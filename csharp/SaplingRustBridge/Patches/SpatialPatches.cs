@@ -19,9 +19,6 @@ namespace SaplingRustBridge.Patches
         // Cache distance bands: (gridWidth << 48) | (cellIndex << 16) | (distance << 4) | flags -> int[]
         private static readonly Dictionary<long, int[]> DistanceBandCache = new Dictionary<long, int[]>(32768);
 
-        // Cache full-distance lists: (gridWidth << 32) | (cellIndex << 16) | distance -> List<int>
-        private static readonly Dictionary<long, List<int>> WithinDistanceCache = new Dictionary<long, List<int>>(16384);
-
         [HarmonyPatch(typeof(CellDistanceFinder), nameof(CellDistanceFinder.Initialize))]
         [HarmonyPostfix]
         public static void Initialize_Postfix(CellDistanceFinder __instance)
@@ -29,7 +26,6 @@ namespace SaplingRustBridge.Patches
             // Clear caches when world/grid is re-initialized
             DirectlyAroundCache.Clear();
             DistanceBandCache.Clear();
-            WithinDistanceCache.Clear();
         }
 
         [HarmonyPatch(typeof(CellDistanceFinder), nameof(CellDistanceFinder.GetAllCellsDirectlyAround))]
@@ -119,44 +115,5 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        [HarmonyPatch(typeof(CellDistanceFinder), nameof(CellDistanceFinder.GetAllCellsWithinDistanceOfCellWithIndex))]
-        [HarmonyPrefix]
-        public static bool GetAllCellsWithinDistanceOfCellWithIndex_Prefix(
-            CellDistanceFinder __instance,
-            int centerIndex,
-            int distance,
-            ref List<int> __result)
-        {
-            long width = (long)__instance.size.x;
-            long key = (width << 40) | ((long)centerIndex << 16) | (long)distance;
-
-            if (WithinDistanceCache.TryGetValue(key, out List<int> cached))
-            {
-                __result = cached;
-                return false; // Skip List<int> allocation!
-            }
-
-            return true;
-        }
-
-        [HarmonyPatch(typeof(CellDistanceFinder), nameof(CellDistanceFinder.GetAllCellsWithinDistanceOfCellWithIndex))]
-        [HarmonyPostfix]
-        public static void GetAllCellsWithinDistanceOfCellWithIndex_Postfix(
-            CellDistanceFinder __instance,
-            int centerIndex,
-            int distance,
-            List<int> __result)
-        {
-            if (__result != null)
-            {
-                long width = (long)__instance.size.x;
-                long key = (width << 40) | ((long)centerIndex << 16) | (long)distance;
-
-                if (!WithinDistanceCache.ContainsKey(key))
-                {
-                    WithinDistanceCache[key] = __result;
-                }
-            }
-        }
     }
 }
