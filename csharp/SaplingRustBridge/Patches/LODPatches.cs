@@ -83,6 +83,53 @@ namespace SaplingRustBridge.Patches
             }
         }
 
+        // Fast-Forward Optimization:
+        // Skip scanning 60,000-120,000 empty map cells every world state change;
+        // directly query the active animals from AnimalPositionTracker in O(active animals)
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateAnimationsBetweenWorldStates))]
+        [HarmonyPrefix]
+        public static void UpdateAnimationsBetweenWorldStates_Prefix(WorldView __instance, float percentageOfInterStateTimePassed, WorldState lastShownState)
+        {
+            if (__instance == null || !__instance.stateWasShownLastFrame || lastShownState == null) return;
+
+            __instance.animalViewsForWhichToUpdateRoughAnimations.Clear();
+            __instance.animalViewsForWhichToUpdateDetailedAnimations.Clear();
+            __instance.cellIndicesForWhichToUpdateAnimations.Clear();
+            __instance.cellLocationTypesForWhichToUpdateAnimations.Clear();
+            __instance.areaIndicesForWhichToUpdateAnimations.Clear();
+
+            var areas = lastShownState.areas;
+            if (areas != null)
+            {
+                for (int i = 0; i < areas.Length; i++)
+                {
+                    var tracker = areas[i].animalPositionTracker;
+                    if (tracker == null || tracker.animalPositions == null) continue;
+
+                    foreach (var ap in tracker.animalPositions)
+                    {
+                        int cIdx = ap.cellIndex;
+                        var loc = ap.locationType;
+                        var array = __instance.GetAnimalViewsForArea(i, loc);
+                        if (array != null && cIdx >= 0 && cIdx < array.Length)
+                        {
+                            var av = array[cIdx];
+                            if (av != null)
+                            {
+                                __instance.animalViewsForWhichToUpdateDetailedAnimations.Add(av);
+                                __instance.cellLocationTypesForWhichToUpdateAnimations.Add(loc);
+                                __instance.cellIndicesForWhichToUpdateAnimations.Add(cIdx);
+                                __instance.areaIndicesForWhichToUpdateAnimations.Add(i);
+                            }
+                        }
+                    }
+                }
+            }
+
+            __instance.stateWasShownLastFrame = false;
+            __instance.roughAnimationsPending = true;
+        }
+
         private static void ApplyAnimalLOD(AnimalView animal, bool isClose)
         {
             if (animal == null || animal.gameObject == null) return;
