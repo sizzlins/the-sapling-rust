@@ -13,6 +13,11 @@ namespace SaplingRustBridge
 
         void Awake()
         {
+            // Disable expensive C# stack trace string allocations on benign warnings and logs
+            Application.SetStackTraceLogType(LogType.Warning, StackTraceLogType.None);
+            Application.SetStackTraceLogType(LogType.Log, StackTraceLogType.None);
+            Debug.unityLogger.filterLogType = LogType.Warning;
+
             Logger.LogInfo("SaplingRustBridge: Initializing Native Rust Engine...");
 
             try
