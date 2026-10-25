@@ -14,6 +14,7 @@ namespace SaplingRustBridge.Patches
     [HarmonyPatch]
     public static class TimeJumpPatches
     {
+        public static volatile bool IsTimeJumpActive = false;
         private static AnimalPosition[] _cachedArray;
 
         // 1. Initial Time Jump: offload days to background thread
@@ -23,6 +24,7 @@ namespace SaplingRustBridge.Patches
         {
             if (__instance != null && __instance.timeLine != null && __instance.nrOfYearsToJump > 0)
             {
+                IsTimeJumpActive = true;
                 __instance.nrOfDaysToJumpPerFrame = 0;
                 AsyncJumpWorker.StartJump(__instance.timeLine, __instance.nrOfYearsToJump);
             }
@@ -63,12 +65,17 @@ namespace SaplingRustBridge.Patches
         [HarmonyPrefix]
         public static bool TimeJumpController_Update_Prefix(TimeJumpController __instance)
         {
-            if (!AsyncJumpWorker.IsRunning) return true;
+            if (!AsyncJumpWorker.IsRunning)
+            {
+                IsTimeJumpActive = false;
+                return true;
+            }
 
             // Handle user cancel/interrupt button
             if (Input.GetMouseButtonDown(0) && __instance.uiView != null && __instance.uiView.interruptButtonHovered)
             {
                 AsyncJumpWorker.Stop();
+                IsTimeJumpActive = false;
                 __instance.nrOfYearsToJump = 0;
                 return true;
             }
@@ -96,6 +103,7 @@ namespace SaplingRustBridge.Patches
 
             if (remaining <= 0)
             {
+                IsTimeJumpActive = false;
                 __instance.nrOfYearsToJump = 0;
                 return true; // Let vanilla invoke timeJumpReady callback on main thread
             }
@@ -112,6 +120,7 @@ namespace SaplingRustBridge.Patches
 
             if (__instance.nrOfDaysToDoInCurrentTimeJump > 0)
             {
+                IsTimeJumpActive = true;
                 if (!AsyncJumpWorker.IsRunning)
                 {
                     AsyncJumpWorker.StartJump(__instance.timeLine, __instance.nrOfDaysToDoInCurrentTimeJump);
@@ -129,6 +138,7 @@ namespace SaplingRustBridge.Patches
 
                 if (remaining <= 0)
                 {
+                    IsTimeJumpActive = false;
                     __instance.nrOfDaysToDoInCurrentTimeJump = 0;
                     return true; // Worker finished! Vanilla runs view cleanup & ShowToday()
                 }
@@ -144,6 +154,19 @@ namespace SaplingRustBridge.Patches
         public static void WorldController_Update_Postfix()
         {
             AsyncJumpWorker.CheckMainThreadCompletion();
+        }
+
+        // 6. Prevent ~700ms main-thread freeze from Resources.UnloadUnusedAssets() during Time Jumps
+        [HarmonyPatch(typeof(Resources), nameof(Resources.UnloadUnusedAssets))]
+        [HarmonyPrefix]
+        public static bool Resources_UnloadUnusedAssets_Prefix(ref AsyncOperation __result)
+        {
+            if (AsyncJumpWorker.IsRunning || IsTimeJumpActive)
+            {
+                __result = null;
+                return false; // Skip the synchronous 50,000+ asset sweep during time skips!
+            }
+            return true;
         }
     }
 }

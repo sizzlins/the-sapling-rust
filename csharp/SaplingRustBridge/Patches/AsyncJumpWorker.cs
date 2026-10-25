@@ -48,6 +48,7 @@ namespace SaplingRustBridge.Patches
             })
             {
                 IsBackground = true,
+                Priority = ThreadPriority.BelowNormal,
                 Name = "SaplingAsyncJumpWorker"
             };
 
