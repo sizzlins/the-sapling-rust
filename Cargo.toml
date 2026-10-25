@@ -6,6 +6,9 @@ edition = "2021"
 # No dependencies. The sim core is pure logic: adding Bevy here would buy nothing for
 # correctness or complexity, and would cost a multi-minute build on every cargo test.
 # Renderer wiring is a separate, later step (see SPEC.md "Deviations").
+[dependencies]
+rayon = "1.10"
+
 [lib]
 name = "sapling_rust"
 crate-type = ["cdylib", "rlib"]

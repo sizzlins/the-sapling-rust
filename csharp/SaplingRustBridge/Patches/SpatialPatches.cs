@@ -115,5 +115,40 @@ namespace SaplingRustBridge.Patches
             }
         }
 
+        // --- Native multicore batch spatial query for animal food searches ---
+        // Pooled arrays avoid GC heap allocations in steady state.
+        private static float[] _batchQueryX;
+        private static float[] _batchQueryY;
+        private static int[] _batchOutIndices;
+
+        /// <summary>
+        /// Batch-query nearest plants for all animals using the native Rust multicore
+        /// CSR spatial engine. Only activates when animal count > 100 (below that,
+        /// the overhead of marshalling outweighs the parallelism benefit).
+        /// </summary>
+        public static int[] BatchFindNearestPlants(float[] animalX, float[] animalY, int count, float maxDist)
+        {
+            IntPtr world = Plugin.RustWorldHandle;
+            if (world == IntPtr.Zero || count <= 100)
+                return null;
+
+            // Resize pooled arrays if needed (never shrinks - steady state = zero alloc)
+            if (_batchQueryX == null || _batchQueryX.Length < count)
+            {
+                _batchQueryX = new float[count];
+                _batchQueryY = new float[count];
+                _batchOutIndices = new int[count];
+            }
+
+            Array.Copy(animalX, _batchQueryX, count);
+            Array.Copy(animalY, _batchQueryY, count);
+
+            NativeSim.sapling_find_nearest_plants_batch(
+                world, _batchQueryX, _batchQueryY, maxDist, _batchOutIndices, (uint)count);
+
+            return _batchOutIndices;
+        }
+
     }
 }
+

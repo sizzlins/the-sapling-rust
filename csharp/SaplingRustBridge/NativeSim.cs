@@ -38,5 +38,14 @@ namespace SaplingRustBridge
             [Out] float[] outY,
             [Out] float[] outEnergy,
             uint maxLen);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint sapling_find_nearest_plants_batch(
+            IntPtr world,
+            [In] float[] queryX,
+            [In] float[] queryY,
+            float maxDist,
+            [Out] int[] outIndices,
+            uint count);
     }
 }

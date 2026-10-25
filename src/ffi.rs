@@ -103,6 +103,30 @@ pub unsafe extern "C" fn sapling_world_get_herbivores(
     count as u32
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn sapling_find_nearest_plants_batch(
+    world: *const World,
+    query_x: *const f32,
+    query_y: *const f32,
+    max_dist: f32,
+    out_indices: *mut i32,
+    count: u32,
+) -> u32 {
+    let w = match world.as_ref() {
+        Some(w) => w,
+        None => return 0,
+    };
+    if query_x.is_null() || query_y.is_null() || out_indices.is_null() || count == 0 {
+        return 0;
+    }
+    let qx = std::slice::from_raw_parts(query_x, count as usize);
+    let qy = std::slice::from_raw_parts(query_y, count as usize);
+    let out = std::slice::from_raw_parts_mut(out_indices, count as usize);
+
+    w.find_nearest_plants_parallel(qx, qy, max_dist, out);
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

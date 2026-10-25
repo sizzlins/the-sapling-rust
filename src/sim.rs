@@ -1,4 +1,4 @@
-//! Ecosystem simulation core. No engine types, no dependencies.
+//! Ecosystem simulation core. No engine types, one dependency (Rayon for parallel queries).
 //!
 //! Two complexity decisions live here, and both are verified by `tests/complexity.rs`:
 //!
@@ -10,6 +10,8 @@
 //! * **Space** - entities are struct-of-arrays (`Vec<f32>` per field), so there is no
 //!   per-entity header, no pointer chasing and no padding waste. Dead entities are
 //!   swap-removed rather than tombstoned, so memory tracks the *live* population.
+
+use rayon::prelude::*;
 
 /// Deterministic RNG (xorshift64*). Seeded so every test is reproducible.
 #[derive(Clone)]
@@ -146,6 +148,31 @@ impl Grid {
         }
     }
 
+    /// Find the nearest item within `max_radius` using expanding-radius search.
+    /// Pure read-only, safe for `&self` from multiple threads.
+    pub fn nearest_within(&self, xs: &[f32], ys: &[f32], x: f32, y: f32, max_radius: f32, cell_size: f32) -> Option<usize> {
+        let mut radius = cell_size;
+        let mut best: Option<usize> = None;
+        let mut best_d2 = f32::MAX;
+
+        while radius <= max_radius {
+            self.for_each_within(xs, ys, x, y, radius, |i| {
+                let dx = xs[i] - x;
+                let dy = ys[i] - y;
+                let d2 = dx * dx + dy * dy;
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best = Some(i);
+                }
+            });
+            if best.is_some() {
+                return best;
+            }
+            radius *= 2.0;
+        }
+        best
+    }
+
     fn clamp_col(&self, x: f32) -> usize {
         (((x - self.min_x) / self.cell) as usize).min(self.cols - 1)
     }
@@ -158,6 +185,11 @@ impl Grid {
         (self.start.capacity() + self.items.capacity() + self.cursor.capacity()) * 4
     }
 }
+
+// SAFETY: Grid is immutable after build() and before the next build().
+// All fields are plain Vec<u32>/f32/usize with no interior mutability.
+// Safe to share &Grid across Rayon threads for read-only spatial queries.
+unsafe impl Sync for Grid {}
 
 fn bounds(xs: &[f32], ys: &[f32]) -> (f32, f32, f32, f32) {
     if xs.is_empty() {
@@ -416,7 +448,7 @@ impl World {
         self.days += self.dt;
     }
 
-    fn rebuild_grid(&mut self) {
+    pub fn rebuild_grid(&mut self) {
         self.grid
             .build(&self.plants.x, &self.plants.y, self.cell_size);
     }
@@ -573,33 +605,14 @@ impl World {
     /// a starving population. Raise `max_search_radius` only if starving herbivores must
     /// still find distant food.
     fn seek_nearest_plant(&self, x: f32, y: f32) -> Option<usize> {
-        let mut radius = self.cell_size;
-        let mut best: Option<usize> = None;
-        let mut best_d2 = f32::MAX;
-
-        while radius <= self.max_search_radius {
-            self.grid.for_each_within(
-                &self.plants.x,
-                &self.plants.y,
-                x,
-                y,
-                radius,
-                |i| {
-                    let dx = self.plants.x[i] - x;
-                    let dy = self.plants.y[i] - y;
-                    let d2 = dx * dx + dy * dy;
-                    if d2 < best_d2 {
-                        best_d2 = d2;
-                        best = Some(i);
-                    }
-                },
-            );
-            if best.is_some() {
-                return best;
-            }
-            radius *= 2.0;
-        }
-        best
+        self.grid.nearest_within(
+            &self.plants.x,
+            &self.plants.y,
+            x,
+            y,
+            self.max_search_radius,
+            self.cell_size,
+        )
     }
 
     /// The same question, asked the slow way. O(plants) per call.
@@ -616,6 +629,37 @@ impl World {
             }
         }
         best
+    }
+
+    /// Batch parallel nearest-plant query using Rayon. Distributes queries across
+    /// all CPU cores. Each query independently reads the shared grid + plant arrays
+    /// (immutable during the call).
+    ///
+    /// `out_indices[i]` is set to the nearest plant index, or -1 if none within max_distance.
+    pub fn find_nearest_plants_parallel(
+        &self,
+        query_x: &[f32],
+        query_y: &[f32],
+        max_distance: f32,
+        out_indices: &mut [i32],
+    ) {
+        assert_eq!(query_x.len(), query_y.len());
+        assert_eq!(query_x.len(), out_indices.len());
+
+        let grid = &self.grid;
+        let plant_x = &self.plants.x;
+        let plant_y = &self.plants.y;
+        let cell_size = self.cell_size;
+
+        out_indices
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, out_idx)| {
+                let qx = query_x[i];
+                let qy = query_y[i];
+                let nearest = grid.nearest_within(plant_x, plant_y, qx, qy, max_distance, cell_size);
+                *out_idx = nearest.map(|idx| idx as i32).unwrap_or(-1);
+            });
     }
 
     /// Bytes held by entity storage + grid. Used by the space-complexity test.

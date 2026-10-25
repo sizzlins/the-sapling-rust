@@ -17,6 +17,7 @@ namespace SaplingRustBridge
         void Awake()
         {
             Instance = this;
+            Patches.ThreadRandomPatch.MainThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
             // Disable expensive C# stack trace string allocations on benign warnings and logs
             Application.SetStackTraceLogType(LogType.Warning, StackTraceLogType.None);
             Application.SetStackTraceLogType(LogType.Log, StackTraceLogType.None);
