@@ -56,6 +56,10 @@
       <HintPath>D:\The_Sapling\The Sapling\the_sapling_Data\Managed\UnityScript.Lang.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="Boo.Lang">
+      <HintPath>D:\The_Sapling\The Sapling\the_sapling_Data\Managed\Boo.Lang.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>
