@@ -14,9 +14,9 @@ namespace SaplingRustBridge.Patches
     /// AnimalObjectBuilder procedural mesh subdivision, rigging, and texture synthesis from scratch.
     /// 
     /// Solution:
-    /// 1. Share species blueprints across all genetic drift variants of that species.
+    /// 1. Share species blueprints across all genetic drift variants and sexes of that species.
     ///    Object.Instantiate() takes 0.1ms vs 400ms for procedural generation (4,000x faster).
-    /// 2. If an exact mutation profile isn't cached, instantly fall back to the species representative model.
+    /// 2. If an exact mutation profile isn't cached, instantly fall back to ANY existing species model.
     /// 3. When a new species model is built, always mark it representative so all sibling organisms reuse it.
     /// </summary>
     [HarmonyPatch]
@@ -44,29 +44,41 @@ namespace SaplingRustBridge.Patches
         {
             if (__result != null || __instance == null) return;
 
-            // Robust fallback: If exact sex/profile match failed, check any model for this species
-            var dict = youngVersion
+            // 1. Try species dictionary (any sex of this species)
+            var speciesDict = youngVersion
                 ? AccessTools.Field(typeof(PrebuiltOrganismLibrary), "gameObjectsYoungVersionForSpeciesIndex")?.GetValue(__instance) as Dictionary<SpeciesAndSexIndex, GameObject>
                 : AccessTools.Field(typeof(PrebuiltOrganismLibrary), "gameObjectsOldVersionForSpeciesIndex")?.GetValue(__instance) as Dictionary<SpeciesAndSexIndex, GameObject>;
 
-            if (dict != null)
+            if (speciesDict != null)
             {
-                var key0 = new SpeciesAndSexIndex(speciesIndex, 0);
-                if (dict.TryGetValue(key0, out var go0) && go0 != null)
+                foreach (var kvp in speciesDict)
                 {
-                    if (!go0.activeSelf) go0.SetActive(true);
-                    __instance.lastUsedStorageApproach = StorageApproach.SpeciesBased;
-                    __result = Object.Instantiate(go0);
-                    return;
+                    if (kvp.Key.speciesIndex == speciesIndex && kvp.Value != null)
+                    {
+                        if (!kvp.Value.activeSelf) kvp.Value.SetActive(true);
+                        __instance.lastUsedStorageApproach = StorageApproach.SpeciesBased;
+                        __result = Object.Instantiate(kvp.Value);
+                        return;
+                    }
                 }
+            }
 
-                var key1 = new SpeciesAndSexIndex(speciesIndex, 1);
-                if (dict.TryGetValue(key1, out var go1) && go1 != null)
+            // 2. If preferred version not found, fallback to other version for this species
+            var otherSpeciesDict = youngVersion
+                ? AccessTools.Field(typeof(PrebuiltOrganismLibrary), "gameObjectsOldVersionForSpeciesIndex")?.GetValue(__instance) as Dictionary<SpeciesAndSexIndex, GameObject>
+                : AccessTools.Field(typeof(PrebuiltOrganismLibrary), "gameObjectsYoungVersionForSpeciesIndex")?.GetValue(__instance) as Dictionary<SpeciesAndSexIndex, GameObject>;
+
+            if (otherSpeciesDict != null)
+            {
+                foreach (var kvp in otherSpeciesDict)
                 {
-                    if (!go1.activeSelf) go1.SetActive(true);
-                    __instance.lastUsedStorageApproach = StorageApproach.SpeciesBased;
-                    __result = Object.Instantiate(go1);
-                    return;
+                    if (kvp.Key.speciesIndex == speciesIndex && kvp.Value != null)
+                    {
+                        if (!kvp.Value.activeSelf) kvp.Value.SetActive(true);
+                        __instance.lastUsedStorageApproach = StorageApproach.SpeciesBased;
+                        __result = Object.Instantiate(kvp.Value);
+                        return;
+                    }
                 }
             }
         }

@@ -13,14 +13,13 @@ namespace SaplingRustBridge.Patches
     public static class StreamingJITPatches
     {
         private static Vector3 _lastFrameCamPos = Vector3.zero;
-        private static Vector3 _settledCamPos = new Vector3(-9999f, -9999f, -9999f);
         private static int _currentRing = 7;
         private static int _cachedAreaIndex = -1;
         private static int _cachedCellIndex = -1;
 
         private const int MaxDistanceRing = 6;
-        private const int MaxBuildsPerFrameMoving = 4;
-        private const int MaxBuildsPerFrameStill = 10;
+        private const int MaxBuildsPerFrameMoving = 3;
+        private const int MaxBuildsPerFrameStill = 8;
 
         [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateOrganismsAroundCameraJIT))]
         [HarmonyPrefix]
@@ -39,13 +38,15 @@ namespace SaplingRustBridge.Patches
             bool isMoving = currentSpeed > 1.5f || __instance.movingCamera;
             int budget = isMoving ? MaxBuildsPerFrameMoving : MaxBuildsPerFrameStill;
 
-            float distFromSettled = (camPos - _settledCamPos).sqrMagnitude;
-            if (distFromSettled > 1.0f)
+            int currentArea = __instance.GetAreaIndexBelowCamera();
+            int currentCell = __instance.GetCellIndexBelowCamera();
+
+            // Only restart rings when the camera crosses into a new world cell
+            if (currentArea != _cachedAreaIndex || currentCell != _cachedCellIndex)
             {
-                _settledCamPos = camPos;
+                _cachedAreaIndex = currentArea;
+                _cachedCellIndex = currentCell;
                 _currentRing = 0;
-                _cachedAreaIndex = __instance.GetAreaIndexBelowCamera();
-                _cachedCellIndex = __instance.GetCellIndexBelowCamera();
             }
 
             StepJITStreaming(__instance, budget);
