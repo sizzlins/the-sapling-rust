@@ -19,6 +19,9 @@ namespace SaplingRustBridge.Patches
         private static float _lastLODScanTime = 0f;
         private const float LODScanInterval = 0.25f; // Scan 4 times per second (negligible CPU cost)
 
+        private static readonly AccessTools.FieldRef<WalkingAnimationControllerV2, Vector3> GoalRef =
+            AccessTools.FieldRefAccess<WalkingAnimationControllerV2, Vector3>("goal");
+
         [HarmonyPatch(typeof(WorldView), "Start")]
         [HarmonyPostfix]
         public static void WorldView_Start_Postfix(WorldView __instance)
@@ -88,9 +91,9 @@ namespace SaplingRustBridge.Patches
         // directly query the active animals from AnimalPositionTracker in O(active animals)
         [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateAnimationsBetweenWorldStates))]
         [HarmonyPrefix]
-        public static void UpdateAnimationsBetweenWorldStates_Prefix(WorldView __instance, float percentageOfInterStateTimePassed, WorldState lastShownState)
+        public static bool UpdateAnimationsBetweenWorldStates_Prefix(WorldView __instance, float percentageOfInterStateTimePassed, WorldState lastShownState)
         {
-            if (__instance == null || !__instance.stateWasShownLastFrame || lastShownState == null) return;
+            if (__instance == null || !__instance.stateWasShownLastFrame || lastShownState == null) return true;
 
             __instance.animalViewsForWhichToUpdateRoughAnimations.Clear();
             __instance.animalViewsForWhichToUpdateDetailedAnimations.Clear();
@@ -128,6 +131,7 @@ namespace SaplingRustBridge.Patches
 
             __instance.stateWasShownLastFrame = false;
             __instance.roughAnimationsPending = true;
+            return false; // Skip the 360,000-cell vanilla scan
         }
 
         private static void ApplyAnimalLOD(AnimalView animal, bool isClose)
@@ -137,7 +141,7 @@ namespace SaplingRustBridge.Patches
             // 1. Legacy animation engine (bone matrix evaluations)
             if (animal.anim != null)
             {
-                animal.anim.enabled = isClose;
+                animal.anim.enabled = isClose || animal.canFly;
             }
 
             // 2. Procedural Inverse Kinematics & Walking Controller
@@ -246,6 +250,45 @@ namespace SaplingRustBridge.Patches
             {
                 __instance.enabled = false;
             }
+        }
+
+        [HarmonyPatch(typeof(WalkingAnimationControllerV2), "Update")]
+        [HarmonyPrefix]
+        public static bool WalkingAnimationControllerV2_Update_Prefix(WalkingAnimationControllerV2 __instance)
+        {
+            if (__instance == null || !__instance.walking || __instance.paused) return true;
+
+            // When distant (solveIK is false), perform lightweight linear movement without bone/joint/raycast calculations
+            if (!__instance.solveIK)
+            {
+                Vector3 curPos = __instance.transform.position;
+                Vector3 goal = GoalRef(__instance);
+
+                __instance.transform.position = Vector3.MoveTowards(curPos, goal, __instance.speed * Time.deltaTime * __instance.timeSpeed);
+
+                if (Vector3.Distance(goal, __instance.transform.position) < 0.05f)
+                {
+                    __instance.StopWalking();
+                }
+                return false; // Skip MovePrimitive, MoveNormal, UpdateTail, UpdateNeck, and leg trigonometry!
+            }
+
+            return true;
+        }
+
+        [HarmonyPatch(typeof(AnimalView), "UpdateAnimationActivityBasedOnDistanceToCamera")]
+        [HarmonyPrefix]
+        public static void AnimalView_UpdateAnimationActivity_Prefix(ref float midThreshold, ref float farThreshold)
+        {
+            if (midThreshold > CloseDistanceThreshold) midThreshold = CloseDistanceThreshold;
+            if (farThreshold > MidDistanceThreshold) farThreshold = MidDistanceThreshold;
+        }
+
+        [HarmonyPatch(typeof(PlantView), "UpdateAnimatorActivityBasedOnDistanceToCamera")]
+        [HarmonyPrefix]
+        public static void PlantView_UpdateAnimatorActivity_Prefix(ref float threshold)
+        {
+            if (threshold > CloseDistanceThreshold) threshold = CloseDistanceThreshold;
         }
 
         private static void OptimizeAnimalInstance(AnimalView animal)
