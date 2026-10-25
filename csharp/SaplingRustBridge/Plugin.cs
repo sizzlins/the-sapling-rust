@@ -18,6 +18,9 @@ namespace SaplingRustBridge
             Application.SetStackTraceLogType(LogType.Log, StackTraceLogType.None);
             Debug.unityLogger.filterLogType = LogType.Warning;
 
+            // Turn on "continuous" cheatcode by default so the game keeps running when alt-tabbed
+            Application.runInBackground = true;
+
             Logger.LogInfo("SaplingRustBridge: Initializing Native Rust Engine...");
 
             try
