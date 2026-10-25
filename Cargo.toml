@@ -1,0 +1,16 @@
+[package]
+name = "sapling-rust"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies. The sim core is pure logic: adding Bevy here would buy nothing for
+# correctness or complexity, and would cost a multi-minute build on every cargo test.
+# Renderer wiring is a separate, later step (see SPEC.md "Deviations").
+[lib]
+name = "sapling_rust"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true

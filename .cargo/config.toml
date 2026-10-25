@@ -1,0 +1,8 @@
+[build]
+target = "x86_64-pc-windows-gnu"
+
+# No MSVC Build Tools on this machine (no link.exe, no Windows Kits import libs).
+# MSYS2 UCRT64 gcc links the GNU-target Rust build instead.
+[target.x86_64-pc-windows-gnu]
+linker = "C:/msys64/ucrt64/bin/gcc.exe"
+rustflags = ["-C", "target-feature=+crt-static"]

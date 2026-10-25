@@ -1,0 +1,11 @@
+# Build output
+/target
+
+# Local and temporary tooling
+**/*.log
+*.tmp
+
+# Decompiled raw outputs / extracted game binaries
+/decompiled source code/
+/rea/
+/rea-*/
