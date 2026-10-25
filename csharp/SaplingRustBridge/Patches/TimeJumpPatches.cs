@@ -15,14 +15,14 @@ namespace SaplingRustBridge.Patches
     {
         private static AnimalPosition[] _cachedArray;
 
-        // 1. Boost Time Jump speed: run 50 days per frame instead of 10
+        // 1. Initial Time Jump speed: start at 25 days/frame (dynamically tuned by SimulationPatches)
         [HarmonyPatch(typeof(TimeJumpController), nameof(TimeJumpController.Jump))]
         [HarmonyPostfix]
         public static void TimeJumpController_Jump_Postfix(TimeJumpController __instance)
         {
             if (__instance != null)
             {
-                __instance.nrOfDaysToJumpPerFrame = 50;
+                __instance.nrOfDaysToJumpPerFrame = 25;
             }
         }
 
