@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net35</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <AssemblyName>SaplingRustBridge</AssemblyName>
+    <RootNamespace>SaplingRustBridge</RootNamespace>
+    <Description>Native Rust turbocharger bridge for The Sapling</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    
+    <!-- BepInEx & Harmony references from the game directory -->
+    <Reference Include="BepInEx">
+      <HintPath>D:\The_Sapling\The Sapling\BepInEx\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>D:\The_Sapling\The Sapling\BepInEx\core\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Unity 2017.4 managed engine assemblies -->
+    <Reference Include="UnityEngine">
+      <HintPath>D:\The_Sapling\The Sapling\the_sapling_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>D:\The_Sapling\The Sapling\the_sapling_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Game logic assemblies -->
+    <Reference Include="Assembly-UnityScript">
+      <HintPath>D:\The_Sapling\The Sapling\the_sapling_Data\Managed\Assembly-UnityScript.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Assembly-UnityScript-firstpass">
+      <HintPath>D:\The_Sapling\The Sapling\the_sapling_Data\Managed\Assembly-UnityScript-firstpass.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityScript.Lang">
+      <HintPath>D:\The_Sapling\The Sapling\the_sapling_Data\Managed\UnityScript.Lang.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

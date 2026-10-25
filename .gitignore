@@ -1,5 +1,7 @@
 # Build output
 /target
+**/bin/
+**/obj/
 
 # Local and temporary tooling
 **/*.log
