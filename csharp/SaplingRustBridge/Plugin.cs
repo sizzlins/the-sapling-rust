@@ -8,11 +8,15 @@ namespace SaplingRustBridge
     [BepInPlugin("com.sizzlins.saplingrust", "SaplingRustBridge", "1.0.0")]
     public class Plugin : BaseUnityPlugin
     {
+        public static Plugin Instance { get; private set; }
+        public static IntPtr RustWorldHandle => Instance != null ? Instance._rustWorld : IntPtr.Zero;
+
         private IntPtr _rustWorld = IntPtr.Zero;
         private Harmony _harmony;
 
         void Awake()
         {
+            Instance = this;
             // Disable expensive C# stack trace string allocations on benign warnings and logs
             Application.SetStackTraceLogType(LogType.Warning, StackTraceLogType.None);
             Application.SetStackTraceLogType(LogType.Log, StackTraceLogType.None);
