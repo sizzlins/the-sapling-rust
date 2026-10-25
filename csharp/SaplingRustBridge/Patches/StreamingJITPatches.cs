@@ -6,28 +6,21 @@ using UnityEngine;
 namespace SaplingRustBridge.Patches
 {
     /// <summary>
-    /// Eliminates the camera movement freeze when entering or panning across crowded sectors.
-    /// 
-    /// Strategy:
-    /// 1. While the camera is actively panning or dragging, defer heavy procedural mesh generation.
-    ///    This keeps camera navigation locked at 60 FPS without hitches.
-    /// 2. When the camera settles or moves at inspecting speeds, stream in unbuilt organisms smoothly
-    ///    at a strict budget of 1 build per frame.
-    /// 3. Rings stream outward from center (radius 0 to 6), covering the visible viewport without
-    ///    redundant 10x re-checking of inner cells.
+    /// Smooth, hitch-free JIT streaming of organisms around the camera.
+    /// Replaces the unbudgeted 10-ring concentric scan with a frame-budgeted ring streamer.
     /// </summary>
     [HarmonyPatch]
     public static class StreamingJITPatches
     {
         private static Vector3 _lastFrameCamPos = Vector3.zero;
         private static Vector3 _settledCamPos = new Vector3(-9999f, -9999f, -9999f);
-        private static int _currentRing = 7; // 7 means all rings (0..6) completed
+        private static int _currentRing = 7;
         private static int _cachedAreaIndex = -1;
         private static int _cachedCellIndex = -1;
-        private static float _timeCameraSettled = 0f;
 
         private const int MaxDistanceRing = 6;
-        private const int MaxBuildsPerFrame = 1; // Strict 1 build per frame guarantees zero frame hitches
+        private const int MaxBuildsPerFrameMoving = 4;
+        private const int MaxBuildsPerFrameStill = 10;
 
         [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateOrganismsAroundCameraJIT))]
         [HarmonyPrefix]
@@ -43,17 +36,9 @@ namespace SaplingRustBridge.Patches
             float currentSpeed = (camPos - _lastFrameCamPos).magnitude / dt;
             _lastFrameCamPos = camPos;
 
-            // While camera is actively moving (> 3 units/sec), defer heavy procedural construction!
-            if (currentSpeed > 3.0f || __instance.movingCamera)
-            {
-                _timeCameraSettled = 0f;
-                return false; // Skip freeze completely during camera drag
-            }
+            bool isMoving = currentSpeed > 1.5f || __instance.movingCamera;
+            int budget = isMoving ? MaxBuildsPerFrameMoving : MaxBuildsPerFrameStill;
 
-            // Camera is stationary or moving slowly
-            _timeCameraSettled += dt;
-
-            // Check if camera settled at a new location
             float distFromSettled = (camPos - _settledCamPos).sqrMagnitude;
             if (distFromSettled > 1.0f)
             {
@@ -63,7 +48,7 @@ namespace SaplingRustBridge.Patches
                 _cachedCellIndex = __instance.GetCellIndexBelowCamera();
             }
 
-            StepJITStreaming(__instance);
+            StepJITStreaming(__instance, budget);
 
             return false;
         }
@@ -72,17 +57,13 @@ namespace SaplingRustBridge.Patches
         [HarmonyPostfix]
         public static void WorldView_Update_Postfix(WorldView __instance)
         {
-            // When camera has settled and still has rings to stream in, tick one batch per frame
             if (_currentRing <= MaxDistanceRing && __instance != null && __instance.cellDistanceFinder != null)
             {
-                if (!__instance.movingCamera)
-                {
-                    StepJITStreaming(__instance);
-                }
+                StepJITStreaming(__instance, MaxBuildsPerFrameStill);
             }
         }
 
-        private static void StepJITStreaming(WorldView view)
+        private static void StepJITStreaming(WorldView view, int budget)
         {
             if (_currentRing > MaxDistanceRing) return;
             if (_cachedAreaIndex < 0 || _cachedCellIndex < 0) return;
@@ -101,7 +82,7 @@ namespace SaplingRustBridge.Patches
                 view.CreateJITOptimizationJobForAnimal(areaIndex, cellIndex);
                 _currentRing++;
 
-                if (view.gameObjectsNewlyGenerated.Count - initialCount >= MaxBuildsPerFrame)
+                if (view.gameObjectsNewlyGenerated.Count - initialCount >= budget)
                 {
                     FinalizeFrameBatch(view, initialCount);
                     return;
@@ -127,8 +108,7 @@ namespace SaplingRustBridge.Patches
                         view.CreateJITOptimizationJobForFungus(areaIndex, c);
                         view.CreateJITOptimizationJobForAnimal(areaIndex, c);
 
-                        // If 1 organism was generated, yield immediately so this frame stays at 60 FPS
-                        if (view.gameObjectsNewlyGenerated.Count - initialCount >= MaxBuildsPerFrame)
+                        if (view.gameObjectsNewlyGenerated.Count - initialCount >= budget)
                         {
                             FinalizeFrameBatch(view, initialCount);
                             return;
@@ -138,7 +118,7 @@ namespace SaplingRustBridge.Patches
 
                 _currentRing++;
 
-                if (view.gameObjectsNewlyGenerated.Count - initialCount >= MaxBuildsPerFrame)
+                if (view.gameObjectsNewlyGenerated.Count - initialCount >= budget)
                 {
                     break;
                 }
