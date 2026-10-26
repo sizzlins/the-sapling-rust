@@ -1,7 +1,9 @@
+using System;
 using System.Collections.Generic;
 using HarmonyLib;
 using UnityEngine;
 using UnityEngine.Rendering;
+
 
 namespace SaplingRustBridge.Patches
 {
@@ -13,9 +15,12 @@ namespace SaplingRustBridge.Patches
     [HarmonyPatch]
     public static class LODPatches
     {
-        public const float CloseDistanceThreshold = 35f;
-        public const float MidDistanceThreshold = 80f;
+        public const float CloseDistanceThreshold = 350f; // Vanilla is 350f
+        public const float MidDistanceThreshold = 1000f;  // Vanilla is 1000f
+        public const float PlantDemoteDistance = 450f;
+        public const float AnimalDemoteDistance = 1500f;
 
+        public static WorldView ActiveWorldView = null;
         private static float _lastLODScanTime = 0f;
         private const float LODScanInterval = 0.25f; // Scan 4 times per second (negligible CPU cost)
 
@@ -27,10 +32,11 @@ namespace SaplingRustBridge.Patches
         public static void WorldView_Start_Postfix(WorldView __instance)
         {
             if (__instance == null) return;
+            ActiveWorldView = __instance;
             __instance.cameraCloseDistanceThreshold = CloseDistanceThreshold;
             __instance.cameraMidDistanceThreshold = MidDistanceThreshold;
-            __instance.limitDetailInTheDistance = true;
-            __instance.detailInTheDistanceNrOfCellsThreshold = 20;
+            __instance.limitDetailInTheDistance = false;
+            __instance.detailInTheDistanceNrOfCellsThreshold = 50000;
         }
 
         [HarmonyPatch(typeof(WorldView), "Update")]
@@ -38,52 +44,80 @@ namespace SaplingRustBridge.Patches
         public static void WorldView_Update_LODGovernor(WorldView __instance)
         {
             if (__instance == null || __instance.worldCamera == null) return;
+            ActiveWorldView = __instance;
 
-            // Ensure distance thresholds stay enforced even if game reloads scenes/settings
-            if (__instance.cameraCloseDistanceThreshold > CloseDistanceThreshold)
+            // Maintain camera distance thresholds so models are visible across whole terrain
+            if (__instance.cameraCloseDistanceThreshold < CloseDistanceThreshold)
             {
                 __instance.cameraCloseDistanceThreshold = CloseDistanceThreshold;
                 __instance.cameraMidDistanceThreshold = MidDistanceThreshold;
             }
+
+            if (AsyncJumpWorker.IsRunning || TimeJumpPatches.IsTimeJumpActive)
+            {
+                return;
+            }
+
+            Vector3 camPos = __instance.worldCamera.transform.position;
 
             // Throttle LOD scanning to avoid per-frame dictionary iterations
             if (Time.time - _lastLODScanTime < LODScanInterval) return;
             _lastLODScanTime = Time.time;
 
             var animals = __instance.animalViewsPerLifeFormIndex;
-            if (animals == null || animals.Count == 0) return;
 
-            Vector3 camPos = __instance.worldCamera.transform.position;
-
-            foreach (var kvp in animals)
+            if (animals != null && animals.Count > 0)
             {
-                var animal = kvp.Value;
-                if (animal == null || animal.gameObject == null) continue;
-
-                float dist = Vector3.Distance(camPos, animal.gameObject.transform.position);
-                animal.distanceToCamera = dist;
-
-                DistanceToCameraCategory newCategory = (dist <= CloseDistanceThreshold)
-                    ? DistanceToCameraCategory.Close
-                    : ((dist <= MidDistanceThreshold) ? DistanceToCameraCategory.Mid : DistanceToCameraCategory.Far);
-
-                bool isClose = (newCategory == DistanceToCameraCategory.Close);
-
-                // Update category and apply optimizations if category changed or if newly initialized
-                if (animal.distanceToCameraCategory != newCategory)
+                foreach (var kvp in animals)
                 {
-                    animal.distanceToCameraCategory = newCategory;
-                    ApplyAnimalLOD(animal, isClose);
-                }
-                else if (!isClose)
-                {
-                    // Distant animals that stopped walking: make sure walking controller is turned off
-                    if (!animal.isWalking && animal.walkingAnimationController != null && animal.walkingAnimationController.enabled)
+                    var animal = kvp.Value;
+                    if (animal == null || animal.JITOptimized || animal.gameObject == null) continue;
+
+                    float dist = Vector3.Distance(camPos, animal.gameObject.transform.position);
+                    animal.distanceToCamera = dist;
+
+                    // Do not demote or destroy animals: let creatures stay visible, alive, and rendered on camera!
+
+                    DistanceToCameraCategory newCategory = (dist <= CloseDistanceThreshold)
+                        ? DistanceToCameraCategory.Close
+                        : ((dist <= MidDistanceThreshold) ? DistanceToCameraCategory.Mid : DistanceToCameraCategory.Far);
+
+                    bool isClose = (newCategory == DistanceToCameraCategory.Close);
+
+                    // Update category and apply optimizations if category changed or if newly initialized
+                    if (animal.distanceToCameraCategory != newCategory)
                     {
-                        animal.walkingAnimationController.enabled = false;
+                        animal.distanceToCameraCategory = newCategory;
+                        ApplyAnimalLOD(animal, isClose);
+                    }
+                    else if (!isClose)
+                    {
+                        // Distant animals that stopped walking: make sure walking controller is turned off
+                        if (!animal.isWalking && animal.walkingAnimationController != null && animal.walkingAnimationController.enabled)
+                        {
+                            animal.walkingAnimationController.enabled = false;
+                        }
                     }
                 }
             }
+        }
+
+        public static void DemotePlantToBillboard(WorldView view, PlantView plant)
+        {
+            // No-op: Do not destroy plant GameObjects so spawned models stay persistent and visible
+            return;
+        }
+
+        public static void DemoteAnimalToJIT(WorldView view, AnimalView animal)
+        {
+            // No-op: Do not destroy animal GameObjects in active play so spawned models stay visible and alive!
+            return;
+        }
+
+        public static void DemoteAllDistantOrganisms(WorldView view, float plantDist = 350f, float animalDist = 1200f)
+        {
+            // No-op: Do not destroy organisms during memory trims
+            return;
         }
 
         // Fast-Forward Optimization:
@@ -156,14 +190,25 @@ namespace SaplingRustBridge.Patches
                 animal.walkingAnimationController.enabled = isClose || animal.isWalking;
             }
 
-            // 3. SkinnedMeshRenderer (Shadows and Skin Quality)
-            var smr = animal.gameObject.GetComponent<SkinnedMeshRenderer>();
-            if (smr != null)
+            // 3. Renderers (Shadows, Offscreen Updates, and Multi-part meshes)
+            var renderers = animal.gameObject.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            for (int r = 0; r < renderers.Length; r++)
             {
-                smr.shadowCastingMode = isClose ? ShadowCastingMode.On : ShadowCastingMode.Off;
-                smr.receiveShadows = isClose;
-                smr.updateWhenOffscreen = false;
-                smr.quality = isClose ? SkinQuality.Bone4 : SkinQuality.Bone1;
+                var smr = renderers[r];
+                if (smr != null)
+                {
+                    smr.enabled = true;
+                    smr.shadowCastingMode = isClose ? ShadowCastingMode.On : ShadowCastingMode.Off;
+                    smr.receiveShadows = isClose;
+                    smr.updateWhenOffscreen = true; // FIX: Prevents Unity from culling procedural meshes with uninitialized bounds!
+                    smr.quality = isClose ? SkinQuality.Bone4 : SkinQuality.Bone2;
+                }
+            }
+
+            var meshRenderers = animal.gameObject.GetComponentsInChildren<MeshRenderer>(true);
+            for (int m = 0; m < meshRenderers.Length; m++)
+            {
+                if (meshRenderers[m] != null) meshRenderers[m].enabled = true;
             }
         }
 
@@ -295,26 +340,20 @@ namespace SaplingRustBridge.Patches
         {
             if (animal == null) return;
 
+            if (animal.gameObject != null)
+            {
+                ConfigureSkinnedMesh(animal.gameObject);
+                ConfigureLegacyAnimation(animal.gameObject);
+            }
             if (animal.gameObjectYoungVersion != null)
             {
                 ConfigureSkinnedMesh(animal.gameObjectYoungVersion);
                 ConfigureLegacyAnimation(animal.gameObjectYoungVersion);
-
-                if (!animal.currentlyShowingYoungVersion)
-                {
-                    animal.gameObjectYoungVersion.SetActive(false);
-                }
             }
-
             if (animal.gameObjectOldVersion != null)
             {
                 ConfigureSkinnedMesh(animal.gameObjectOldVersion);
                 ConfigureLegacyAnimation(animal.gameObjectOldVersion);
-
-                if (animal.currentlyShowingYoungVersion)
-                {
-                    animal.gameObjectOldVersion.SetActive(false);
-                }
             }
         }
 
@@ -351,7 +390,7 @@ namespace SaplingRustBridge.Patches
             var renderers = go.GetComponentsInChildren<SkinnedMeshRenderer>(true);
             for (int i = 0; i < renderers.Length; i++)
             {
-                renderers[i].updateWhenOffscreen = false;
+                renderers[i].updateWhenOffscreen = true; // FIX: Ensure procedural models are always rendered on camera!
             }
         }
 
@@ -361,7 +400,7 @@ namespace SaplingRustBridge.Patches
             var anims = go.GetComponentsInChildren<Animation>(true);
             for (int i = 0; i < anims.Length; i++)
             {
-                anims[i].cullingType = AnimationCullingType.BasedOnRenderers;
+                anims[i].cullingType = AnimationCullingType.AlwaysAnimate;
             }
         }
 
@@ -373,6 +412,15 @@ namespace SaplingRustBridge.Patches
             {
                 animators[i].cullingMode = AnimatorCullingMode.CullUpdateTransforms;
             }
+        }
+
+        // Guard against NullReferenceException in FungusView.Update when gameObject is not yet initialized
+        [HarmonyPatch(typeof(FungusView), nameof(FungusView.Update))]
+        [HarmonyPrefix]
+        public static bool FungusView_Update_Prefix(FungusView __instance)
+        {
+            if (__instance == null || __instance.gameObject == null) return false;
+            return true;
         }
     }
 }

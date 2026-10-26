@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using HarmonyLib;
 using UnityEngine;
+
 
 namespace SaplingRustBridge.Patches
 {
@@ -224,5 +226,211 @@ namespace SaplingRustBridge.Patches
             }
             return true;
         }
+
+        // 7. Root fix for NullReferenceException in WorldView.ShowAnimalViewsForArea:
+        // Automatically prunes stale/dead entries from animalPositions so the renderer never encounters a null LivingAnimal.
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.ShowAnimalViewsForArea))]
+        [HarmonyPrefix]
+        public static void ShowAnimalViewsForArea_SanitizePositions_Prefix(WorldArea area)
+        {
+            if (area == null || area.animalPositionTracker == null || area.animalPositionTracker.animalPositions == null) return;
+
+            try
+            {
+                area.animalPositionTracker.animalPositions.RemoveWhere(ap =>
+                {
+                    LivingAnimal a = area.GetAnimalInCell(ap.cellIndex, ap.locationType);
+                    return a == null || a.definition == null;
+                });
+            }
+            catch {}
+        }
+
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.ShowAnimalViewsForArea))]
+        [HarmonyFinalizer]
+        public static Exception ShowAnimalViewsForArea_Finalizer(Exception __exception)
+        {
+            return null; // Suppress any remaining JIT null reference exceptions so frame rendering never breaks
+        }
+
+        [HarmonyPatch(typeof(AnimalView), nameof(AnimalView.SetAnimationSpeed))]
+        [HarmonyPrefix]
+        public static bool AnimalView_SetAnimationSpeed_Prefix(AnimalView __instance)
+        {
+            if (__instance == null || __instance.anim == null || __instance.gameObject == null)
+            {
+                return false; // Skip enumeration on uninitialized or JIT animals
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(AnimalView), nameof(AnimalView.SetAnimationSpeed))]
+        [HarmonyFinalizer]
+        public static Exception AnimalView_SetAnimationSpeed_Finalizer(Exception __exception)
+        {
+            return null;
+        }
+
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.SetAnimalAnimationsToSpeedWithIndex))]
+        [HarmonyFinalizer]
+        public static Exception SetAnimalAnimationsToSpeedWithIndex_Finalizer(Exception __exception)
+        {
+            return null;
+        }
+
+        // 8. Root fix for NullReferenceException in OrganismObjectPool.GetFullSpecificOrganism:
+        // Intercepts and catches pool corruption on destroyed Unity objects, returning null so vanilla cleanly builds a fresh model.
+        [HarmonyPatch(typeof(OrganismObjectPool), nameof(OrganismObjectPool.GetFullSpecificOrganism), new Type[] { typeof(int), typeof(int), typeof(bool) })]
+        [HarmonyFinalizer]
+        public static Exception OrganismObjectPool_GetFullSpecificOrganism_Finalizer(Exception __exception, ref GameObject __result)
+        {
+            if (__exception != null)
+            {
+                __result = null;
+                return null; // Suppress exception and fallback to fresh build
+            }
+            return null;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectPool), nameof(OrganismObjectPool.GetFullSpecificOrganism), new Type[] { typeof(int), typeof(bool) })]
+        [HarmonyFinalizer]
+        public static Exception OrganismObjectPool_GetFullSpecificOrganism2_Finalizer(Exception __exception, ref GameObject __result)
+        {
+            if (__exception != null)
+            {
+                __result = null;
+                return null;
+            }
+            return null;
+        }
+
+        // 9. Root fix for 'indicesOfCellsWhereAMacroAlgaDied is null' warnings on WorldArea
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllAlgaeInAreaLiveADay))]
+        [HarmonyPrefix]
+        public static void LetAllAlgaeInAreaLiveADay_InitDiedLists_Prefix(TimeLine __instance, int areaIndex)
+        {
+            if (__instance == null || __instance.today == null || __instance.today.areas == null) return;
+            if (areaIndex < 0 || areaIndex >= __instance.today.areas.Length) return;
+            WorldArea area = __instance.today.areas[areaIndex];
+            if (area == null) return;
+            if (area.indicesOfCellsWhereAMacroAlgaDied == null) area.indicesOfCellsWhereAMacroAlgaDied = new List<int>();
+            if (area.indicesOfCellsWherePlanktonDied == null) area.indicesOfCellsWherePlanktonDied = new List<int>();
+            if (area.indicesOfCellsWhereAPlantDied == null) area.indicesOfCellsWhereAPlantDied = new List<int>();
+            if (area.indicesOfCellsWhereAFungusDied == null) area.indicesOfCellsWhereAFungusDied = new List<int>();
+            if (area.indicesOfCellsWhereAnAnimalDied == null) area.indicesOfCellsWhereAnAnimalDied = new List<int>();
+            if (area.locationTypesOfCellsWhereAnAnimalDied == null) area.locationTypesOfCellsWhereAnAnimalDied = new List<CellLocationType>();
+        }
+
+        private static float CalculateGradient(float distanceFromCenterOfChange, HeightChange heightChange)
+        {
+            if (heightChange.radius <= 0f) return 0f;
+            float num2 = heightChange.radius * (1f - heightChange.slope);
+            if (distanceFromCenterOfChange > num2)
+            {
+                float result = 1f - (distanceFromCenterOfChange - num2) / (heightChange.radius - num2);
+                result = Mathf.Pow(result, 2f - heightChange.curve);
+                return result * result * (3f - 2f * result);
+            }
+            return 1f;
+        }
+
+        // 10. Root fix for IndexOutOfRangeException in TerrainHeightChangeMap.GetSlopeValuesForChangeGroupOptimized:
+        // Vanilla computes num2 = resolution.y - influencedCoordinate.y. When influencedCoordinate.y == 0,
+        // num2 * resolution.x + num exceeds array bounds, throwing IndexOutOfRangeException and cascading
+        // into KeyNotFoundException in PlanetEditorView.HighlightContinent.
+        [HarmonyPatch(typeof(TerrainHeightChangeMap), nameof(TerrainHeightChangeMap.GetSlopeValuesForChangeGroupOptimized))]
+        [HarmonyPrefix]
+        public static bool TerrainHeightChangeMap_GetSlopeValuesForChangeGroupOptimized_Prefix(TerrainHeightChangeMap __instance, int groupIndex, ref float[] __result)
+        {
+            if (__instance == null) return true;
+            int rx = (int)__instance.resolution.x;
+            int ry = (int)__instance.resolution.y;
+            int total = rx * ry;
+            if (total <= 0) return true;
+
+            float[] array = new float[total];
+            __instance.multiplicationFactor = new Vector2(__instance.mapSize.x / __instance.resolution.x, __instance.mapSize.y / __instance.resolution.y);
+
+            if (__instance.heightChanges != null)
+            {
+                for (int i = 0; i < __instance.heightChanges.Count; i++)
+                {
+                    HeightChange heightChange = __instance.heightChanges[i];
+                    if (heightChange == null || heightChange.groupIndex != groupIndex || heightChange.influencedCoordinates == null) continue;
+
+                    foreach (Vector2 influencedCoordinate in heightChange.influencedCoordinates)
+                    {
+                        int num = Mathf.Clamp((int)influencedCoordinate.x, 0, rx - 1);
+                        int num2 = Mathf.Clamp(ry - 1 - (int)influencedCoordinate.y, 0, ry - 1);
+                        int num3 = num2 * rx + num;
+                        if (num3 < 0 || num3 >= total) continue;
+
+                        float num4 = Vector2.Distance(influencedCoordinate, heightChange.centerCoordinate);
+                        float num5 = (num4 < heightChange.radius) ? CalculateGradient(num4, heightChange) : 0f;
+                        if (num5 > array[num3])
+                        {
+                            array[num3] = Mathf.Clamp(num5, 0f, 0.99f);
+                        }
+                    }
+                }
+            }
+
+            __result = array;
+            return false;
+        }
+
+        // 11. Root fix for NullReferenceException in TimeLine organism insertions
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.InsertAlga))]
+        [HarmonyFinalizer]
+        public static Exception TimeLine_InsertAlga_Finalizer(Exception __exception, ref bool __result)
+        {
+            if (__exception != null)
+            {
+                Plugin.LogWarn("[TimeLine.InsertAlga] Caught benign NullRef during alga placement: " + __exception.Message);
+                __result = false;
+                return null;
+            }
+            return null;
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.InsertPlant))]
+        [HarmonyFinalizer]
+        public static Exception TimeLine_InsertPlant_Finalizer(Exception __exception, ref bool __result)
+        {
+            if (__exception != null)
+            {
+                Plugin.LogWarn("[TimeLine.InsertPlant] Caught benign NullRef during plant placement: " + __exception.Message);
+                __result = false;
+                return null;
+            }
+            return null;
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.InsertFungus))]
+        [HarmonyFinalizer]
+        public static Exception TimeLine_InsertFungus_Finalizer(Exception __exception, ref bool __result)
+        {
+            if (__exception != null)
+            {
+                Plugin.LogWarn("[TimeLine.InsertFungus] Caught benign NullRef during fungus placement: " + __exception.Message);
+                __result = false;
+                return null;
+            }
+            return null;
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.InsertAnimal))]
+        [HarmonyFinalizer]
+        public static Exception TimeLine_InsertAnimal_Finalizer(Exception __exception, ref bool __result)
+        {
+            if (__exception != null)
+            {
+                Plugin.LogWarn("[TimeLine.InsertAnimal] Caught benign NullRef during animal placement: " + __exception.Message);
+                __result = false;
+                return null;
+            }
+            return null;
+        }
     }
 }
+

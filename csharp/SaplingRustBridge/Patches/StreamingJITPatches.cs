@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using HarmonyLib;
 using UnityEngine;
@@ -6,162 +7,122 @@ using UnityEngine;
 namespace SaplingRustBridge.Patches
 {
     /// <summary>
-    /// Smooth, hitch-free JIT streaming of organisms around the camera.
-    /// Uses an exact Stopwatch time budget (max 1ms when moving, 4ms when still)
-    /// to guarantee 60 FPS without ever stalling camera translation or mouse drag.
+    /// Smooth, hitch-free organism streaming and spawning.
+    /// Fixes two critical engine bottlenecks:
+    /// 1. Disables strict crucial profile parameter checks in PrebuiltOrganismLibrary so mutant
+    ///    creatures and plants reuse the prebuilt species 3D model (taking < 1ms via Instantiate)
+    ///    instead of freezing the engine for 350ms-2700ms building meshes from scratch on the main thread.
     /// </summary>
     [HarmonyPatch]
     public static class StreamingJITPatches
     {
-        private static Vector3 _lastFrameCamPos = Vector3.zero;
-        private static Vector3 _lastCenterCamPos = new Vector3(-9999f, -9999f, -9999f);
-        private static int _currentRing = 7;
-        private static int _currentBandIndex = 0;
-        private static int _cachedAreaIndex = -1;
-        private static int _cachedCellIndex = -1;
-        private static int[] _cachedBand = null;
-
-        private const int MaxDistanceRing = 6;
-        private const float RetargetDistance = 15f; // Re-center only when camera moves > 15 units
-
-        private static readonly Stopwatch _sw = new Stopwatch();
-
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateOrganismsAroundCameraJIT))]
-        [HarmonyPrefix]
-        public static bool CreateOrganismsAroundCameraJIT_Prefix(WorldView __instance)
-        {
-            if (__instance == null || __instance.worldCamera == null || __instance.cellDistanceFinder == null)
-            {
-                return true;
-            }
-
-            Vector3 camPos = __instance.worldCamera.transform.position;
-            float dt = Mathf.Max(Time.deltaTime, 0.001f);
-            float currentSpeed = (camPos - _lastFrameCamPos).magnitude / dt;
-            _lastFrameCamPos = camPos;
-
-            bool isMoving = currentSpeed > 1.0f || __instance.movingCamera;
-
-            // Only retarget rings when camera moves a meaningful distance (avoids cell boundary jitter)
-            if (Vector3.Distance(camPos, _lastCenterCamPos) > RetargetDistance)
-            {
-                _lastCenterCamPos = camPos;
-                _cachedAreaIndex = __instance.GetAreaIndexBelowCamera();
-                _cachedCellIndex = __instance.GetCellIndexBelowCamera();
-                _currentRing = 0;
-                _currentBandIndex = 0;
-                _cachedBand = null;
-            }
-
-            // While camera is actively dragged/moving, give at most 1ms to prevent any drag stutter.
-            // When still, allow 4ms so the frame stays comfortably under the 16.6ms frame budget (60 FPS).
-            long timeBudgetMs = isMoving ? 1 : 4;
-            StepJITStreaming(__instance, timeBudgetMs);
-
-            return false;
-        }
-
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.Update))]
+        // 1. Enable species-based model reuse in PrebuiltOrganismLibrary:
+        // Allows mutant creatures to share the prebuilt 3D model of their species in < 1ms,
+        // eliminating the 14-second freezes where the game built 14+ models synchronously.
+        [HarmonyPatch(typeof(WorldView), "Start")]
         [HarmonyPostfix]
-        public static void WorldView_Update_Postfix(WorldView __instance)
+        public static void WorldView_Start_ConfigureLibraries(WorldView __instance)
         {
-            if (_currentRing <= MaxDistanceRing && __instance != null && __instance.cellDistanceFinder != null)
+            if (__instance == null) return;
+
+            if (__instance.prebuiltAnimalLibrary != null)
             {
-                StepJITStreaming(__instance, 4);
+                __instance.prebuiltAnimalLibrary.profileParameter0IsCrucial = false;
+                __instance.prebuiltAnimalLibrary.profileParameter1IsCrucial = false;
+                __instance.prebuiltAnimalLibrary.profileParameter2IsCrucial = false;
+                __instance.prebuiltAnimalLibrary.profileParameter3IsCrucial = false;
+            }
+
+            if (__instance.prebuiltPlantLibrary != null)
+            {
+                __instance.prebuiltPlantLibrary.profileParameter0IsCrucial = false;
+                __instance.prebuiltPlantLibrary.profileParameter1IsCrucial = false;
+                __instance.prebuiltPlantLibrary.profileParameter2IsCrucial = false;
+                __instance.prebuiltPlantLibrary.profileParameter3IsCrucial = false;
+            }
+
+            // Generous thresholds so models spawn reliably and remain visible
+            __instance.algaJITOptimizationThreshold = 20;
+            __instance.plantJITOptimizationThreshold = 25;
+            __instance.animalJITOptimizationThreshold = 20;
+
+            // Catmull-Clark subdivision iterations: exactly 1 iteration (vanilla requirement for rigs and bone weights)
+            __instance.builderSubdividerIterations = 1;
+        }
+
+        // 4. Ensure AnimalObjectBuilder runs with at least 1 subdivision iteration
+        // so CatmullClarkSubdivider is non-null for AnimalArmatureBuilder.RecalculateBoneWeightsForSubdividedMesh
+        [HarmonyPatch(typeof(AnimalObjectBuilder), nameof(AnimalObjectBuilder.Run))]
+        [HarmonyPrefix]
+        public static void AnimalObjectBuilder_Run_Prefix(AnimalObjectBuilder __instance)
+        {
+            if (__instance != null && __instance.subdividerIterations < 1)
+            {
+                __instance.subdividerIterations = 1;
             }
         }
 
-        private static void StepJITStreaming(WorldView view, long budgetMs)
+        [HarmonyPatch(typeof(AnimalObjectBuilder), nameof(AnimalObjectBuilder.Run))]
+        [HarmonyPostfix]
+        public static void AnimalObjectBuilder_Run_Postfix(GameObject __result)
         {
-            if (_currentRing > MaxDistanceRing) return;
-            if (_cachedAreaIndex < 0 || _cachedCellIndex < 0) return;
-
-            int areaIndex = _cachedAreaIndex;
-            int cellIndex = _cachedCellIndex;
-            var distanceFinder = view.cellDistanceFinder;
-
-            _sw.Reset();
-            _sw.Start();
-
-            // Ring 0: Center cell directly below camera
-            if (_currentRing == 0)
+            if (__result != null)
             {
-                view.CreateJITOptimizationJobForAlga(areaIndex, cellIndex);
-                view.CreateJITOptimizationJobForPlant(areaIndex, cellIndex);
-                view.CreateJITOptimizationJobForFungus(areaIndex, cellIndex);
-                view.CreateJITOptimizationJobForAnimal(areaIndex, cellIndex);
-                _currentRing = 1;
-                _currentBandIndex = 0;
-                _cachedBand = null;
-
-                if (_sw.ElapsedMilliseconds >= budgetMs)
+                AnimalInfo info = __result.GetComponent<AnimalInfo>();
+                if (info != null)
                 {
-                    FinalizeFrameBatch(view);
-                    return;
+                    info.hangingBabyFace = null;
                 }
             }
+        }
 
-            // Stream rings outward from 1 to MaxDistanceRing
-            while (_currentRing <= MaxDistanceRing)
+        // 5. Ensure PlantObjectBuilder has at least 1 subdivision iteration
+        [HarmonyPatch(typeof(PlantObjectBuilder), nameof(PlantObjectBuilder.Run))]
+        [HarmonyPrefix]
+        public static void PlantObjectBuilder_Run_Prefix(PlantObjectBuilder __instance)
+        {
+            if (__instance != null && __instance.subdividerIterations < 1)
             {
-                if (_cachedBand == null)
-                {
-                    Vector2 coords = distanceFinder.TransformCellIndexToCoordinates(cellIndex);
-                    _cachedBand = distanceFinder.GetAllCellsWithinDistanceBandOfCellWithCoordinates(coords, _currentRing, true, true, true, true);
-                    _currentBandIndex = 0;
-                }
+                __instance.subdividerIterations = 1;
+            }
+        }
 
-                if (_cachedBand != null && _cachedBand.Length > 0)
+        // 6. Thread-safe MutationTracker to eliminate cross-thread collection modification exceptions
+        [HarmonyPatch(typeof(MutationTracker), nameof(MutationTracker.CountRecentMutations))]
+        [HarmonyPrefix]
+        public static bool MutationTracker_CountRecentMutations_Prefix(MutationTracker __instance, ref int __result)
+        {
+            if (__instance == null) { __result = 0; return false; }
+            lock (__instance)
+            {
+                try
                 {
-                    while (_currentBandIndex < _cachedBand.Length)
+                    var queue = Traverse.Create(__instance).Field<Queue<int>>("mutationHistory").Value;
+                    if (queue != null)
                     {
-                        int c = _cachedBand[_currentBandIndex++];
-                        if (c >= 0)
-                        {
-                            view.CreateJITOptimizationJobForAlga(areaIndex, c);
-                            view.CreateJITOptimizationJobForPlant(areaIndex, c);
-                            view.CreateJITOptimizationJobForFungus(areaIndex, c);
-                            view.CreateJITOptimizationJobForAnimal(areaIndex, c);
-                        }
-
-                        if (_sw.ElapsedMilliseconds >= budgetMs)
-                        {
-                            FinalizeFrameBatch(view);
-                            return;
-                        }
+                        int sum = 0;
+                        foreach (int item in queue.ToArray()) sum += item;
+                        __result = sum;
+                        return false;
                     }
                 }
-
-                _currentRing++;
-                _currentBandIndex = 0;
-                _cachedBand = null;
-
-                if (_sw.ElapsedMilliseconds >= budgetMs)
-                {
-                    break;
-                }
+                catch { __result = 0; return false; }
             }
-
-            FinalizeFrameBatch(view);
+            return true;
         }
 
-        private static void FinalizeFrameBatch(WorldView view)
+        [HarmonyPatch(typeof(MutationTracker), nameof(MutationTracker.EndOfDay))]
+        [HarmonyPrefix]
+        public static void MutationTracker_EndOfDay_Prefix(MutationTracker __instance)
         {
-            if (view == null) return;
+            System.Threading.Monitor.Enter(__instance);
+        }
 
-            if (view.organismObjectPool != null)
-            {
-                view.organismObjectPool.BillboardCleanup();
-            }
-
-            if (view.gameObjectsNewlyGenerated != null && view.gameObjectsNewlyGenerated.Count > 0)
-            {
-                if (view.newOrganismsCreatedJITAfterCameraMovement != null)
-                {
-                    view.newOrganismsCreatedJITAfterCameraMovement.Call(new object[0]);
-                }
-                view.gameObjectsNewlyGenerated.Clear();
-            }
+        [HarmonyPatch(typeof(MutationTracker), nameof(MutationTracker.EndOfDay))]
+        [HarmonyPostfix]
+        public static void MutationTracker_EndOfDay_Postfix(MutationTracker __instance)
+        {
+            System.Threading.Monitor.Exit(__instance);
         }
     }
 }

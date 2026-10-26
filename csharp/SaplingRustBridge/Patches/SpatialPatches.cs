@@ -198,6 +198,405 @@ namespace SaplingRustBridge.Patches
             return _batchOutIndices;
         }
 
+        /// <summary>
+        /// Phase 1: Native Discrete 2D Grid & Concentric Ring Instinct Search
+        /// Bridges original WorldArea / WorldCell logic to multi-threaded native Rust.
+        /// </summary>
+        public static class NativeGridManager
+        {
+            public static IntPtr Handle = IntPtr.Zero;
+            private static int _width = 0;
+            private static int _height = 0;
+            private static bool _terrainSynced = false;
+
+            public static void EnsureGrid(int width, int height)
+            {
+                if (Handle != IntPtr.Zero && (_width != width || _height != height))
+                {
+                    NativeSim.sapling_grid_free(Handle);
+                    Handle = IntPtr.Zero;
+                    _terrainSynced = false;
+                }
+
+                if (Handle == IntPtr.Zero && width > 0 && height > 0)
+                {
+                    _width = width;
+                    _height = height;
+                    Handle = NativeSim.sapling_grid_create((uint)width, (uint)height);
+                    _terrainSynced = false;
+                }
+            }
+
+            public static void Free()
+            {
+                if (Handle != IntPtr.Zero)
+                {
+                    NativeSim.sapling_grid_free(Handle);
+                    Handle = IntPtr.Zero;
+                    _terrainSynced = false;
+                }
+            }
+
+            public static void SyncTerrain(WorldArea area)
+            {
+                if (Handle == IntPtr.Zero || area == null || area.cells == null) return;
+                for (int i = 0; i < area.cells.Length; i++)
+                {
+                    var cell = area.cells[i];
+                    if (cell != null)
+                    {
+                        byte isWater = (byte)(cell.oceanDepth != -1f ? 1 : 0);
+                        NativeSim.sapling_grid_set_terrain(Handle, (uint)i, cell.oceanDepth, isWater);
+                    }
+                }
+                _terrainSynced = true;
+            }
+
+            public static void SyncOrganisms(WorldArea area, TimeLine timeLine = null)
+            {
+                if (Handle == IntPtr.Zero || area == null || area.cells == null) return;
+                if (!_terrainSynced)
+                {
+                    SyncTerrain(area);
+                }
+
+                NativeSim.sapling_grid_clear_organisms(Handle);
+
+                // 1. Sync plants
+                var plantIndices = area.cellIndicesOfPlants;
+                if (plantIndices != null)
+                {
+                    for (int i = 0; i < plantIndices.Count; i++)
+                    {
+                        int idx = plantIndices[i];
+                        if (idx >= 0 && idx < area.cells.Length)
+                        {
+                            var cell = area.cells[idx];
+                            if (cell != null && cell.plant != null && cell.plant.definition != null)
+                            {
+                                var def = cell.plant.definition;
+                                NativeSim.sapling_grid_set_plant(
+                                    Handle,
+                                    (uint)idx,
+                                    (short)def.definitionIndex,
+                                    def.colorHue,
+                                    def.colorBrightness,
+                                    cell.plant.lowestLeafHeight,
+                                    (byte)(cell.plant.lowestFruitHeight != -1f ? 1 : 0),
+                                    def.fruitHue,
+                                    (byte)(def.barkType == BarkType.None ? 1 : 0));
+
+                                byte seedCount = (byte)(cell.plant.indicesOfSeedsThatAreReady != null ? cell.plant.indicesOfSeedsThatAreReady.Count : 0);
+                                NativeSim.sapling_grid_set_plant_bio(
+                                    Handle,
+                                    (uint)idx,
+                                    cell.plant.health,
+                                    cell.plant.energyProfitPerDayDuringDayTime,
+                                    (ushort)cell.plant.age,
+                                    (ushort)cell.plant.maximumAge,
+                                    seedCount);
+                            }
+                        }
+                    }
+                }
+
+                // 2. Sync macro algae
+                var algaIndices = area.cellIndicesOfMacroAlgae;
+                if (algaIndices != null)
+                {
+                    for (int i = 0; i < algaIndices.Count; i++)
+                    {
+                        int idx = algaIndices[i];
+                        if (idx >= 0 && idx < area.cells.Length)
+                        {
+                            var cell = area.cells[idx];
+                            if (cell != null && cell.alga != null && cell.alga.definition != null)
+                            {
+                                var def = cell.alga.definition;
+                                NativeSim.sapling_grid_set_alga(Handle, (uint)idx, 0, def.colorHue, def.colorBrightness);
+                            }
+                        }
+                    }
+                }
+
+                // 3. Sync plankton
+                var planktonIndices = area.cellIndicesOfPlankton;
+                if (planktonIndices != null)
+                {
+                    for (int i = 0; i < planktonIndices.Count; i++)
+                    {
+                        int idx = planktonIndices[i];
+                        if (idx >= 0 && idx < area.cells.Length)
+                        {
+                            var cell = area.cells[idx];
+                            if (cell != null && cell.plankton != null && cell.plankton.definition != null)
+                            {
+                                var def = cell.plankton.definition;
+                                NativeSim.sapling_grid_set_alga(Handle, (uint)idx, 1, def.colorHue, def.colorBrightness);
+                            }
+                        }
+                    }
+                }
+
+                // 4. Sync animals
+                if (area.animalPositionTracker != null && area.animalPositionTracker.animalPositions != null)
+                {
+                    foreach (var pos in area.animalPositionTracker.animalPositions)
+                    {
+                        int idx = pos.cellIndex;
+                        if (idx >= 0 && idx < area.cells.Length)
+                        {
+                            var a = area.GetAnimalInCell(idx, pos.locationType);
+                            if (a != null && a.definition != null && !a.dying && !a.eaten)
+                            {
+                                var def = a.definition;
+                                short spIndex = (short)def.definitionIndex;
+                                if (timeLine != null && timeLine.populationBasedAnimalClassifier != null)
+                                {
+                                    int sp = timeLine.populationBasedAnimalClassifier.LookUp(def.definitionIndex);
+                                    if (sp != -1) spIndex = (short)sp;
+                                }
+
+                                byte fert = (byte)(
+                                    (a.ReadyForInternalFertilization(true) ? 1 : 0) |
+                                    (a.ReadyForInternalFertilization(false) ? 2 : 0) |
+                                    (a.ReadyForExternalFertilization() ? 4 : 0)
+                                );
+                                float loudness = (a.stepSound != null) ? a.stepSound.loudness : 1.0f;
+                                NativeSim.sapling_grid_set_animal(
+                                    Handle,
+                                    (uint)idx,
+                                    spIndex,
+                                    def.colorHue,
+                                    def.colorBrightness,
+                                    (byte)def.skinPattern,
+                                    fert,
+                                    loudness,
+                                    (byte)(a.glowing ? 1 : 0));
+
+                                byte diet = (byte)(a.eatsMeatOnly ? 1 : (a.eatsPlants ? 0 : 2));
+                                NativeSim.sapling_grid_set_animal_bio(
+                                    Handle,
+                                    (uint)idx,
+                                    a.health,
+                                    a.energy,
+                                    1.0f,
+                                    (ushort)a.age,
+                                    (ushort)a.expectedAge,
+                                    diet);
+                            }
+                        }
+                    }
+                }
+
+                // 5. Sync fungi via indexed list
+                if (area.cellIndicesOfFungi != null)
+                {
+                    for (int f = 0; f < area.cellIndicesOfFungi.Count; f++)
+                    {
+                        int idx = area.cellIndicesOfFungi[f];
+                        if (idx >= 0 && idx < area.cells.Length)
+                        {
+                            var cell = area.cells[idx];
+                            if (cell != null && cell.fungus != null && cell.fungus.definition != null)
+                            {
+                                NativeSim.sapling_grid_set_fungus(
+                                    Handle,
+                                    (uint)idx,
+                                    (short)cell.fungus.definition.definitionIndex,
+                                    (byte)(cell.fungus.definition.myceliumType == Mycelium.Parasite ? 1 : 0),
+                                    1.0f,
+                                    (ushort)cell.fungus.cycleDuration);
+                            }
+                        }
+                    }
+                }
+
+                // 6. Sync grass
+                for (int i = 0; i < area.cells.Length; i++)
+                {
+                    var cell = area.cells[i];
+                    if (cell != null && cell.grassHeight > 0)
+                    {
+                        NativeSim.sapling_grid_set_grass(Handle, (uint)i, cell.grassHue, cell.grassBrightness);
+                    }
+                }
+            }
+        }
+
+    [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllAnimalsInAreaLiveADay))]
+    [HarmonyPrefix]
+    public static void LetAllAnimalsInAreaLiveADay_NativeGrid_Prefix(TimeLine __instance, int areaIndex)
+    {
+        try
+        {
+            if (__instance == null || __instance.today == null || __instance.today.areas == null) return;
+            if (areaIndex < 0 || areaIndex >= __instance.today.areas.Length) return;
+            WorldArea area = __instance.today.areas[areaIndex];
+            if (area == null || area.cells == null) return;
+
+            NativeGridManager.EnsureGrid((int)area.size.y, (int)area.size.x);
+            NativeGridManager.SyncOrganisms(area, __instance);
+        }
+        catch {}
+    }
+
+    [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.SearchNearbyCellsForInstinctTrigger))]
+    [HarmonyPrefix]
+    public static bool SearchNearbyCellsForInstinctTrigger_Native_Prefix(
+        TimeLine __instance,
+        InstinctDefinition instinct,
+        LivingAnimal animal,
+        int areaIndex,
+        int cellIndex,
+        CellLocationType locationType,
+        Vector2 sensingRange,
+        SpeciesDefinition ownSpecies,
+        float unwarpedPlaceInDayNightCycle,
+        ref int __result)
+    {
+        if (animal == null || instinct == null) return true;
+
+        // 1. High-level pruning
+        var cond = instinct.conditionObject;
+        if (cond == InstinctConditionObject.APotentialMate)
+        {
+            if (animal.isChild || animal.age < animal.matureAtAge || animal.pregnant ||
+                (!animal.ReadyForInternalFertilization(false) &&
+                 !animal.ReadyForInternalFertilization(true) &&
+                 !animal.ReadyForExternalFertilization()))
+            {
+                __result = -1;
+                return false;
+            }
+        }
+        if (cond == InstinctConditionObject.Food || cond == InstinctConditionObject.APlant || cond == InstinctConditionObject.AnAlga)
+        {
+            if (!animal.canEat)
+            {
+                __result = -1;
+                return false;
+            }
+            if (animal.eatsMeatOnly && (cond == InstinctConditionObject.APlant || cond == InstinctConditionObject.AnAlga))
+            {
+                __result = -1;
+                return false;
+            }
+        }
+        if (animal.sessile && instinct.action == InstinctAction.GoTowards)
+        {
+            __result = -1;
+            return false;
+        }
+
+        // 2. Native Rust Concentric Ring Search
+        IntPtr grid = NativeGridManager.Handle;
+        if (grid == IntPtr.Zero)
+        {
+            return true; // Fallback to original C# method
+        }
+
+        try
+        {
+            NativeSim.NativeInstinctQuery q = default;
+            q.CellIndex = cellIndex;
+            q.MinDistance = (int)sensingRange.x;
+            q.MaxDistance = (int)sensingRange.y;
+            q.ConditionSense = (int)instinct.conditionSense;
+            q.ConditionObject = (int)instinct.conditionObject;
+
+            if (instinct.conditionSense == InstinctConditionSense.See)
+            {
+                bool[] dirs = animal.ListVisibleDirections();
+                if (dirs != null && dirs.Length >= 4)
+                {
+                    q.Top = (byte)(dirs[0] ? 1 : 0);
+                    q.Left = (byte)(dirs[1] ? 1 : 0);
+                    q.Right = (byte)(dirs[2] ? 1 : 0);
+                    q.Bottom = (byte)(dirs[3] ? 1 : 0);
+                }
+                else
+                {
+                    q.Top = 1; q.Left = 1; q.Right = 1; q.Bottom = 1;
+                }
+            }
+            else
+            {
+                q.Top = 1; q.Left = 1; q.Right = 1; q.Bottom = 1;
+            }
+
+            int ownSpeciesIdx = -1;
+            if (__instance != null && __instance.populationBasedAnimalClassifier != null && animal.definition != null)
+            {
+                ownSpeciesIdx = __instance.populationBasedAnimalClassifier.LookUp(animal.definition.definitionIndex);
+            }
+            if (ownSpeciesIdx == -1 && animal.definition != null)
+            {
+                ownSpeciesIdx = animal.definition.definitionIndex;
+            }
+            q.OwnSpeciesIndex = ownSpeciesIdx;
+            q.CursorCellIndex = (__instance != null) ? __instance.cursorCellIndex : -1;
+            q.HueMin = instinct.conditionRange.x;
+            q.HueMax = instinct.conditionRange.y;
+            q.BrightnessMin = instinct.conditionAdditionalRange.x;
+            q.BrightnessMax = instinct.conditionAdditionalRange.y;
+            q.AddHueMin = instinct.conditionAdditionalRange2.x;
+            q.AddHueMax = instinct.conditionAdditionalRange2.y;
+
+            uint canEat = 0;
+            if (animal.orderedDetailedFoodTypes != null)
+            {
+                for (int ft = 0; ft < animal.orderedDetailedFoodTypes.Length; ft++)
+                {
+                    switch (animal.orderedDetailedFoodTypes[ft])
+                    {
+                        case DetailedFoodType.SoftPlantTissue: canEat |= 1; break;
+                        case DetailedFoodType.Grass: canEat |= 2; break;
+                        case DetailedFoodType.Fruit: canEat |= 4; break;
+                        case DetailedFoodType.WholeAnimal:
+                        case DetailedFoodType.FreshMeat:
+                        case DetailedFoodType.OldMeat: canEat |= 8; break;
+                    }
+                }
+            }
+            if (canEat == 0)
+            {
+                if (animal.eatsPlants) canEat |= (1 | 2 | 4);
+                if (animal.eatsMeat) canEat |= 8;
+            }
+            q.CanEatFlags = canEat;
+            q.CanEatAtHeight = animal.canEatAtHeight * 10f;
+            q.CanFly = (byte)(animal.canFly ? 1 : 0);
+            q.CanClimb = (byte)(animal.canClimb ? 1 : 0);
+            q.ReadyInternalReceiver = (byte)(animal.ReadyForInternalFertilization(true) ? 1 : 0);
+            q.ReadyInternalGiver = (byte)(animal.ReadyForInternalFertilization(false) ? 1 : 0);
+            q.ReadyExternal = (byte)(animal.ReadyForExternalFertilization() ? 1 : 0);
+
+            ushort patternMask = 0;
+            if (instinct.conditionChoices != null)
+            {
+                for (int c = 0; c < instinct.conditionChoices.Length && c < 16; c++)
+                {
+                    if (instinct.conditionChoices[c]) patternMask |= (ushort)(1 << c);
+                }
+            }
+            q.SkinPatternMask = patternMask;
+
+            int res = NativeSim.sapling_grid_search_instinct(grid, ref q);
+            if (res != -1)
+            {
+                __result = res;
+                return false; // Found via native Rust SIMD search with 0 allocations!
+            }
+            return true; // Fallback to vanilla C# search for cross-species interbreeding and subtle edge cases!
+        }
+        catch
+        {
+            return true; // Fallback on any error
+        }
     }
 }
+}
+
+
 

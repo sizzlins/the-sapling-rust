@@ -2,6 +2,7 @@
 /target
 **/bin/
 **/obj/
+*.dll
 
 # Local and temporary tooling
 **/*.log

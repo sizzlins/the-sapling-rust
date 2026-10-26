@@ -120,147 +120,41 @@ namespace SaplingRustBridge.Patches
             return false;
         }
 
-        // --- 3. Prune futile spatial searches (Mate, Satiety/Diet, Sessile) ---
-        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.SearchNearbyCellsForInstinctTrigger))]
-        [HarmonyPrefix]
-        public static bool SearchNearbyCellsForInstinctTrigger_Prefix(
-            InstinctDefinition instinct,
-            LivingAnimal animal,
-            ref int __result)
-        {
-            if (animal == null || instinct == null) return true;
+        private static WorldController _activeWorldController;
 
-            var cond = instinct.conditionObject;
-
-            // 1. Mate Search Pruning:
-            if (cond == InstinctConditionObject.APotentialMate)
-            {
-                if (animal.isChild || animal.age < animal.matureAtAge || animal.pregnant ||
-                    (!animal.ReadyForInternalFertilization(false) &&
-                     !animal.ReadyForInternalFertilization(true) &&
-                     !animal.ReadyForExternalFertilization()))
-                {
-                    __result = -1;
-                    return false; // Skip 10 concentric rings of cells!
-                }
-            }
-
-            // 2. Food & Foraging Search Pruning:
-            if (cond == InstinctConditionObject.Food || cond == InstinctConditionObject.APlant || cond == InstinctConditionObject.AnAlga)
-            {
-                // Can't eat at all, or already fully satiated (energy >= 90% of max capacity)
-                if (!animal.canEat || animal.energy >= animal.CalculateReproductionThreshold() * 0.90f)
-                {
-                    __result = -1;
-                    return false; // Satiated creatures do not scan 100 cells for food!
-                }
-
-                // Pure carnivores never forage for plants or algae
-                if (animal.eatsMeatOnly && (cond == InstinctConditionObject.APlant || cond == InstinctConditionObject.AnAlga))
-                {
-                    __result = -1;
-                    return false;
-                }
-
-                // Non-plant eaters looking at plants
-                if (cond == InstinctConditionObject.APlant && !animal.eatsPlants && !animal.eatsNectar)
-                {
-                    __result = -1;
-                    return false;
-                }
-            }
-
-            // 3. Sessile Creature Pruning:
-            // Immobile creatures cannot travel to distant cells
-            if (animal.sessile && instinct.action == InstinctAction.GoTowards)
-            {
-                __result = -1;
-                return false;
-            }
-
-            return true;
-        }
-
-        // --- 4. Prevent 10-32 GB RAM Balloon: Cap historical WorldState snapshots ---
-        private const int MaxTimelineHistory = 200;
-
-        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LiveADay))]
+        [HarmonyPatch(typeof(WorldController), "Start")]
         [HarmonyPostfix]
-        public static void TimeLine_LiveADay_CapHistory(TimeLine __instance)
+        public static void WorldController_Start_Postfix(WorldController __instance)
         {
-            if (__instance == null || __instance.line == null) return;
-
-            // Demographics graphs only query ~100 recent points.
-            // Keeping thousands of full WorldState clones exhausts the 32-bit/Mono heap.
-            if (__instance.line.Count > MaxTimelineHistory + 50)
-            {
-                int toRemove = __instance.line.Count - MaxTimelineHistory;
-                __instance.line.RemoveRange(0, toRemove);
-            }
-        }
-
-        // --- 4. Adaptive Frame Budgeting for Time Skip (Smooth UI, No Freezes) ---
-        private static readonly Stopwatch _jumpStopwatch = new Stopwatch();
-        private const long TargetFrameBudgetMs = 30; // Max 30ms per frame to maintain ~30+ FPS
-
-        [HarmonyPatch(typeof(TimeJumpController), nameof(TimeJumpController.Update))]
-        [HarmonyPrefix]
-        public static void TimeJumpController_Update_Prefix(TimeJumpController __instance)
-        {
-            _jumpStopwatch.Reset();
-            _jumpStopwatch.Start();
-        }
-
-        [HarmonyPatch(typeof(TimeJumpController), nameof(TimeJumpController.Update))]
-        [HarmonyPostfix]
-        public static void TimeJumpController_Update_Postfix(TimeJumpController __instance)
-        {
-            _jumpStopwatch.Stop();
-            long elapsed = _jumpStopwatch.ElapsedMilliseconds;
-
-            if (__instance == null) return;
-
-            // Dynamically adjust jump batch size to match hardware throughput
-            if (elapsed > TargetFrameBudgetMs + 10)
-            {
-                // Frame took too long: reduce batch to keep UI responsive
-                __instance.nrOfDaysToJumpPerFrame = Math.Max(2, __instance.nrOfDaysToJumpPerFrame - 2);
-            }
-            else if (elapsed < TargetFrameBudgetMs - 10 && __instance.nrOfDaysToJumpPerFrame < 50)
-            {
-                // Headroom available: increase batch to jump faster
-                __instance.nrOfDaysToJumpPerFrame = Math.Min(50, __instance.nrOfDaysToJumpPerFrame + 2);
-            }
+            _activeWorldController = __instance;
         }
 
         [HarmonyPatch(typeof(WorldController), "Update")]
         [HarmonyPrefix]
-        public static void WorldController_Update_Prefix(WorldController __instance)
+        public static void WorldController_Update_Track(WorldController __instance)
         {
-            if (__instance != null && __instance.nrOfDaysToDoInCurrentTimeJump > 0)
+            _activeWorldController = __instance;
+        }
+
+        // --- 4. Synchronize Calendar Display with actual DayIndex ---
+        [HarmonyPatch(typeof(WorldUIView), nameof(WorldUIView.UpdateTimeIndicators))]
+        [HarmonyPrefix]
+        public static void WorldUIView_UpdateTimeIndicators_Prefix(ref int numberOfYears)
+        {
+            if (_activeWorldController != null && _activeWorldController.timeLine != null && _activeWorldController.timeLine.dayIndex > numberOfYears)
             {
-                _jumpStopwatch.Reset();
-                _jumpStopwatch.Start();
+                numberOfYears = _activeWorldController.timeLine.dayIndex;
             }
         }
 
-        [HarmonyPatch(typeof(WorldController), "Update")]
-        [HarmonyPostfix]
-        public static void WorldController_Update_Postfix(WorldController __instance)
+        // --- 5. Synchronize Night Cycle colors with actual DayIndex ---
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateColorsForNightCycle))]
+        [HarmonyPrefix]
+        public static void WorldView_UpdateColorsForNightCycle_Prefix(ref int currentDayNr)
         {
-            if (__instance != null && _jumpStopwatch.IsRunning)
+            if (_activeWorldController != null && _activeWorldController.timeLine != null && _activeWorldController.timeLine.dayIndex > currentDayNr)
             {
-                _jumpStopwatch.Stop();
-                long elapsed = _jumpStopwatch.ElapsedMilliseconds;
-
-                if (elapsed > TargetFrameBudgetMs + 10)
-                {
-                    __instance.nrOfDaysToJumpPerFrame = Math.Max(2, __instance.nrOfDaysToJumpPerFrame - 2);
-                }
-                else if (elapsed < TargetFrameBudgetMs - 10 && __instance.nrOfDaysToJumpPerFrame < 40)
-                {
-                    __instance.nrOfDaysToJumpPerFrame = Math.Min(40, __instance.nrOfDaysToJumpPerFrame + 2);
-                }
+                currentDayNr = _activeWorldController.timeLine.dayIndex;
             }
         }
     }

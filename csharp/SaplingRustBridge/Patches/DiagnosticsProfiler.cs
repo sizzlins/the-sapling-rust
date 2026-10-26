@@ -13,87 +13,136 @@ namespace SaplingRustBridge.Patches
     [HarmonyPatch]
     public static class DiagnosticsProfiler
     {
-        private static readonly Stopwatch _frameSw = new Stopwatch();
-
-        // 1. Frame Hitch Watchdog: Detects any frame that takes > 40ms (freezes)
-        [HarmonyPatch(typeof(WorldView), "Update")]
+        // 1. Measure WorldController.ShowToday (Daily visual update)
+        [HarmonyPatch(typeof(WorldController), nameof(WorldController.ShowToday))]
         [HarmonyPrefix]
-        public static void WorldView_Update_Start()
-        {
-            _frameSw.Reset();
-            _frameSw.Start();
-        }
-
-        [HarmonyPatch(typeof(WorldView), "Update")]
-        [HarmonyPostfix]
-        public static void WorldView_Update_End()
-        {
-            _frameSw.Stop();
-            long ms = _frameSw.ElapsedMilliseconds;
-            if (ms >= 40)
-            {
-                UnityEngine.Debug.LogWarning($"[PROFILER HITCH] WorldView.Update took {ms} ms! GC Heap: {GC.GetTotalMemory(false) / (1024 * 1024)} MB");
-            }
-        }
-
-        // 2. Measure CreateOrganismsAroundCameraJIT
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateOrganismsAroundCameraJIT))]
-        [HarmonyPrefix]
-        public static void JIT_Prefix(out Stopwatch __state)
+        public static void ShowToday_Prefix(out Stopwatch __state)
         {
             __state = Stopwatch.StartNew();
         }
 
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateOrganismsAroundCameraJIT))]
+        [HarmonyPatch(typeof(WorldController), nameof(WorldController.ShowToday))]
         [HarmonyPostfix]
-        public static void JIT_Postfix(Stopwatch __state)
-        {
-            if (__state != null && __state.ElapsedMilliseconds >= 15)
-            {
-                UnityEngine.Debug.LogWarning($"[PROFILER JIT] CreateOrganismsAroundCameraJIT took {__state.ElapsedMilliseconds} ms!");
-            }
-        }
-
-        // 3. Measure Camera Mouse Drag
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.MoveTheCameraSoPositionAIsSeenAtPositionB))]
-        [HarmonyPrefix]
-        public static void Drag_Prefix(out Stopwatch __state)
-        {
-            __state = Stopwatch.StartNew();
-        }
-
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.MoveTheCameraSoPositionAIsSeenAtPositionB))]
-        [HarmonyPostfix]
-        public static void Drag_Postfix(Stopwatch __state)
+        public static void ShowToday_Postfix(Stopwatch __state)
         {
             if (__state != null && __state.ElapsedMilliseconds >= 20)
             {
-                UnityEngine.Debug.LogWarning($"[PROFILER DRAG] MoveTheCamera took {__state.ElapsedMilliseconds} ms!");
+                Plugin.LogWarn($"[PROFILER TODAY] WorldController.ShowToday took {__state.ElapsedMilliseconds} ms!");
             }
         }
 
-        // 4. Measure Grass Tessellation
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateTesselationDetailForGrassMaterial))]
+        // 2. Measure TimeLine.LiveADay (Daily simulation tick)
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LiveADay))]
         [HarmonyPrefix]
-        public static void Tess_Prefix(out Stopwatch __state)
+        public static void LiveADay_Prefix(out Stopwatch __state)
         {
             __state = Stopwatch.StartNew();
         }
 
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateTesselationDetailForGrassMaterial))]
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LiveADay))]
         [HarmonyPostfix]
-        public static void Tess_Postfix(Stopwatch __state)
+        public static void LiveADay_Postfix(Stopwatch __state)
         {
-            if (__state != null && __state.ElapsedMilliseconds >= 10)
+            if (!TimeJumpPatches.IsTimeJumpActive && __state != null && __state.ElapsedMilliseconds >= 20)
             {
-                UnityEngine.Debug.LogWarning($"[PROFILER TESS] UpdateTesselation took {__state.ElapsedMilliseconds} ms!");
+                Plugin.LogWarn($"[PROFILER SIM] TimeLine.LiveADay took {__state.ElapsedMilliseconds} ms!");
             }
         }
 
-        // 5. Measure Hover Actions
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllPlantsInAreaLiveADay))]
+        [HarmonyPrefix]
+        public static void Plants_Prefix(out Stopwatch __state) { __state = Stopwatch.StartNew(); }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllPlantsInAreaLiveADay))]
+        [HarmonyPostfix]
+        public static void Plants_Postfix(Stopwatch __state)
+        {
+            if (!TimeJumpPatches.IsTimeJumpActive && __state != null && __state.ElapsedMilliseconds >= 15)
+                Plugin.LogWarn($"[PROFILER SIM-PLANTS] LetAllPlants took {__state.ElapsedMilliseconds} ms!");
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllAnimalsInAreaLiveADay))]
+        [HarmonyPrefix]
+        public static void Animals_Prefix(out Stopwatch __state) { __state = Stopwatch.StartNew(); }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllAnimalsInAreaLiveADay))]
+        [HarmonyPostfix]
+        public static void Animals_Postfix(Stopwatch __state)
+        {
+            if (!TimeJumpPatches.IsTimeJumpActive && __state != null && __state.ElapsedMilliseconds >= 15)
+                Plugin.LogWarn($"[PROFILER SIM-ANIMALS] LetAllAnimals took {__state.ElapsedMilliseconds} ms!");
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllAlgaeInAreaLiveADay))]
+        [HarmonyPrefix]
+        public static void Algae_Prefix(out Stopwatch __state) { __state = Stopwatch.StartNew(); }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllAlgaeInAreaLiveADay))]
+        [HarmonyPostfix]
+        public static void Algae_Postfix(Stopwatch __state)
+        {
+            if (!TimeJumpPatches.IsTimeJumpActive && __state != null && __state.ElapsedMilliseconds >= 15)
+                Plugin.LogWarn($"[PROFILER SIM-ALGAE] LetAllAlgae took {__state.ElapsedMilliseconds} ms!");
+        }
+
+        // 3. Measure WorldView.BuildAndCacheAnimal (Procedural animal generation from scratch)
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.BuildAndCacheAnimal))]
+        [HarmonyPrefix]
+        public static void BuildAnimal_Prefix(out Stopwatch __state)
+        {
+            __state = Stopwatch.StartNew();
+        }
+
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.BuildAndCacheAnimal))]
+        [HarmonyPostfix]
+        public static void BuildAnimal_Postfix(Stopwatch __state, AnimalDefinition animalDefinition)
+        {
+            if (__state != null && __state.ElapsedMilliseconds >= 15)
+            {
+                Plugin.LogWarn($"[PROFILER BUILD-ANIMAL] BuildAndCacheAnimal (def {animalDefinition?.definitionIndex}) took {__state.ElapsedMilliseconds} ms!");
+            }
+        }
+
+        // 4. Measure PlantObjectBuilder.Run (Procedural plant generation from scratch)
+        [HarmonyPatch(typeof(PlantObjectBuilder), nameof(PlantObjectBuilder.Run))]
+        [HarmonyPrefix]
+        public static void BuildPlant_Prefix(out Stopwatch __state)
+        {
+            __state = Stopwatch.StartNew();
+        }
+
+        [HarmonyPatch(typeof(PlantObjectBuilder), nameof(PlantObjectBuilder.Run))]
+        [HarmonyPostfix]
+        public static void BuildPlant_Postfix(Stopwatch __state)
+        {
+            if (__state != null && __state.ElapsedMilliseconds >= 15)
+            {
+                Plugin.LogWarn($"[PROFILER BUILD-PLANT] PlantObjectBuilder.Run took {__state.ElapsedMilliseconds} ms!");
+            }
+        }
+
+        // 5. Measure WorldView.UpdateCameraPositionDuringGeneralMovement (Camera move step)
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateCameraPositionDuringGeneralMovement))]
+        [HarmonyPrefix]
+        public static void CamMove_Prefix(out Stopwatch __state)
+        {
+            __state = Stopwatch.StartNew();
+        }
+
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateCameraPositionDuringGeneralMovement))]
+        [HarmonyPostfix]
+        public static void CamMove_Postfix(Stopwatch __state)
+        {
+            if (__state != null && __state.ElapsedMilliseconds >= 20)
+            {
+                Plugin.LogWarn($"[PROFILER CAM-MOVE] UpdateCameraPositionDuringGeneralMovement took {__state.ElapsedMilliseconds} ms!");
+            }
+        }
+
+        // 6. Measure WorldController.AddHoverActionsToNewlyGeneratedGameObjects
         [HarmonyPatch(typeof(WorldController), nameof(WorldController.AddHoverActionsToNewlyGeneratedGameObjects))]
         [HarmonyPrefix]
-        public static void Hover_Prefix(out Stopwatch __state, GameObject[] gameObjectsNewlyGenerated)
+        public static void Hover_Prefix(out Stopwatch __state)
         {
             __state = Stopwatch.StartNew();
         }
@@ -104,43 +153,7 @@ namespace SaplingRustBridge.Patches
         {
             if (__state != null && __state.ElapsedMilliseconds >= 15)
             {
-                UnityEngine.Debug.LogWarning($"[PROFILER HOVER] AddHoverActions ({gameObjectsNewlyGenerated?.Length} objs) took {__state.ElapsedMilliseconds} ms!");
-            }
-        }
-
-        // 6. Measure Plant JIT job
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateJITOptimizationJobForPlant))]
-        [HarmonyPrefix]
-        public static void PlantJIT_Prefix(out Stopwatch __state)
-        {
-            __state = Stopwatch.StartNew();
-        }
-
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateJITOptimizationJobForPlant))]
-        [HarmonyPostfix]
-        public static void PlantJIT_Postfix(Stopwatch __state, int areaIndex, int cellIndex)
-        {
-            if (__state != null && __state.ElapsedMilliseconds >= 20)
-            {
-                UnityEngine.Debug.LogWarning($"[PROFILER PLANT] Cell {cellIndex} plant build took {__state.ElapsedMilliseconds} ms!");
-            }
-        }
-
-        // 7. Measure Animal JIT job
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateJITOptimizationJobForAnimalView))]
-        [HarmonyPrefix]
-        public static void AnimalJIT_Prefix(out Stopwatch __state)
-        {
-            __state = Stopwatch.StartNew();
-        }
-
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateJITOptimizationJobForAnimalView))]
-        [HarmonyPostfix]
-        public static void AnimalJIT_Postfix(Stopwatch __state, AnimalView animalView)
-        {
-            if (__state != null && __state.ElapsedMilliseconds >= 20)
-            {
-                UnityEngine.Debug.LogWarning($"[PROFILER ANIMAL] Animal {animalView?.definition?.definitionIndex} build took {__state.ElapsedMilliseconds} ms!");
+                Plugin.LogWarn($"[PROFILER HOVER] AddHoverActions ({gameObjectsNewlyGenerated?.Length} objs) took {__state.ElapsedMilliseconds} ms!");
             }
         }
     }
