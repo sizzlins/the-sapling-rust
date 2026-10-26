@@ -287,6 +287,60 @@ namespace SaplingRustBridge
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         public static extern float sapling_grid_get_nutrients(IntPtr grid, uint idx);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct NativeCellSnapshot
+        {
+            public ushort Flags;
+            public short PlantSpecies;
+            public float PlantHue;
+            public float PlantBrightness;
+            public float PlantFruitHue;
+            public float PlantLeafHeight;
+            public float PlantHealth;
+            public float PlantEnergy;
+            public ushort PlantAge;
+            public ushort PlantMaxAge;
+            public float AlgaHue;
+            public float AlgaBrightness;
+            public float GrassHue;
+            public float GrassBrightness;
+            public short AnimalSpecies;
+            public ushort Detritus;
+            public float AnimalHue;
+            public float AnimalBrightness;
+            public float AnimalStepLoudness;
+            public float AnimalHealth;
+            public float AnimalEnergy;
+            public float AnimalWater;
+            public ushort AnimalAge;
+            public ushort AnimalMaxAge;
+            public short FungusSpecies;
+            public ushort FungusCycleDuration;
+            public float FungusEnergy;
+            public float Nutrients;
+            public byte PlantSeeds;
+            public byte AnimalSkinPattern;
+            public byte AnimalFertFlags;
+            public byte AnimalDiet;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int sapling_grid_warp(
+            IntPtr grid,
+            uint days,
+            float mutAlgae,
+            float mutPlants,
+            float mutAnimals,
+            float mutFungi,
+            ulong seed,
+            ref NativeDaySummary outSummary);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint sapling_grid_get_all_cells(
+            IntPtr grid,
+            [Out] NativeCellSnapshot[] outSnapshots,
+            uint maxLen);
     }
 }
 

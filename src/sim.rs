@@ -1101,6 +1101,43 @@ pub struct DaySimulationSummary {
     pub total_algae: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeCellSnapshot {
+    pub flags: u16,
+    pub plant_species: i16,
+    pub plant_hue: f32,
+    pub plant_brightness: f32,
+    pub plant_fruit_hue: f32,
+    pub plant_leaf_height: f32,
+    pub plant_health: f32,
+    pub plant_energy: f32,
+    pub plant_age: u16,
+    pub plant_max_age: u16,
+    pub alga_hue: f32,
+    pub alga_brightness: f32,
+    pub grass_hue: f32,
+    pub grass_brightness: f32,
+    pub animal_species: i16,
+    pub detritus: u16,
+    pub animal_hue: f32,
+    pub animal_brightness: f32,
+    pub animal_step_loudness: f32,
+    pub animal_health: f32,
+    pub animal_energy: f32,
+    pub animal_water: f32,
+    pub animal_age: u16,
+    pub animal_max_age: u16,
+    pub fungus_species: i16,
+    pub fungus_cycle_duration: u16,
+    pub fungus_energy: f32,
+    pub nutrients: f32,
+    pub plant_seeds: u8,
+    pub animal_skin_pattern: u8,
+    pub animal_fert_flags: u8,
+    pub animal_diet: u8,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct NativeGrid {
     pub width: usize,
@@ -1736,6 +1773,75 @@ impl NativeGrid {
         }
 
         summary
+    }
+
+    pub fn warp(
+        &mut self,
+        days: u32,
+        mut_algae: f32,
+        mut_plants: f32,
+        mut_animals: f32,
+        mut_fungi: f32,
+        seed: u64,
+        out_summary: &mut DaySimulationSummary,
+    ) {
+        let mut rng = FastRng::new(seed);
+        for _ in 0..days {
+            let day_summary = self.step_simulation_day(mut_algae, mut_plants, mut_animals, mut_fungi, &mut rng);
+            out_summary.plant_births = out_summary.plant_births.saturating_add(day_summary.plant_births);
+            out_summary.plant_deaths = out_summary.plant_deaths.saturating_add(day_summary.plant_deaths);
+            out_summary.animal_births = out_summary.animal_births.saturating_add(day_summary.animal_births);
+            out_summary.animal_deaths = out_summary.animal_deaths.saturating_add(day_summary.animal_deaths);
+            out_summary.fungus_births = out_summary.fungus_births.saturating_add(day_summary.fungus_births);
+            out_summary.fungus_deaths = out_summary.fungus_deaths.saturating_add(day_summary.fungus_deaths);
+            out_summary.alga_births = out_summary.alga_births.saturating_add(day_summary.alga_births);
+            out_summary.alga_deaths = out_summary.alga_deaths.saturating_add(day_summary.alga_deaths);
+            out_summary.total_plants = day_summary.total_plants;
+            out_summary.total_animals = day_summary.total_animals;
+            out_summary.total_fungi = day_summary.total_fungi;
+            out_summary.total_algae = day_summary.total_algae;
+        }
+    }
+
+    pub fn get_all_cells(&self, out: &mut [NativeCellSnapshot]) -> usize {
+        let count = self.flags.len().min(out.len());
+        for i in 0..count {
+            out[i] = NativeCellSnapshot {
+                flags: self.flags[i],
+                plant_species: self.plant_species[i],
+                plant_hue: self.plant_hue[i],
+                plant_brightness: self.plant_brightness[i],
+                plant_fruit_hue: self.plant_fruit_hue[i],
+                plant_leaf_height: self.plant_leaf_height[i],
+                plant_health: self.plant_health[i],
+                plant_energy: self.plant_energy[i],
+                plant_age: self.plant_age[i],
+                plant_max_age: self.plant_max_age[i],
+                alga_hue: self.alga_hue[i],
+                alga_brightness: self.alga_brightness[i],
+                grass_hue: self.grass_hue[i],
+                grass_brightness: self.grass_brightness[i],
+                animal_species: self.animal_species[i],
+                detritus: self.detritus[i],
+                animal_hue: self.animal_hue[i],
+                animal_brightness: self.animal_brightness[i],
+                animal_step_loudness: self.animal_step_loudness[i],
+                animal_health: self.animal_health[i],
+                animal_energy: self.animal_energy[i],
+                animal_water: self.animal_water[i],
+                animal_age: self.animal_age[i],
+                animal_max_age: self.animal_max_age[i],
+                fungus_species: self.fungus_species[i],
+                fungus_cycle_duration: self.fungus_cycle_duration[i],
+                fungus_energy: self.fungus_energy[i],
+                nutrients: self.nutrients[i],
+                plant_seeds: self.plant_seeds[i],
+                animal_skin_pattern: self.animal_skin_pattern[i],
+                animal_fert_flags: self.animal_fert_flags[i],
+                animal_diet: self.animal_diet[i],
+            };
+        }
+        count
     }
 
     #[inline(always)]

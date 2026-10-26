@@ -374,6 +374,139 @@ namespace SaplingRustBridge.Patches
                     }
                 }
             }
+
+            private static NativeSim.NativeCellSnapshot[] _snapshotBuffer;
+
+            public static void SyncBackToUnity(WorldArea area, TimeLine timeLine)
+            {
+                if (Handle == IntPtr.Zero || area == null || area.cells == null) return;
+                int cellCount = area.cells.Length;
+                if (_snapshotBuffer == null || _snapshotBuffer.Length < cellCount)
+                {
+                    _snapshotBuffer = new NativeSim.NativeCellSnapshot[cellCount];
+                }
+
+                uint retrieved = NativeSim.sapling_grid_get_all_cells(Handle, _snapshotBuffer, (uint)cellCount);
+                if (retrieved == 0) return;
+
+                if (area.cellIndicesOfPlants != null) area.cellIndicesOfPlants.Clear();
+                else area.cellIndicesOfPlants = new List<int>();
+
+                if (area.cellIndicesOfMacroAlgae != null) area.cellIndicesOfMacroAlgae.Clear();
+                else area.cellIndicesOfMacroAlgae = new List<int>();
+
+                if (area.cellIndicesOfPlankton != null) area.cellIndicesOfPlankton.Clear();
+                else area.cellIndicesOfPlankton = new List<int>();
+
+                if (area.cellIndicesOfFungi != null) area.cellIndicesOfFungi.Clear();
+                else area.cellIndicesOfFungi = new List<int>();
+
+                if (area.animalPositionTracker != null)
+                {
+                    area.animalPositionTracker.Clear();
+                }
+
+                PlantDefinition refPlantDef = (timeLine != null && timeLine.allPlantSpecies != null && timeLine.allPlantSpecies.Count > 0)
+                    ? (timeLine.allPlantSpecies[0].exampleOrganism as PlantDefinition) : null;
+                AnimalDefinition refAnimalDef = (timeLine != null && timeLine.allAnimalSpecies != null && timeLine.allAnimalSpecies.Count > 0)
+                    ? (timeLine.allAnimalSpecies[0].exampleOrganism as AnimalDefinition) : null;
+
+                for (int i = 0; i < retrieved; i++)
+                {
+                    var snap = _snapshotBuffer[i];
+                    var cell = area.cells[i];
+                    if (cell == null) continue;
+
+                    ushort f = snap.Flags;
+
+                    // 1. Plants
+                    if ((f & 1) != 0) // FLAG_HAS_PLANT
+                    {
+                        if (cell.plant == null)
+                        {
+                            PlantDefinition def = (snap.PlantSpecies >= 0 && timeLine != null && timeLine.allSpecies != null && snap.PlantSpecies < timeLine.allSpecies.Count && timeLine.allSpecies[snap.PlantSpecies]?.exampleOrganism is PlantDefinition pd)
+                                ? pd : refPlantDef;
+                            if (def != null)
+                            {
+                                cell.plant = new LivingPlant(def, cell.windStrength, cell.temperature, cell.shallowGroundWater, cell.deepGroundWater, area.sunLightFactor, true);
+                            }
+                        }
+                        if (cell.plant != null)
+                        {
+                            cell.plant.health = snap.PlantHealth;
+                            cell.plant.energyProfitPerDayDuringDayTime = snap.PlantEnergy;
+                            cell.plant.lowestLeafHeight = snap.PlantLeafHeight;
+                            cell.plant.lowestFruitHeight = (f & 256) != 0 ? snap.PlantLeafHeight : -1f;
+                            area.cellIndicesOfPlants.Add(i);
+                        }
+                    }
+                    else
+                    {
+                        cell.plant = null;
+                    }
+
+                    // 2. Algae / Plankton
+                    if ((f & 2) != 0) // FLAG_HAS_ALGA
+                    {
+                        area.cellIndicesOfMacroAlgae.Add(i);
+                    }
+                    if ((f & 4) != 0) // FLAG_HAS_PLANKTON
+                    {
+                        area.cellIndicesOfPlankton.Add(i);
+                    }
+
+                    // 3. Grass
+                    if ((f & 8) != 0) // FLAG_HAS_GRASS
+                    {
+                        cell.grassHeight = 1;
+                        cell.grassHue = snap.GrassHue;
+                        cell.grassBrightness = snap.GrassBrightness;
+                    }
+                    else
+                    {
+                        cell.grassHeight = 0;
+                    }
+
+                    // 4. Animals
+                    if ((f & 16) != 0) // FLAG_HAS_GROUND_ANIMAL
+                    {
+                        var a = area.GetAnimalInCell(i, CellLocationType.Ground);
+                        if (a == null)
+                        {
+                            AnimalDefinition def = (snap.AnimalSpecies >= 0 && timeLine != null && timeLine.allSpecies != null && snap.AnimalSpecies < timeLine.allSpecies.Count && timeLine.allSpecies[snap.AnimalSpecies]?.exampleOrganism is AnimalDefinition ad)
+                                ? ad : refAnimalDef;
+                            if (def != null)
+                            {
+                                a = new LivingAnimal(def);
+                                area.AddAnimalToCell(a, i, CellLocationType.Ground);
+                            }
+                        }
+                        if (a != null)
+                        {
+                            a.health = snap.AnimalHealth;
+                            a.energy = snap.AnimalEnergy;
+                            if (area.animalPositionTracker != null)
+                            {
+                                area.animalPositionTracker.Add(i, CellLocationType.Ground);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        area.RemoveAnimalAtLocation(i, CellLocationType.Ground);
+                    }
+
+                    // 5. Fungi
+                    if ((f & 2048) != 0) // FLAG_HAS_FUNGUS
+                    {
+                        area.cellIndicesOfFungi.Add(i);
+                    }
+
+                    // 6. Soil
+                    cell.detritus = (int)snap.Detritus;
+                    cell.nutrients = snap.Nutrients;
+                }
+            }
         }
 
     [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllAnimalsInAreaLiveADay))]
@@ -382,6 +515,7 @@ namespace SaplingRustBridge.Patches
     {
         try
         {
+            if (AsyncJumpWorker.IsRunning) return; // Do not run expensive per-day P/Invoke syncs during time jumps!
             if (__instance == null || __instance.today == null || __instance.today.areas == null) return;
             if (areaIndex < 0 || areaIndex >= __instance.today.areas.Length) return;
             WorldArea area = __instance.today.areas[areaIndex];

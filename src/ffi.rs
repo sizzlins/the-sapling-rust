@@ -7,8 +7,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::RwLock;
 
 use crate::sim::{
-    CreatureDecision, DaySimulationSummary, FastRng, InstanceMatrix, NativeGrid, NativeInstinctQuery,
-    WarpStats, World,
+    CreatureDecision, DaySimulationSummary, FastRng, InstanceMatrix, NativeCellSnapshot,
+    NativeGrid, NativeInstinctQuery, WarpStats, World,
 };
 
 pub struct WorldHandle {
@@ -592,6 +592,55 @@ pub unsafe extern "C" fn sapling_grid_step_day(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn sapling_grid_warp(
+    handle: *mut GridHandle,
+    days: u32,
+    mut_algae: f32,
+    mut_plants: f32,
+    mut_animals: f32,
+    mut_fungi: f32,
+    seed: u64,
+    out_summary: *mut DaySimulationSummary,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        if let Ok(mut g) = (*handle).inner.write() {
+            let mut summary = DaySimulationSummary::default();
+            g.warp(days, mut_algae, mut_plants, mut_animals, mut_fungi, seed, &mut summary);
+            if !out_summary.is_null() {
+                *out_summary = summary;
+            }
+            0
+        } else {
+            -2
+        }
+    }));
+    res.unwrap_or(-3)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sapling_grid_get_all_cells(
+    handle: *const GridHandle,
+    out_snapshots: *mut NativeCellSnapshot,
+    max_len: u32,
+) -> u32 {
+    if handle.is_null() || out_snapshots.is_null() || max_len == 0 {
+        return 0;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        if let Ok(g) = (*handle).inner.read() {
+            let slice = std::slice::from_raw_parts_mut(out_snapshots, max_len as usize);
+            g.get_all_cells(slice) as u32
+        } else {
+            0
+        }
+    }));
+    res.unwrap_or(0)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn sapling_grid_get_detritus(handle: *const GridHandle, idx: u32) -> u16 {
     if handle.is_null() {
         return 0;
@@ -839,6 +888,39 @@ mod tests {
             let batch_count = sapling_grid_search_instincts_batch(grid, &q, 1, out.as_mut_ptr());
             assert_eq!(batch_count, 1);
             assert_eq!(out[0], 72);
+
+            sapling_grid_free(grid);
+        }
+    }
+
+    #[test]
+    fn test_c_abi_grid_warp() {
+        unsafe {
+            let grid = sapling_grid_create(10, 10);
+            assert!(!grid.is_null());
+
+            {
+                sapling_grid_set_cell_env(grid, 25, 22.0, 0.6, 0.6, 0.8, 2, -1.0, 0.0, 0.2);
+                sapling_grid_set_plant(grid, 25, 1, 0.3, 0.5, 1.2, 1, 0.1, 0);
+                sapling_grid_set_plant_bio(grid, 25, 100.0, 0.8, 10, 100, 2);
+
+                sapling_grid_set_cell_env(grid, 26, 22.0, 0.5, 0.5, 0.2, 5, -1.0, 0.0, 0.1);
+                sapling_grid_set_fungus(grid, 26, 1, 0, 0.5, 1);
+
+                sapling_grid_set_cell_env(grid, 27, 22.0, 0.5, 0.5, 0.5, 0, -1.0, 0.0, 0.1);
+                sapling_grid_set_grass(grid, 27, 0.4, 0.6);
+                sapling_grid_set_animal(grid, 27, 2, 0.1, 0.5, 0, 0, 1.0, 0);
+                sapling_grid_set_animal_bio(grid, 27, 100.0, 0.7, 0.9, 5, 80, 0);
+            }
+
+            let mut summary = DaySimulationSummary::default();
+            let ret = sapling_grid_warp(grid, 100, 0.05, 0.05, 0.05, 0.05, 42, &mut summary);
+            assert_eq!(ret, 0);
+            assert!(summary.total_plants + summary.total_animals + summary.total_algae + summary.total_fungi > 0);
+
+            let mut snapshots = [NativeCellSnapshot::default(); 100];
+            let count = sapling_grid_get_all_cells(grid, snapshots.as_mut_ptr(), 100);
+            assert_eq!(count, 100);
 
             sapling_grid_free(grid);
         }
