@@ -22,13 +22,35 @@ namespace SaplingRustBridge.Patches
         private static int _dayCounter = 0;
         private static float _lastTrimTime = 0f;
 
-        // --- 1. CAPTURE SHARED TEXTURE FACTORY ---
+        // --- 1. CAPTURE SHARED TEXTURE FACTORY & CONFIGURE SANE POOL EXPIRATION ---
         [HarmonyPatch(typeof(WorldView), "Start")]
         [HarmonyPostfix]
         public static void WorldView_Start_MemoryInit(WorldView __instance)
         {
             if (__instance == null) return;
             SharedAnimalTextureFactory = __instance.animalTextureFactory;
+
+            if (__instance.organismObjectPool != null)
+            {
+                // Vanilla keeps dead pooled organisms activeSelf=true in the sky for 300 years!
+                __instance.organismObjectPool.outOfSightInsteadOfDisabling = false; // Disable dead pooled GameObjects!
+                __instance.organismObjectPool.expireAfterYears = 3; // Clean dead pools after 3 years instead of 300!
+            }
+
+            // Vanilla keeps extinct species 3D blueprints in memory for 300 years!
+            SetLibraryCleanupYears(__instance.prebuiltOrganismLibrary, 5);
+            SetLibraryCleanupYears(__instance.prebuiltPlantLibrary, 5);
+            SetLibraryCleanupYears(__instance.prebuiltAnimalLibrary, 5);
+        }
+
+        private static void SetLibraryCleanupYears(PrebuiltOrganismLibrary lib, int years)
+        {
+            if (lib == null) return;
+            try
+            {
+                Traverse.Create(lib).Field("cleanUpAfterNrOfInactiveYears").SetValue(years);
+            }
+            catch { }
         }
 
         // --- 2. SHARE TEXTURE FACTORY ACROSS BUILDERS (Eliminates duplicate GPU textures) ---
@@ -42,7 +64,7 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // --- 3. PERIODIC EXTINCT DEFINITION PRUNING ---
+        // --- 3. PERIODIC EXTINCT DEFINITION PRUNING & AUTOMATIC MEMORY RECLAMATION ---
         [HarmonyPatch(typeof(WorldController), nameof(WorldController.ShowToday))]
         [HarmonyPostfix]
         public static void WorldController_ShowToday_MemoryGovernor(WorldController __instance)
@@ -52,13 +74,19 @@ namespace SaplingRustBridge.Patches
             _dayCounter++;
 
             // Periodically clean extinct definitions from TimeLine classifiers (vanilla only does this during autosave)
-            if (_dayCounter % 200 == 0)
+            if (_dayCounter % 100 == 0)
             {
                 try
                 {
                     __instance.timeLine.PruneExtinctDefinitionIndices();
                 }
                 catch { }
+            }
+
+            // Automatically reclaim unreferenced native assets and return physical RAM to Windows every 50 in-game days
+            if (_dayCounter % 50 == 0)
+            {
+                TriggerDeepMemoryTrim();
             }
         }
 
