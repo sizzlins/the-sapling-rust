@@ -120,7 +120,7 @@ namespace SaplingRustBridge.Patches
             return false;
         }
 
-        // --- 3. Prune futile spatial mate searches when animal cannot mate ---
+        // --- 3. Prune futile spatial searches (Mate, Satiety/Diet, Sessile) ---
         [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.SearchNearbyCellsForInstinctTrigger))]
         [HarmonyPrefix]
         public static bool SearchNearbyCellsForInstinctTrigger_Prefix(
@@ -128,16 +128,75 @@ namespace SaplingRustBridge.Patches
             LivingAnimal animal,
             ref int __result)
         {
-            if (instinct != null && instinct.conditionObject == InstinctConditionObject.APotentialMate)
+            if (animal == null || instinct == null) return true;
+
+            var cond = instinct.conditionObject;
+
+            // 1. Mate Search Pruning:
+            if (cond == InstinctConditionObject.APotentialMate)
             {
-                if (animal == null || (!animal.ReadyForInternalFertilization(false) && !animal.ReadyForInternalFertilization(true)))
+                if (animal.isChild || animal.age < animal.matureAtAge || animal.pregnant ||
+                    (!animal.ReadyForInternalFertilization(false) &&
+                     !animal.ReadyForInternalFertilization(true) &&
+                     !animal.ReadyForExternalFertilization()))
                 {
                     __result = -1;
-                    return false; // Cannot mate in any capacity; skip scanning 10 concentric rings of cells!
+                    return false; // Skip 10 concentric rings of cells!
                 }
             }
 
+            // 2. Food & Foraging Search Pruning:
+            if (cond == InstinctConditionObject.Food || cond == InstinctConditionObject.APlant || cond == InstinctConditionObject.AnAlga)
+            {
+                // Can't eat at all, or already fully satiated (energy >= 90% of max capacity)
+                if (!animal.canEat || animal.energy >= animal.CalculateReproductionThreshold() * 0.90f)
+                {
+                    __result = -1;
+                    return false; // Satiated creatures do not scan 100 cells for food!
+                }
+
+                // Pure carnivores never forage for plants or algae
+                if (animal.eatsMeatOnly && (cond == InstinctConditionObject.APlant || cond == InstinctConditionObject.AnAlga))
+                {
+                    __result = -1;
+                    return false;
+                }
+
+                // Non-plant eaters looking at plants
+                if (cond == InstinctConditionObject.APlant && !animal.eatsPlants && !animal.eatsNectar)
+                {
+                    __result = -1;
+                    return false;
+                }
+            }
+
+            // 3. Sessile Creature Pruning:
+            // Immobile creatures cannot travel to distant cells
+            if (animal.sessile && instinct.action == InstinctAction.GoTowards)
+            {
+                __result = -1;
+                return false;
+            }
+
             return true;
+        }
+
+        // --- 4. Prevent 10-32 GB RAM Balloon: Cap historical WorldState snapshots ---
+        private const int MaxTimelineHistory = 200;
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LiveADay))]
+        [HarmonyPostfix]
+        public static void TimeLine_LiveADay_CapHistory(TimeLine __instance)
+        {
+            if (__instance == null || __instance.line == null) return;
+
+            // Demographics graphs only query ~100 recent points.
+            // Keeping thousands of full WorldState clones exhausts the 32-bit/Mono heap.
+            if (__instance.line.Count > MaxTimelineHistory + 50)
+            {
+                int toRemove = __instance.line.Count - MaxTimelineHistory;
+                __instance.line.RemoveRange(0, toRemove);
+            }
         }
 
         // --- 4. Adaptive Frame Budgeting for Time Skip (Smooth UI, No Freezes) ---

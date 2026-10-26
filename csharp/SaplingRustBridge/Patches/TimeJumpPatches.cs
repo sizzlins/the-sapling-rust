@@ -105,6 +105,7 @@ namespace SaplingRustBridge.Patches
             {
                 IsTimeJumpActive = false;
                 __instance.nrOfYearsToJump = 0;
+                MemoryPatches.TrimMemory();
                 return true; // Let vanilla invoke timeJumpReady callback on main thread
             }
 
@@ -140,6 +141,7 @@ namespace SaplingRustBridge.Patches
                 {
                     IsTimeJumpActive = false;
                     __instance.nrOfDaysToDoInCurrentTimeJump = 0;
+                    MemoryPatches.TrimMemory();
                     return true; // Worker finished! Vanilla runs view cleanup & ShowToday()
                 }
 
