@@ -130,14 +130,20 @@ namespace SaplingRustBridge.Patches
 
         private static void FinalizeFrameBatch(WorldView view, int initialCount)
         {
+            if (view == null) return;
+
             if (view.organismObjectPool != null)
             {
                 view.organismObjectPool.BillboardCleanup();
             }
 
-            if (view.gameObjectsNewlyGenerated.Count > initialCount && view.newOrganismsCreatedJITAfterCameraMovement != null)
+            if (view.gameObjectsNewlyGenerated != null && view.gameObjectsNewlyGenerated.Count > initialCount)
             {
-                view.newOrganismsCreatedJITAfterCameraMovement.Call(new object[0]);
+                if (view.newOrganismsCreatedJITAfterCameraMovement != null)
+                {
+                    view.newOrganismsCreatedJITAfterCameraMovement.Call(new object[0]);
+                }
+                view.gameObjectsNewlyGenerated.Clear();
             }
         }
     }

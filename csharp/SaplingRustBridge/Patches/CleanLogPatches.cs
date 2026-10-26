@@ -6,16 +6,105 @@ namespace SaplingRustBridge.Patches
 {
     /// <summary>
     /// Eliminates the root causes of log spam, console locks, and engine stalls:
-    /// 1. Prevents duplicate child LODGroups on fruit/branches (OrganismObjectBuilder.addLODGroup = false).
-    /// 2. Bounds checks WalkingAnimationControllerV2 to eliminate IndexOutOfRangeException on hopping/mutated creatures.
-    /// 3. Sets anim.playAutomatically = false on AnimalView to stop 'Default clip could not be found' warnings.
-    /// 4. Silences benign 'updating focussed organism centerpoints' warnings.
+    /// 1. Prevents duplicate child LODGroups on nest prefabs and organism body parts.
+    /// 2. Filters duplicate LODGroup warnings and animation clip info messages from disk logging.
+    /// 3. Bounds checks WalkingAnimationControllerV2 to eliminate IndexOutOfRangeException on hopping/mutated creatures.
+    /// 4. Sets anim.playAutomatically = false on AnimalView to stop 'Default clip could not be found' warnings.
+    /// 5. Silences benign 'updating focussed organism centerpoints' warnings.
+    /// 6. Clears gameObjectsNewlyGenerated buffer to prevent quadratic accumulation during camera movement.
     /// </summary>
     [HarmonyPatch]
     public static class CleanLogPatches
     {
-        // 1. Root fix for 86,000+ LODGroup warnings:
-        // Individual body parts (like fruit sacs) must NOT have their own LODGroups when the parent tree has the root LODGroup.
+        /// <summary>
+        /// Strips any child LODGroups that conflict with a root LODGroup on the same GameObject hierarchy.
+        /// </summary>
+        public static void StripConflictingLODGroups(GameObject go)
+        {
+            if (go == null) return;
+            LODGroup rootLod = go.GetComponent<LODGroup>();
+            if (rootLod != null)
+            {
+                LODGroup[] allLods = go.GetComponentsInChildren<LODGroup>(true);
+                for (int i = 0; i < allLods.Length; i++)
+                {
+                    if (allLods[i] != null && allLods[i] != rootLod)
+                    {
+                        UnityEngine.Object.Destroy(allLods[i]);
+                    }
+                }
+            }
+        }
+
+        private static void SanitizeNestArray(GameObject[] nests)
+        {
+            if (nests == null) return;
+            for (int i = 0; i < nests.Length; i++)
+            {
+                if (nests[i] != null)
+                {
+                    StripConflictingLODGroups(nests[i]);
+                }
+            }
+        }
+
+        // 1. Root fix for 77,000+ LODGroup warnings:
+        // Strip duplicate child LODGroups from all nest prefabs when WorldView starts.
+        [HarmonyPatch(typeof(WorldView), "Start")]
+        [HarmonyPostfix]
+        public static void WorldView_Start_SanitizeNestPrefabs(WorldView __instance)
+        {
+            if (__instance == null) return;
+            GameObject[] prefabs = new GameObject[]
+            {
+                __instance.openSacBurrowPrefab, __instance.openSacTwigsPrefab, __instance.openSacWaxPrefab,
+                __instance.openFlapsBurrowPrefab, __instance.openFlapsTwigsPrefab, __instance.openFlapsWaxPrefab,
+                __instance.openOpeningBurrowPrefab, __instance.openOpeningTwigsPrefab, __instance.openOpeningWaxPrefab,
+                __instance.openSphericalBurrowPrefab, __instance.openSphericalTwigsPrefab, __instance.openSphericalWaxPrefab,
+                __instance.openCylinderBurrowPrefab, __instance.openCylinderTwigsPrefab, __instance.openCylinderWaxPrefab,
+                __instance.openOvoidBurrowPrefab, __instance.openOvoidTwigsPrefab, __instance.openOvoidWaxPrefab,
+                __instance.enclosedBurrowPrefab, __instance.enclosedTwigsPrefab, __instance.enclosedWaxPrefab
+            };
+            for (int i = 0; i < prefabs.Length; i++)
+            {
+                StripConflictingLODGroups(prefabs[i]);
+            }
+        }
+
+        // Sanitize active nests whenever nests are updated or day progresses
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateNests))]
+        [HarmonyPostfix]
+        public static void WorldView_UpdateNests_Postfix(WorldView __instance)
+        {
+            if (__instance == null) return;
+            SanitizeNestArray(__instance.nestsArea0);
+            SanitizeNestArray(__instance.nestsArea1);
+            SanitizeNestArray(__instance.nestsArea2);
+        }
+
+        [HarmonyPatch(typeof(WorldController), nameof(WorldController.ShowToday))]
+        [HarmonyPrefix]
+        public static void WorldController_ShowToday_SanitizeNests(WorldController __instance)
+        {
+            if (__instance != null && __instance.view != null)
+            {
+                SanitizeNestArray(__instance.view.nestsArea0);
+                SanitizeNestArray(__instance.view.nestsArea1);
+                SanitizeNestArray(__instance.view.nestsArea2);
+            }
+        }
+
+        // Disable child LODGroup generation on individual body parts
+        [HarmonyPatch(typeof(OrganismObjectBuilder), nameof(OrganismObjectBuilder.CreateGameObjectsForBodyPartMeshArray))]
+        [HarmonyPrefix]
+        public static void OrganismObjectBuilder_CreateGameObjects_Prefix(OrganismObjectBuilder __instance)
+        {
+            if (__instance != null)
+            {
+                __instance.addLODGroup = false;
+            }
+        }
+
         [HarmonyPatch(typeof(OrganismObjectBuilder), MethodType.Constructor)]
         [HarmonyPostfix]
         public static void OrganismObjectBuilder_ctor_Postfix(OrganismObjectBuilder __instance)
@@ -26,7 +115,42 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // 2. Root fix for IndexOutOfRangeException in WalkingAnimationControllerV2.SolveInverseKinematicsForLeg:
+        [HarmonyPatch(typeof(PlantObjectBuilder), nameof(PlantObjectBuilder.Run))]
+        [HarmonyPostfix]
+        public static void PlantObjectBuilder_Run_Postfix(GameObject __result)
+        {
+            StripConflictingLODGroups(__result);
+        }
+
+        // 2. Defense-in-depth: Suppress disk logging of duplicate LODGroup and default animation warnings
+        [HarmonyPatch(typeof(BepInEx.Logging.DiskLogListener), nameof(BepInEx.Logging.DiskLogListener.LogEvent))]
+        [HarmonyPrefix]
+        public static bool DiskLogListener_LogEvent_Prefix(object sender, BepInEx.Logging.LogEventArgs eventArgs)
+        {
+            if (eventArgs != null && eventArgs.Data != null)
+            {
+                string text = eventArgs.Data.ToString();
+                if (text.IndexOf("is registered with more than one LODGroup", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    text.IndexOf("Default clip could not be found", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // 3. Clear gameObjectsNewlyGenerated buffer to prevent quadratic re-binding loops on camera movement
+        [HarmonyPatch(typeof(WorldController), nameof(WorldController.AddHoverActionsToNewlyGeneratedGameObjects))]
+        [HarmonyPostfix]
+        public static void AddHoverActions_Postfix(WorldController __instance)
+        {
+            if (__instance != null && __instance.view != null && __instance.view.gameObjectsNewlyGenerated != null)
+            {
+                __instance.view.gameObjectsNewlyGenerated.Clear();
+            }
+        }
+
+        // 4. Root fix for IndexOutOfRangeException in WalkingAnimationControllerV2.SolveInverseKinematicsForLeg:
         // Protects against array index mismatches in asymmetrical or hopping mutant creatures.
         [HarmonyPatch(typeof(WalkingAnimationControllerV2), "SolveInverseKinematicsForLeg")]
         [HarmonyPrefix]
@@ -64,7 +188,7 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // 3. Stop Unity looking for a default clip on frame 1 before procedural clips are generated
+        // 5. Stop Unity looking for a default clip on frame 1 before procedural clips are generated
         [HarmonyPatch(typeof(AnimalView), "Start", new Type[] { typeof(AnimalDefinition), typeof(Vector3), typeof(int), typeof(RuntimeAnimatorController) })]
         [HarmonyPostfix]
         public static void AnimalView_Start_AnimationFix(AnimalView __instance)
@@ -76,7 +200,7 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // 4. Suppress benign 'updating focussed organism centerpoints while no organism is in focus'
+        // 6. Suppress benign 'updating focussed organism centerpoints while no organism is in focus'
         [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateCenterPointsClosestToCamera))]
         [HarmonyPrefix]
         public static bool WorldView_UpdateCenterPoints_Prefix(WorldView __instance)
