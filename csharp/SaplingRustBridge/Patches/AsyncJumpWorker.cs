@@ -46,12 +46,16 @@ namespace SaplingRustBridge.Patches
                 ICallable savedLockCreation = timeLine.lockCreation;
                 ICallable savedMeteorite = timeLine.dailyChallengeMeteoriteEvent;
                 ICallable savedNewSpecies = timeLine.newSpeciesCreatedCallBack;
+                ICallable savedPlayedALongTime = timeLine.playedALongTimeCallBack;
+                ICallable savedAnimalGetsEaten = timeLine.animalGetsEatenCallBack;
 
                 timeLine.changeOceanDepth = _noOp;
                 timeLine.eventOccurs = _noOp;
                 timeLine.lockCreation = _noOp;
                 timeLine.dailyChallengeMeteoriteEvent = _noOp;
                 timeLine.newSpeciesCreatedCallBack = _noOp;
+                timeLine.playedALongTimeCallBack = _noOp;
+                timeLine.animalGetsEatenCallBack = _noOp;
 
                 try
                 {
@@ -60,14 +64,15 @@ namespace SaplingRustBridge.Patches
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     while (_daysRemaining > 0 && _isRunning)
                     {
-                        int batch = Math.Min(50, _daysRemaining);
+                        // 250-day batch size: significantly amortizes while loop overhead
+                        int batch = Math.Min(250, _daysRemaining);
                         timeLine.JumpAhead(batch);
                         _daysRemaining -= batch;
 
-                        // Only yield when >= 16ms has elapsed, keeping UI at 60fps while running at full CPU speed
-                        if (sw.ElapsedMilliseconds >= 16)
+                        // Non-blocking yield: replaces 15ms Sleep(1) with Sleep(0) to maximize CPU throughput
+                        if (sw.ElapsedMilliseconds >= 32)
                         {
-                            Thread.Sleep(1);
+                            Thread.Sleep(0);
                             sw.Reset();
                             sw.Start();
                         }
@@ -87,6 +92,8 @@ namespace SaplingRustBridge.Patches
                     timeLine.lockCreation = savedLockCreation;
                     timeLine.dailyChallengeMeteoriteEvent = savedMeteorite;
                     timeLine.newSpeciesCreatedCallBack = savedNewSpecies;
+                    timeLine.playedALongTimeCallBack = savedPlayedALongTime;
+                    timeLine.animalGetsEatenCallBack = savedAnimalGetsEaten;
 
                     _daysRemaining = 0;
                     _isRunning = false;
@@ -94,7 +101,7 @@ namespace SaplingRustBridge.Patches
             })
             {
                 IsBackground = true,
-                Priority = System.Threading.ThreadPriority.BelowNormal,
+                Priority = System.Threading.ThreadPriority.Normal,
                 Name = "SaplingAsyncJumpWorker"
             };
 

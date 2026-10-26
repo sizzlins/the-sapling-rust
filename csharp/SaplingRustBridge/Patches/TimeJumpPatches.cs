@@ -93,6 +93,12 @@ namespace SaplingRustBridge.Patches
         [HarmonyPostfix]
         public static void TimeLine_LiveADay_Postfix(TimeLine __instance)
         {
+            // During background time jumps, throttle history snapshots to every 10 days to eliminate P/Invoke loop overhead
+            if (AsyncJumpWorker.IsRunning && (__instance.dayIndex % 10 != 0))
+            {
+                return;
+            }
+
             IntPtr world = Plugin.RustWorldHandle;
             if (world != IntPtr.Zero)
             {

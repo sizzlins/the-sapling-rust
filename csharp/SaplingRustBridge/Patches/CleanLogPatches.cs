@@ -431,6 +431,53 @@ namespace SaplingRustBridge.Patches
             }
             return null;
         }
+
+        // 9. Root fix for ArgumentOutOfRangeException in TimeLine.GetSpeciesOfOrganismWithDefinitionIndex on hover
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.GetSpeciesOfOrganismWithDefinitionIndex))]
+        [HarmonyPrefix]
+        public static bool TimeLine_GetSpeciesOfOrganismWithDefinitionIndex_Prefix(TimeLine __instance, int definitionIndex, OrganismType organismType, bool rememberSubspecies, ref SpeciesDefinition __result)
+        {
+            if (__instance == null || __instance.allSpecies == null)
+            {
+                __result = null;
+                return false;
+            }
+
+            if (__instance.usePopulationBasedClassification)
+            {
+                PopulationBasedClassifier classifier = null;
+                switch (organismType)
+                {
+                    case OrganismType.Alga: classifier = __instance.populationBasedAlgaClassifier; break;
+                    case OrganismType.Plant: classifier = __instance.populationBasedPlantClassifier; break;
+                    case OrganismType.Animal: classifier = __instance.populationBasedAnimalClassifier; break;
+                    case OrganismType.Fungus: classifier = __instance.populationBasedFungusClassifier; break;
+                }
+
+                if (classifier == null) { __result = null; return false; }
+                int num = classifier.LookUp(definitionIndex);
+                if (rememberSubspecies)
+                {
+                    try
+                    {
+                        __instance.subspeciesOfLastClassifiedOrganism = classifier.GetSubspeciesOfDefinition(definitionIndex, num);
+                    }
+                    catch { }
+                }
+
+                if (num >= 0 && num < __instance.allSpecies.Count)
+                {
+                    __result = __instance.allSpecies[num] as SpeciesDefinition;
+                }
+                else
+                {
+                    __result = null;
+                }
+                return false; // Safely handled with bounds check!
+            }
+
+            return true;
+        }
     }
 }
 
