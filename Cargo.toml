@@ -16,4 +16,10 @@ path = "src/lib.rs"
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[lints.clippy]
+perf = { level = "deny", priority = -1 }
+redundant_clone = "deny"

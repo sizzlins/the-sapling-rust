@@ -380,6 +380,9 @@ pub struct World {
     grid: Grid,
     /// Reused every tick so the death lists never reallocate.
     scratch: Vec<u32>,
+    births_plants_scratch: Vec<(f32, f32, f32, f32, f32, u32)>,
+    births_herbivores_scratch: Vec<(f32, f32, f32, f32)>,
+    plants_to_remove_scratch: Vec<u32>,
 }
 
 impl Default for World {
@@ -410,6 +413,9 @@ impl World {
             timeline: TimelineStore::default(),
             grid: Grid::default(),
             scratch: Vec::new(),
+            births_plants_scratch: Vec::new(),
+            births_herbivores_scratch: Vec::new(),
+            plants_to_remove_scratch: Vec::new(),
         }
     }
 
@@ -458,7 +464,7 @@ impl World {
 
     fn step_plants(&mut self) {
         let dt = self.dt;
-        let mut births: Vec<(f32, f32, f32, f32, f32, u32)> = Vec::new();
+        self.births_plants_scratch.clear();
 
         for i in 0..self.plants.len() {
             self.plants.age[i] += dt;
@@ -476,7 +482,7 @@ impl World {
                 let cx = self.plants.x[i] + angle.cos() * dist;
                 let cy = self.plants.y[i] + angle.sin() * dist;
                 let drift = 1.0 + self.rng.range(-self.mutation_drift, self.mutation_drift);
-                births.push((
+                self.births_plants_scratch.push((
                     cx,
                     cy,
                     self.plants.energy[i] * (1.0 - self.spread_cost),
@@ -501,7 +507,8 @@ impl World {
             self.deaths_plants += 1;
         }
 
-        for (x, y, energy, scale, growth, parent_gen) in births {
+        for k in 0..self.births_plants_scratch.len() {
+            let (x, y, energy, scale, growth, parent_gen) = self.births_plants_scratch[k];
             let max_age = self.rng.range(70.0, 110.0);
             let idx = self.plants.len();
             self.plants.push(x, y, energy, scale, growth, max_age);
@@ -514,8 +521,8 @@ impl World {
         let eat_radius = self.eat_radius;
         let eat_radius2 = eat_radius * eat_radius;
         let speed = 6.0;
-        let mut births: Vec<(f32, f32, f32, f32)> = Vec::new();
-        let mut plants_to_remove: Vec<u32> = Vec::new();
+        self.births_herbivores_scratch.clear();
+        self.plants_to_remove_scratch.clear();
 
         for i in 0..self.herbivores.len() {
             self.herbivores.age[i] += dt;
@@ -549,7 +556,7 @@ impl World {
                     self.herbivores.energy[i] += self.eat_damage * 0.8;
                     self.herbivores.plants_eaten[i] += 1;
                     if self.plants.energy[p] <= 0.0 {
-                        plants_to_remove.push(p as u32);
+                        self.plants_to_remove_scratch.push(p as u32);
                     }
                 }
             } else {
@@ -562,7 +569,7 @@ impl World {
             self.herbivores.y[i] += self.herbivores.vy[i] * dt;
 
             if self.herbivores.energy[i] > 0.9 && self.herbivores.breed_cooldown[i] <= 0.0 {
-                births.push((
+                self.births_herbivores_scratch.push((
                     self.herbivores.x[i],
                     self.herbivores.y[i],
                     self.herbivores.energy[i] * 0.5,
@@ -574,15 +581,16 @@ impl World {
             }
         }
 
-        for k in (0..plants_to_remove.len()).rev() {
-            let p = plants_to_remove[k] as usize;
+        for k in (0..self.plants_to_remove_scratch.len()).rev() {
+            let p = self.plants_to_remove_scratch[k] as usize;
             if p < self.plants.len() {
                 self.plants.remove(p);
                 self.deaths_plants += 1;
             }
         }
 
-        for (x, y, energy, max_age) in births {
+        for k in 0..self.births_herbivores_scratch.len() {
+            let (x, y, energy, max_age) = self.births_herbivores_scratch[k];
             self.herbivores.push(x, y, energy, max_age);
         }
 
@@ -1190,6 +1198,13 @@ pub struct NativeGrid {
     pub animal_age: Vec<u16>,
     pub animal_max_age: Vec<u16>,
     pub animal_diet: Vec<u8>, // 0: Herbivore, 1: Carnivore, 2: Omnivore
+
+    // --- 5. Active Organism Indices for O(1) Eviction & Sparse Simulation ---
+    pub active_plants: Vec<u32>,
+    pub active_animals: Vec<u32>,
+    pub active_fungi: Vec<u32>,
+    pub active_algae: Vec<u32>,
+    pub births_scratch: Vec<u32>,
 }
 
 impl NativeGrid {
@@ -1242,6 +1257,34 @@ impl NativeGrid {
             animal_age: vec![0; size],
             animal_max_age: vec![70; size],
             animal_diet: vec![0; size],
+
+            active_plants: Vec::with_capacity(size / 8),
+            active_animals: Vec::with_capacity(size / 16),
+            active_fungi: Vec::with_capacity(size / 16),
+            active_algae: Vec::with_capacity(size / 8),
+            births_scratch: Vec::with_capacity(128),
+        }
+    }
+
+    pub fn rebuild_active_indices(&mut self) {
+        self.active_fungi.clear();
+        self.active_algae.clear();
+        self.active_plants.clear();
+        self.active_animals.clear();
+        for i in 0..self.flags.len() {
+            let f = self.flags[i];
+            if (f & FLAG_HAS_FUNGUS) != 0 {
+                self.active_fungi.push(i as u32);
+            }
+            if (f & (FLAG_HAS_ALGA | FLAG_HAS_PLANKTON)) != 0 {
+                self.active_algae.push(i as u32);
+            }
+            if (f & FLAG_HAS_PLANT) != 0 {
+                self.active_plants.push(i as u32);
+            }
+            if (f & FLAG_HAS_GROUND_ANIMAL) != 0 {
+                self.active_animals.push(i as u32);
+            }
         }
     }
 
@@ -1252,6 +1295,11 @@ impl NativeGrid {
         }
         self.plant_species.fill(-1);
         self.animal_species.fill(-1);
+        self.active_plants.clear();
+        self.active_animals.clear();
+        self.active_fungi.clear();
+        self.active_algae.clear();
+        self.births_scratch.clear();
     }
 
     pub fn set_terrain(&mut self, idx: usize, _ocean_depth: f32, is_water: bool) {
@@ -1276,6 +1324,9 @@ impl NativeGrid {
         bark_none: bool,
     ) {
         if idx < self.flags.len() {
+            if (self.flags[idx] & FLAG_HAS_PLANT) == 0 {
+                self.active_plants.push(idx as u32);
+            }
             self.flags[idx] |= FLAG_HAS_PLANT;
             if fruit_ripe {
                 self.flags[idx] |= FLAG_PLANT_FRUIT_RIPE;
@@ -1293,6 +1344,9 @@ impl NativeGrid {
 
     pub fn set_alga(&mut self, idx: usize, is_plankton: bool, hue: f32, brightness: f32) {
         if idx < self.flags.len() {
+            if (self.flags[idx] & (FLAG_HAS_ALGA | FLAG_HAS_PLANKTON)) == 0 {
+                self.active_algae.push(idx as u32);
+            }
             if is_plankton {
                 self.flags[idx] |= FLAG_HAS_PLANKTON;
             } else {
@@ -1323,6 +1377,9 @@ impl NativeGrid {
         is_glowing: bool,
     ) {
         if idx < self.flags.len() {
+            if (self.flags[idx] & FLAG_HAS_GROUND_ANIMAL) == 0 {
+                self.active_animals.push(idx as u32);
+            }
             self.flags[idx] |= FLAG_HAS_GROUND_ANIMAL;
             if is_glowing {
                 self.flags[idx] |= FLAG_IS_GLOWING;
@@ -1410,6 +1467,9 @@ impl NativeGrid {
         cycle_duration: u16,
     ) {
         if idx < self.flags.len() {
+            if (self.flags[idx] & FLAG_HAS_FUNGUS) == 0 {
+                self.active_fungi.push(idx as u32);
+            }
             self.flags[idx] |= FLAG_HAS_FUNGUS;
             if is_parasite {
                 self.flags[idx] |= FLAG_FUNGUS_PARASITE;
@@ -1469,10 +1529,21 @@ impl NativeGrid {
         rng: &mut FastRng,
     ) -> DaySimulationSummary {
         let mut summary = DaySimulationSummary::default();
-        let total_cells = self.width * self.height;
 
-        // 1. Fungi Loop
-        for i in 0..total_cells {
+        if self.active_fungi.is_empty()
+            && self.active_algae.is_empty()
+            && self.active_plants.is_empty()
+            && self.active_animals.is_empty()
+        {
+            self.rebuild_active_indices();
+        }
+
+        self.births_scratch.clear();
+
+        // 1. Fungi Loop (Sparse over active living fungi)
+        let fungi_count = self.active_fungi.len();
+        for k in 0..fungi_count {
+            let i = self.active_fungi[k] as usize;
             if (self.flags[i] & FLAG_HAS_FUNGUS) == 0 {
                 continue;
             }
@@ -1545,6 +1616,7 @@ impl NativeGrid {
                                 self.fungus_energy[target] = 1.0;
                                 self.fungus_age[target] = 0;
                                 self.fungus_cycle_duration[target] = self.fungus_cycle_duration[i];
+                                self.births_scratch.push(target as u32);
                                 summary.fungus_births += 1;
                             }
                         }
@@ -1552,9 +1624,14 @@ impl NativeGrid {
                 }
             }
         }
+        self.active_fungi.retain(|&idx| (self.flags[idx as usize] & FLAG_HAS_FUNGUS) != 0);
+        self.active_fungi.extend_from_slice(&self.births_scratch);
+        self.births_scratch.clear();
 
-        // 2. Algae Loop
-        for i in 0..total_cells {
+        // 2. Algae Loop (Sparse over active algae)
+        let algae_count = self.active_algae.len();
+        for k in 0..algae_count {
+            let i = self.active_algae[k] as usize;
             if (self.flags[i] & (FLAG_HAS_ALGA | FLAG_HAS_PLANKTON)) == 0 {
                 continue;
             }
@@ -1572,6 +1649,7 @@ impl NativeGrid {
                             self.flags[target] |= FLAG_HAS_ALGA;
                             self.alga_hue[target] = self.alga_hue[i];
                             self.alga_brightness[target] = self.alga_brightness[i];
+                            self.births_scratch.push(target as u32);
                             summary.alga_births += 1;
                         } else if !is_water && (self.flags[target] & FLAG_HAS_PLANT) == 0 && self.shallow_water[target] > 0.4 {
                             if rng.next_f32() < mut_algae * 0.1 {
@@ -1584,6 +1662,7 @@ impl NativeGrid {
                                 self.plant_seeds[target] = 0;
                                 self.plant_hue[target] = self.alga_hue[i];
                                 self.plant_brightness[target] = self.alga_brightness[i];
+                                self.active_plants.push(target as u32);
                                 summary.plant_births += 1;
                             }
                         }
@@ -1591,9 +1670,14 @@ impl NativeGrid {
                 }
             }
         }
+        self.active_algae.retain(|&idx| (self.flags[idx as usize] & (FLAG_HAS_ALGA | FLAG_HAS_PLANKTON)) != 0);
+        self.active_algae.extend_from_slice(&self.births_scratch);
+        self.births_scratch.clear();
 
-        // 3. Plants Loop
-        for i in 0..total_cells {
+        // 3. Plants Loop (Sparse over active plants)
+        let plants_count = self.active_plants.len();
+        for k in 0..plants_count {
+            let i = self.active_plants[k] as usize;
             if (self.flags[i] & FLAG_HAS_PLANT) == 0 {
                 continue;
             }
@@ -1642,14 +1726,20 @@ impl NativeGrid {
                         self.plant_age[target] = 0;
                         self.plant_max_age[target] = self.plant_max_age[i];
                         self.plant_seeds[target] = 0;
+                        self.births_scratch.push(target as u32);
                         summary.plant_births += 1;
                     }
                 }
             }
         }
+        self.active_plants.retain(|&idx| (self.flags[idx as usize] & FLAG_HAS_PLANT) != 0);
+        self.active_plants.extend_from_slice(&self.births_scratch);
+        self.births_scratch.clear();
 
-        // 4. Animals Loop
-        for i in 0..total_cells {
+        // 4. Animals Loop (Sparse over active animals)
+        let animals_count = self.active_animals.len();
+        for k in 0..animals_count {
+            let i = self.active_animals[k] as usize;
             if (self.flags[i] & FLAG_HAS_GROUND_ANIMAL) == 0 {
                 continue;
             }
@@ -1747,6 +1837,7 @@ impl NativeGrid {
                             self.animal_age[target] = 0;
                             self.animal_max_age[target] = self.animal_max_age[i];
                             self.animal_diet[target] = self.animal_diet[i];
+                            self.births_scratch.push(target as u32);
                             summary.animal_births += 1;
                             break;
                         }
@@ -1754,23 +1845,15 @@ impl NativeGrid {
                 }
             }
         }
+        self.active_animals.retain(|&idx| (self.flags[idx as usize] & FLAG_HAS_GROUND_ANIMAL) != 0);
+        self.active_animals.extend_from_slice(&self.births_scratch);
+        self.births_scratch.clear();
 
-        // Tally totals
-        for i in 0..total_cells {
-            let f = self.flags[i];
-            if (f & FLAG_HAS_PLANT) != 0 {
-                summary.total_plants += 1;
-            }
-            if (f & FLAG_HAS_GROUND_ANIMAL) != 0 {
-                summary.total_animals += 1;
-            }
-            if (f & FLAG_HAS_FUNGUS) != 0 {
-                summary.total_fungi += 1;
-            }
-            if (f & (FLAG_HAS_ALGA | FLAG_HAS_PLANKTON)) != 0 {
-                summary.total_algae += 1;
-            }
-        }
+        // Tally totals in O(1)
+        summary.total_plants = self.active_plants.len() as u32;
+        summary.total_animals = self.active_animals.len() as u32;
+        summary.total_fungi = self.active_fungi.len() as u32;
+        summary.total_algae = self.active_algae.len() as u32;
 
         summary
     }
@@ -1785,6 +1868,7 @@ impl NativeGrid {
         seed: u64,
         out_summary: &mut DaySimulationSummary,
     ) {
+        self.rebuild_active_indices();
         let mut rng = FastRng::new(seed);
         for _ in 0..days {
             let day_summary = self.step_simulation_day(mut_algae, mut_plants, mut_animals, mut_fungi, &mut rng);
