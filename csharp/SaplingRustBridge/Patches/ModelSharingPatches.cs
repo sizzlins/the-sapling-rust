@@ -105,13 +105,74 @@ namespace SaplingRustBridge.Patches
                     }
                 }
             }
+            // 3. Fallback: if this species has no model, clone ANY valid existing model in the library!
+            // This completely eliminates synchronous Catmull-Clark mesh builds (21-second freezes).
+            GameObject fallbackTemplate = null;
+            if (speciesDict != null)
+            {
+                foreach (var kvp in speciesDict)
+                {
+                    if (kvp.Value != null) { fallbackTemplate = kvp.Value; break; }
+                }
+            }
+            if (fallbackTemplate == null && otherSpeciesDict != null)
+            {
+                foreach (var kvp in otherSpeciesDict)
+                {
+                    if (kvp.Value != null) { fallbackTemplate = kvp.Value; break; }
+                }
+            }
+
+            if (fallbackTemplate != null)
+            {
+                if (!fallbackTemplate.activeSelf) fallbackTemplate.SetActive(true);
+                __instance.lastUsedStorageApproach = StorageApproach.SpeciesBased;
+                __result = UnityEngine.Object.Instantiate(fallbackTemplate);
+
+                // Cache this template under this speciesIndex so future lookups are immediate
+                var key = new SpeciesAndSexIndex(speciesIndex, sexIndex);
+                if (speciesDict != null && !speciesDict.ContainsKey(key))
+                {
+                    speciesDict[key] = fallbackTemplate;
+                }
+                return;
+            }
         }
 
         [HarmonyPatch(typeof(WorldView), nameof(WorldView.BuildAndCacheAnimal))]
         [HarmonyPrefix]
-        public static void BuildAndCacheAnimal_Prefix(ref bool representativeForSpecies)
+        public static bool BuildAndCacheAnimal_Prefix(
+            WorldView __instance,
+            AnimalDefinition animalDefinition,
+            bool youngVersion,
+            int animalSpeciesIndex,
+            LibraryProfile libraryProfile,
+            ref bool representativeForSpecies)
         {
-            representativeForSpecies = true;
+            // Never build individual mutant meshes on the fly! Mutants share the species model.
+            if (!representativeForSpecies) return false;
+
+            // If the library already has a model for this species, don't rebuild it!
+            var lib = __instance?.prebuiltAnimalLibrary;
+            if (lib != null)
+            {
+                var dict = youngVersion
+                    ? AccessTools.Field(typeof(PrebuiltOrganismLibrary), "gameObjectsYoungVersionForSpeciesIndex")?.GetValue(lib) as Dictionary<SpeciesAndSexIndex, GameObject>
+                    : AccessTools.Field(typeof(PrebuiltOrganismLibrary), "gameObjectsOldVersionForSpeciesIndex")?.GetValue(lib) as Dictionary<SpeciesAndSexIndex, GameObject>;
+
+                if (dict != null)
+                {
+                    foreach (var kvp in dict)
+                    {
+                        if (kvp.Key.speciesIndex == animalSpeciesIndex && kvp.Value != null)
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return true;
         }
 
         // Intercept procedural animal mesh subdivision: if an existing species model exists, clone it instantly!
@@ -144,6 +205,20 @@ namespace SaplingRustBridge.Patches
                         foreach (var kvp in dict)
                         {
                             if (kvp.Key.speciesIndex == speciesIdx && kvp.Value != null)
+                            {
+                                if (!kvp.Value.activeSelf) kvp.Value.SetActive(true);
+                                GameObject clone = UnityEngine.Object.Instantiate(kvp.Value);
+                                clone.transform.localScale = __instance.GetModelScale(__instance.definition.bodySize, false);
+                                clone.transform.position = location - __instance.GetHeightAboveGroundForGameObject(clone);
+                                __result = clone;
+                                return false; // Skip Catmull-Clark mesh subdivision!
+                            }
+                        }
+
+                        // Universal fallback: clone ANY animal model in dict
+                        foreach (var kvp in dict)
+                        {
+                            if (kvp.Value != null)
                             {
                                 if (!kvp.Value.activeSelf) kvp.Value.SetActive(true);
                                 GameObject clone = UnityEngine.Object.Instantiate(kvp.Value);
@@ -191,6 +266,19 @@ namespace SaplingRustBridge.Patches
                         foreach (var kvp in dict)
                         {
                             if (kvp.Key.speciesIndex == speciesIdx && kvp.Value != null)
+                            {
+                                if (!kvp.Value.activeSelf) kvp.Value.SetActive(true);
+                                GameObject clone = UnityEngine.Object.Instantiate(kvp.Value);
+                                clone.transform.position = location;
+                                __result = clone;
+                                return false; // Skip procedural plant subdivision!
+                            }
+                        }
+
+                        // Universal fallback: clone ANY plant model in dict
+                        foreach (var kvp in dict)
+                        {
+                            if (kvp.Value != null)
                             {
                                 if (!kvp.Value.activeSelf) kvp.Value.SetActive(true);
                                 GameObject clone = UnityEngine.Object.Instantiate(kvp.Value);
