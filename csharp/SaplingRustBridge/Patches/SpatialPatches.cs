@@ -19,9 +19,6 @@ namespace SaplingRustBridge.Patches
         // Cache distance bands: (gridWidth << 48) | (cellIndex << 16) | (distance << 4) | flags -> int[]
         private static readonly Dictionary<long, int[]> DistanceBandCache = new Dictionary<long, int[]>(32768);
 
-        // Cache full distance disks: (gridWidth << 48) | (cx << 32) | (cy << 16) | distance -> List<int>
-        private static readonly Dictionary<long, List<int>> WithinDistanceCache = new Dictionary<long, List<int>>(16384);
-
         [HarmonyPatch(typeof(CellDistanceFinder), nameof(CellDistanceFinder.Initialize))]
         [HarmonyPostfix]
         public static void Initialize_Postfix(CellDistanceFinder __instance)
@@ -29,7 +26,6 @@ namespace SaplingRustBridge.Patches
             // Clear caches when world/grid is re-initialized
             DirectlyAroundCache.Clear();
             DistanceBandCache.Clear();
-            WithinDistanceCache.Clear();
         }
 
         [HarmonyPatch(typeof(CellDistanceFinder), nameof(CellDistanceFinder.GetAllCellsDirectlyAround))]
@@ -119,50 +115,6 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // --- Cache full distance disks to eliminate millions of new List<int>() allocations ---
-        [HarmonyPatch(typeof(CellDistanceFinder), nameof(CellDistanceFinder.GetAllCellsWithinDistanceOfCellWithCoordinates))]
-        [HarmonyPrefix]
-        public static bool GetAllCellsWithinDistance_Prefix(
-            CellDistanceFinder __instance,
-            Vector2 coordinates,
-            int distance,
-            ref List<int> __result)
-        {
-            long width = (long)__instance.size.x;
-            int cx = (int)coordinates.x;
-            int cy = (int)coordinates.y;
-            long key = (width << 48) | ((long)cx << 32) | ((long)cy << 16) | (long)distance;
-
-            if (WithinDistanceCache.TryGetValue(key, out List<int> cached))
-            {
-                __result = cached;
-                return false; // Skip method and new List<int>() allocation!
-            }
-
-            return true;
-        }
-
-        [HarmonyPatch(typeof(CellDistanceFinder), nameof(CellDistanceFinder.GetAllCellsWithinDistanceOfCellWithCoordinates))]
-        [HarmonyPostfix]
-        public static void GetAllCellsWithinDistance_Postfix(
-            CellDistanceFinder __instance,
-            Vector2 coordinates,
-            int distance,
-            List<int> __result)
-        {
-            if (__result != null)
-            {
-                long width = (long)__instance.size.x;
-                int cx = (int)coordinates.x;
-                int cy = (int)coordinates.y;
-                long key = (width << 48) | ((long)cx << 32) | ((long)cy << 16) | (long)distance;
-
-                if (!WithinDistanceCache.ContainsKey(key))
-                {
-                    WithinDistanceCache[key] = __result;
-                }
-            }
-        }
 
         // --- Native multicore batch spatial query for animal food searches ---
         // Pooled arrays avoid GC heap allocations in steady state.

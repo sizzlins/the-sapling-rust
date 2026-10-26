@@ -14,10 +14,6 @@ namespace SaplingRustBridge
         private IntPtr _rustWorld = IntPtr.Zero;
         private Harmony _harmony;
 
-        private static readonly System.Diagnostics.Stopwatch _frameStopwatch = new System.Diagnostics.Stopwatch();
-        private static readonly System.Diagnostics.Stopwatch _updateStopwatch = new System.Diagnostics.Stopwatch();
-        private static int _lastGcCount = 0;
-
         public static void LogWarn(string msg)
         {
             if (Instance != null && Instance.Logger != null)
@@ -32,38 +28,9 @@ namespace SaplingRustBridge
 
         void Update()
         {
-            if (_frameStopwatch.IsRunning)
-            {
-                long totalFrameMs = _frameStopwatch.ElapsedMilliseconds;
-                int gcCount = GC.CollectionCount(0);
-                bool gcRan = gcCount != _lastGcCount;
-                _lastGcCount = gcCount;
-
-                if (totalFrameMs >= 40)
-                {
-                    long heapMb = GC.GetTotalMemory(false) / (1024 * 1024);
-                    Logger.LogWarning($"[PROFILER FRAME HITCH] Full frame took {totalFrameMs} ms! (GC ran: {gcRan}, Heap: {heapMb} MB)");
-                }
-            }
-            _frameStopwatch.Reset();
-            _frameStopwatch.Start();
-
-            _updateStopwatch.Reset();
-            _updateStopwatch.Start();
-
             if (Input.GetKeyDown(KeyCode.F9))
             {
                 Patches.MemoryPatches.TriggerDeepMemoryTrim();
-            }
-        }
-
-        void LateUpdate()
-        {
-            _updateStopwatch.Stop();
-            long updateMs = _updateStopwatch.ElapsedMilliseconds;
-            if (updateMs >= 35)
-            {
-                Logger.LogWarning($"[PROFILER SCRIPT STALL] MonoBehaviours Update phase took {updateMs} ms!");
             }
         }
 
@@ -112,7 +79,6 @@ namespace SaplingRustBridge
                 typeof(Patches.SpatialPatches),
                 typeof(Patches.TimeJumpPatches),
                 typeof(Patches.ThreadRandomPatch),
-                typeof(Patches.DiagnosticsProfiler),
                 typeof(Patches.CleanLogPatches)
             };
 
