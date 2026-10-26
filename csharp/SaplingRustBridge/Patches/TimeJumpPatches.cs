@@ -17,7 +17,7 @@ namespace SaplingRustBridge.Patches
         public static volatile bool IsTimeJumpActive = false;
         private static AnimalPosition[] _cachedArray;
 
-        // 1. Initial Time Jump: offload days to background thread
+        // 1. Initial Time Jump
         [HarmonyPatch(typeof(TimeJumpController), nameof(TimeJumpController.Jump))]
         [HarmonyPostfix]
         public static void TimeJumpController_Jump_Postfix(TimeJumpController __instance)
@@ -25,8 +25,7 @@ namespace SaplingRustBridge.Patches
             if (__instance != null && __instance.timeLine != null && __instance.nrOfYearsToJump > 0)
             {
                 IsTimeJumpActive = true;
-                __instance.nrOfDaysToJumpPerFrame = 0;
-                AsyncJumpWorker.StartJump(__instance.timeLine, __instance.nrOfYearsToJump);
+                __instance.nrOfDaysToJumpPerFrame = 0; // Handled by adaptive loop
             }
         }
 
@@ -93,8 +92,8 @@ namespace SaplingRustBridge.Patches
         [HarmonyPostfix]
         public static void TimeLine_LiveADay_Postfix(TimeLine __instance)
         {
-            // During background time jumps, throttle history snapshots to every 10 days to eliminate P/Invoke loop overhead
-            if (AsyncJumpWorker.IsRunning && (__instance.dayIndex % 10 != 0))
+            // During time jumps, throttle history snapshots to every 10 days to eliminate P/Invoke loop overhead
+            if (IsTimeJumpActive && (__instance.dayIndex % 10 != 0))
             {
                 return;
             }
@@ -124,107 +123,119 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // 4. During a TimeJumpController jump, run UI at 60+ FPS on main thread while worker jumps
+        // 5. During a TimeJumpController jump, run authentic simulation with 60 FPS UI updates
         [HarmonyPatch(typeof(TimeJumpController), "Update")]
         [HarmonyPrefix]
         public static bool TimeJumpController_Update_Prefix(TimeJumpController __instance)
         {
-            if (__instance == null) return true;
+            if (__instance == null || __instance.timeLine == null) return true;
 
             try
             {
                 // Handle user cancel / interrupt button click
                 if (Input.GetMouseButtonDown(0) && __instance.uiView != null && __instance.uiView.interruptButtonHovered)
                 {
-                    AsyncJumpWorker.Stop();
                     IsTimeJumpActive = false;
                     __instance.nrOfYearsToJump = 0;
-                    var callback = __instance.timeJumpReady;
+                    var cb = __instance.timeJumpReady;
                     __instance.timeJumpReady = null;
-                    if (callback != null)
+                    if (cb != null)
                     {
                         __instance.uiView.ShowWaitInstructions(true);
-                        callback.Call(new object[0]);
+                        cb.Call(new object[0]);
                     }
                     return false;
                 }
 
-                int remaining = AsyncJumpWorker.DaysRemaining;
-                __instance.nrOfYearsToJump = remaining;
-
-                // When worker completes or was stopped, transition immediately
-                if (!AsyncJumpWorker.IsRunning || remaining <= 0)
+                if (__instance.nrOfYearsToJump > 0)
                 {
-                    IsTimeJumpActive = false;
-                    __instance.nrOfYearsToJump = 0;
-                    var callback = __instance.timeJumpReady;
-                    __instance.timeJumpReady = null;
-                    if (callback != null)
+                    IsTimeJumpActive = true;
+                    // Time-budgeted authentic simulation: simulate as many days as possible in ~20ms
+                    // while guaranteeing silky smooth 50-60 FPS UI updates!
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    while (__instance.nrOfYearsToJump > 0 && sw.ElapsedMilliseconds < 20)
                     {
-                        __instance.uiView.ShowWaitInstructions(true);
-                        callback.Call(new object[0]);
+                        int batch = Math.Min(250, __instance.nrOfYearsToJump);
+                        __instance.timeLine.JumpAhead(batch);
+                        __instance.nrOfYearsToJump -= batch;
                     }
-                    return false;
-                }
 
-                // Update UI progress bar and species counts smoothly from main thread
-                if (__instance.timeLine != null && __instance.uiView != null)
-                {
-                    var epochs = __instance.timeLine.epochs;
-                    var epoch = (epochs != null && epochs.Count > 0) ? epochs[epochs.Count - 1] : null;
-
-                    int algaCount = __instance.timeLine.allAlgaSpecies != null ? __instance.timeLine.allAlgaSpecies.Count : 0;
-                    int plantCount = __instance.timeLine.allPlantSpecies != null ? __instance.timeLine.allPlantSpecies.Count : 0;
-                    int aquaticCount = 0;
-                    int terrCount = 0;
-                    if (__instance.timeLine.allAnimalSpecies != null)
+                    // Update UI progress bar and species counts smoothly from main thread
+                    if (__instance.uiView != null)
                     {
-                        for (int s = 0; s < __instance.timeLine.allAnimalSpecies.Count; s++)
+                        var epochs = __instance.timeLine.epochs;
+                        var epoch = (epochs != null && epochs.Count > 0) ? epochs[epochs.Count - 1] : null;
+
+                        int algaCount = __instance.timeLine.allAlgaSpecies != null ? __instance.timeLine.allAlgaSpecies.Count : 0;
+                        int plantCount = __instance.timeLine.allPlantSpecies != null ? __instance.timeLine.allPlantSpecies.Count : 0;
+                        int aquaticCount = 0;
+                        int terrCount = 0;
+                        if (__instance.timeLine.allAnimalSpecies != null)
                         {
-                            if (__instance.timeLine.allAnimalSpecies[s].canWalk) terrCount++;
-                            else aquaticCount++;
+                            for (int s = 0; s < __instance.timeLine.allAnimalSpecies.Count; s++)
+                            {
+                                if (__instance.timeLine.allAnimalSpecies[s].canWalk) terrCount++;
+                                else aquaticCount++;
+                            }
                         }
+                        int fungusCount = __instance.timeLine.allFungusSpecies != null ? __instance.timeLine.allFungusSpecies.Count : 0;
+
+                        int algaMut = SafeCountMutations(__instance.timeLine.algaMutationTracker);
+                        int plantMut = SafeCountMutations(__instance.timeLine.plantMutationTracker);
+                        int animalMut = (aquaticCount + terrCount > 0)
+                            ? SafeCountMutations(__instance.timeLine.animalMutationTracker)
+                            : 0;
+                        int fungusMut = SafeCountMutations(__instance.timeLine.fungusMutationTracker);
+
+                        __instance.uiView.UpdateProgress(
+                            __instance.nrOfYearsToJump,
+                            algaMut,
+                            plantMut,
+                            animalMut,
+                            fungusMut,
+                            (epoch != null && epoch.currentNrOfAlgaSpecies > 0) ? epoch.currentNrOfAlgaSpecies : algaCount,
+                            (epoch != null && epoch.currentNrOfPlantSpecies > 0) ? epoch.currentNrOfPlantSpecies : plantCount,
+                            (epoch != null && epoch.currentNrOfAquaticAnimalSpecies > 0) ? epoch.currentNrOfAquaticAnimalSpecies : aquaticCount,
+                            (epoch != null && epoch.currentNrOfTerrestrialAnimalSpecies > 0) ? epoch.currentNrOfTerrestrialAnimalSpecies : terrCount,
+                            (epoch != null && epoch.currentNrOfFungusSpecies > 0) ? epoch.currentNrOfFungusSpecies : fungusCount
+                        );
                     }
-                    int fungusCount = __instance.timeLine.allFungusSpecies != null ? __instance.timeLine.allFungusSpecies.Count : 0;
 
-                    int algaMut = SafeCountMutations(__instance.timeLine.algaMutationTracker);
-                    int plantMut = SafeCountMutations(__instance.timeLine.plantMutationTracker);
-                    int animalMut = (aquaticCount + terrCount > 0)
-                        ? SafeCountMutations(__instance.timeLine.animalMutationTracker)
-                        : 0;
-                    int fungusMut = SafeCountMutations(__instance.timeLine.fungusMutationTracker);
+                    if (__instance.superJump && __instance.nrOfYearsToJump % 1000 == 0)
+                    {
+                        Plugin.LogWarn($"[Superjump] Remaining: {__instance.nrOfYearsToJump} years, dayIndex: {__instance.timeLine.dayIndex}");
+                    }
 
-                    __instance.uiView.UpdateProgress(
-                        remaining,
-                        algaMut,
-                        plantMut,
-                        animalMut,
-                        fungusMut,
-                        (epoch != null && epoch.currentNrOfAlgaSpecies > 0) ? epoch.currentNrOfAlgaSpecies : algaCount,
-                        (epoch != null && epoch.currentNrOfPlantSpecies > 0) ? epoch.currentNrOfPlantSpecies : plantCount,
-                        (epoch != null && epoch.currentNrOfAquaticAnimalSpecies > 0) ? epoch.currentNrOfAquaticAnimalSpecies : aquaticCount,
-                        (epoch != null && epoch.currentNrOfTerrestrialAnimalSpecies > 0) ? epoch.currentNrOfTerrestrialAnimalSpecies : terrCount,
-                        (epoch != null && epoch.currentNrOfFungusSpecies > 0) ? epoch.currentNrOfFungusSpecies : fungusCount
-                    );
+                    return false;
                 }
-
-                return false; // Suppress vanilla JumpAhead loop
+                else
+                {
+                    IsTimeJumpActive = false;
+                    var cb = __instance.timeJumpReady;
+                    __instance.timeJumpReady = null;
+                    if (cb != null)
+                    {
+                        if (__instance.uiView != null) __instance.uiView.ShowWaitInstructions(true);
+                        cb.Call(new object[0]);
+                    }
+                    return false;
+                }
             }
             catch (Exception ex)
             {
                 Plugin.LogWarn("[TimeJumpController_Update_Prefix] " + ex.Message);
-                return false; // Do not fall back to vanilla blocking loop on error
+                return true;
             }
         }
 
-        // 5. In-game Time Jump support on WorldController
+        // 6. In-game Time Jump support on WorldController
         [HarmonyPatch(typeof(WorldController), "Update")]
         [HarmonyPrefix]
         public static bool WorldController_Update_Prefix(WorldController __instance)
         {
             if (__instance == null || __instance.timeLine == null) return true;
 
-            // Direct 1-button trigger for 875,000-year Rust Superjump
+            // Direct 1-button trigger for 875,000-year Superjump
             if (Input.GetKeyDown(KeyCode.F10))
             {
                 Plugin.LogWarn("[SUPERJUMP] Triggered instantly via F10 shortcut key!");
@@ -237,29 +248,28 @@ namespace SaplingRustBridge.Patches
             if (__instance.nrOfDaysToDoInCurrentTimeJump > 0)
             {
                 IsTimeJumpActive = true;
-                if (!AsyncJumpWorker.IsRunning)
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                while (__instance.nrOfDaysToDoInCurrentTimeJump > 0 && sw.ElapsedMilliseconds < 20)
                 {
-                    AsyncJumpWorker.StartJump(__instance.timeLine, __instance.nrOfDaysToDoInCurrentTimeJump);
+                    int batch = Math.Min(250, __instance.nrOfDaysToDoInCurrentTimeJump);
+                    __instance.timeLine.JumpAhead(batch);
+                    __instance.nrOfDaysToDoInCurrentTimeJump -= batch;
                 }
-
-                int remaining = AsyncJumpWorker.DaysRemaining;
-                __instance.nrOfDaysToDoInCurrentTimeJump = remaining;
-                __instance.nrOfDaysToJumpPerFrame = 0;
 
                 if (__instance.uiView != null)
                 {
-                    __instance.uiView.nrOfDaysToDoInCurrentTimeJump = remaining;
+                    __instance.uiView.nrOfDaysToDoInCurrentTimeJump = __instance.nrOfDaysToDoInCurrentTimeJump;
                     __instance.uiView.UpdateTimeJumpWaitingView();
                 }
 
-                if (remaining <= 0)
+                if (__instance.nrOfDaysToDoInCurrentTimeJump <= 0)
                 {
                     IsTimeJumpActive = false;
                     __instance.nrOfDaysToDoInCurrentTimeJump = 0;
-                    return true; // Worker finished! Vanilla runs view cleanup & ShowToday()
+                    return true; // Vanilla handles ShowToday() and view cleanup
                 }
 
-                return false; // Skip vanilla blocking JumpAhead
+                return false;
             }
 
             return true;
@@ -269,7 +279,6 @@ namespace SaplingRustBridge.Patches
         [HarmonyPostfix]
         public static void WorldController_Update_Postfix()
         {
-            AsyncJumpWorker.CheckMainThreadCompletion();
         }
 
         // 6. Prevent ~700ms main-thread freeze from Resources.UnloadUnusedAssets() during Time Jumps

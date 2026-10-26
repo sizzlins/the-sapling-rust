@@ -515,7 +515,7 @@ namespace SaplingRustBridge.Patches
     {
         try
         {
-            if (AsyncJumpWorker.IsRunning) return; // Do not run expensive per-day P/Invoke syncs during time jumps!
+            if (TimeJumpPatches.IsTimeJumpActive || AsyncJumpWorker.IsRunning) return; // Do not run expensive per-day P/Invoke syncs during time jumps!
             if (__instance == null || __instance.today == null || __instance.today.areas == null) return;
             if (areaIndex < 0 || areaIndex >= __instance.today.areas.Length) return;
             WorldArea area = __instance.today.areas[areaIndex];

@@ -176,8 +176,8 @@ namespace SaplingRustBridge.Patches
             if (animal.anim != null)
             {
                 animal.anim.playAutomatically = false;
-                animal.anim.cullingType = AnimationCullingType.BasedOnRenderers;
-                animal.anim.enabled = isClose && (animal.anim.clip != null || animal.anim.GetClipCount() > 0);
+                animal.anim.cullingType = AnimationCullingType.AlwaysAnimate;
+                animal.anim.enabled = isClose || animal.canFly;
             }
 
             // 2. Procedural Inverse Kinematics & Walking Controller
@@ -202,7 +202,7 @@ namespace SaplingRustBridge.Patches
                     smr.enabled = true;
                     smr.shadowCastingMode = isClose ? ShadowCastingMode.On : ShadowCastingMode.Off;
                     smr.receiveShadows = isClose;
-                    smr.updateWhenOffscreen = isClose; // Only update offscreen bones if close to camera
+                    smr.updateWhenOffscreen = true; // FIX: Prevents Unity from freezing mouth/jaw bone transforms on procedural rigs!
                     smr.quality = isClose ? SkinQuality.Bone4 : SkinQuality.Bone2;
                 }
             }
@@ -392,7 +392,7 @@ namespace SaplingRustBridge.Patches
             var renderers = go.GetComponentsInChildren<SkinnedMeshRenderer>(true);
             for (int i = 0; i < renderers.Length; i++)
             {
-                renderers[i].updateWhenOffscreen = false; // Allow Unity to cull offscreen procedural meshes
+                renderers[i].updateWhenOffscreen = true; // FIX: Ensure procedural models (mouth/head/limbs) never detach
             }
         }
 
@@ -403,7 +403,7 @@ namespace SaplingRustBridge.Patches
             for (int i = 0; i < anims.Length; i++)
             {
                 anims[i].playAutomatically = false;
-                anims[i].cullingType = AnimationCullingType.BasedOnRenderers;
+                anims[i].cullingType = AnimationCullingType.AlwaysAnimate;
             }
         }
 

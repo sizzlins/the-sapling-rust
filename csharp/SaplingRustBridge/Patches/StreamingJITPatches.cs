@@ -27,19 +27,19 @@ namespace SaplingRustBridge.Patches
 
             if (__instance.prebuiltAnimalLibrary != null)
             {
-                // parameter0 = mouth/jaw/mandible shape: MUST be crucial to prevent detached floating mouth parts!
-                __instance.prebuiltAnimalLibrary.profileParameter0IsCrucial = true;
+                // All parameters crucial so models always match anatomy perfectly
+                __instance.prebuiltAnimalLibrary.profileParameter0IsCrucial = true; // mouth/jaw
                 __instance.prebuiltAnimalLibrary.profileParameter1IsCrucial = true; // front limbs
                 __instance.prebuiltAnimalLibrary.profileParameter2IsCrucial = true; // back limbs
-                __instance.prebuiltAnimalLibrary.profileParameter3IsCrucial = false; // eyes/minor accessories
+                __instance.prebuiltAnimalLibrary.profileParameter3IsCrucial = true; // eyes/head accessories
             }
 
             if (__instance.prebuiltPlantLibrary != null)
             {
                 __instance.prebuiltPlantLibrary.profileParameter0IsCrucial = true;
                 __instance.prebuiltPlantLibrary.profileParameter1IsCrucial = true;
-                __instance.prebuiltPlantLibrary.profileParameter2IsCrucial = false;
-                __instance.prebuiltPlantLibrary.profileParameter3IsCrucial = false;
+                __instance.prebuiltPlantLibrary.profileParameter2IsCrucial = true;
+                __instance.prebuiltPlantLibrary.profileParameter3IsCrucial = true;
             }
 
             // Restore vanilla JIT optimization thresholds (vanilla is 10, 15, 10)
@@ -63,7 +63,7 @@ namespace SaplingRustBridge.Patches
             if (anim != null)
             {
                 anim.playAutomatically = false;
-                anim.cullingType = AnimationCullingType.BasedOnRenderers;
+                anim.cullingType = AnimationCullingType.AlwaysAnimate;
             }
         }
 
@@ -89,6 +89,19 @@ namespace SaplingRustBridge.Patches
                 if (info != null)
                 {
                     info.hangingBabyFace = null;
+                }
+
+                // FIX: Ensure mouth and all multi-part skinned renderers never detach
+                var smrs = __result.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+                for (int i = 0; i < smrs.Length; i++)
+                {
+                    smrs[i].updateWhenOffscreen = true;
+                }
+                var anims = __result.GetComponentsInChildren<Animation>(true);
+                for (int i = 0; i < anims.Length; i++)
+                {
+                    anims[i].playAutomatically = false;
+                    anims[i].cullingType = AnimationCullingType.AlwaysAnimate;
                 }
             }
         }
