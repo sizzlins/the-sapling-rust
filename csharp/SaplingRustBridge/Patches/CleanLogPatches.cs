@@ -122,10 +122,22 @@ namespace SaplingRustBridge.Patches
             StripConflictingLODGroups(__result);
         }
 
-        // 2. Defense-in-depth: Suppress disk logging of duplicate LODGroup and default animation warnings
+        // 2. Defense-in-depth: Suppress disk AND console logging of duplicate LODGroup and default animation warnings
         [HarmonyPatch(typeof(BepInEx.Logging.DiskLogListener), nameof(BepInEx.Logging.DiskLogListener.LogEvent))]
         [HarmonyPrefix]
         public static bool DiskLogListener_LogEvent_Prefix(object sender, BepInEx.Logging.LogEventArgs eventArgs)
+        {
+            return FilterSpamLog(eventArgs);
+        }
+
+        [HarmonyPatch(typeof(BepInEx.Logging.ConsoleLogListener), nameof(BepInEx.Logging.ConsoleLogListener.LogEvent))]
+        [HarmonyPrefix]
+        public static bool ConsoleLogListener_LogEvent_Prefix(object sender, BepInEx.Logging.LogEventArgs eventArgs)
+        {
+            return FilterSpamLog(eventArgs);
+        }
+
+        private static bool FilterSpamLog(BepInEx.Logging.LogEventArgs eventArgs)
         {
             if (eventArgs != null && eventArgs.Data != null)
             {

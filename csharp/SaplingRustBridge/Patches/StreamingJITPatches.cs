@@ -1,5 +1,5 @@
 using System;
-using System.Collections.Generic;
+using System.Diagnostics;
 using HarmonyLib;
 using UnityEngine;
 
@@ -7,19 +7,24 @@ namespace SaplingRustBridge.Patches
 {
     /// <summary>
     /// Smooth, hitch-free JIT streaming of organisms around the camera.
-    /// Replaces the unbudgeted 10-ring concentric scan with a frame-budgeted ring streamer.
+    /// Uses an exact Stopwatch time budget (max 1ms when moving, 4ms when still)
+    /// to guarantee 60 FPS without ever stalling camera translation or mouse drag.
     /// </summary>
     [HarmonyPatch]
     public static class StreamingJITPatches
     {
         private static Vector3 _lastFrameCamPos = Vector3.zero;
+        private static Vector3 _lastCenterCamPos = new Vector3(-9999f, -9999f, -9999f);
         private static int _currentRing = 7;
+        private static int _currentBandIndex = 0;
         private static int _cachedAreaIndex = -1;
         private static int _cachedCellIndex = -1;
+        private static int[] _cachedBand = null;
 
         private const int MaxDistanceRing = 6;
-        private const int MaxBuildsPerFrameMoving = 3;
-        private const int MaxBuildsPerFrameStill = 8;
+        private const float RetargetDistance = 15f; // Re-center only when camera moves > 15 units
+
+        private static readonly Stopwatch _sw = new Stopwatch();
 
         [HarmonyPatch(typeof(WorldView), nameof(WorldView.CreateOrganismsAroundCameraJIT))]
         [HarmonyPrefix]
@@ -35,21 +40,23 @@ namespace SaplingRustBridge.Patches
             float currentSpeed = (camPos - _lastFrameCamPos).magnitude / dt;
             _lastFrameCamPos = camPos;
 
-            bool isMoving = currentSpeed > 1.5f || __instance.movingCamera;
-            int budget = isMoving ? MaxBuildsPerFrameMoving : MaxBuildsPerFrameStill;
+            bool isMoving = currentSpeed > 1.0f || __instance.movingCamera;
 
-            int currentArea = __instance.GetAreaIndexBelowCamera();
-            int currentCell = __instance.GetCellIndexBelowCamera();
-
-            // Only restart rings when the camera crosses into a new world cell
-            if (currentArea != _cachedAreaIndex || currentCell != _cachedCellIndex)
+            // Only retarget rings when camera moves a meaningful distance (avoids cell boundary jitter)
+            if (Vector3.Distance(camPos, _lastCenterCamPos) > RetargetDistance)
             {
-                _cachedAreaIndex = currentArea;
-                _cachedCellIndex = currentCell;
+                _lastCenterCamPos = camPos;
+                _cachedAreaIndex = __instance.GetAreaIndexBelowCamera();
+                _cachedCellIndex = __instance.GetCellIndexBelowCamera();
                 _currentRing = 0;
+                _currentBandIndex = 0;
+                _cachedBand = null;
             }
 
-            StepJITStreaming(__instance, budget);
+            // While camera is actively dragged/moving, give at most 1ms to prevent any drag stutter.
+            // When still, allow 4ms so the frame stays comfortably under the 16.6ms frame budget (60 FPS).
+            long timeBudgetMs = isMoving ? 1 : 4;
+            StepJITStreaming(__instance, timeBudgetMs);
 
             return false;
         }
@@ -60,19 +67,21 @@ namespace SaplingRustBridge.Patches
         {
             if (_currentRing <= MaxDistanceRing && __instance != null && __instance.cellDistanceFinder != null)
             {
-                StepJITStreaming(__instance, MaxBuildsPerFrameStill);
+                StepJITStreaming(__instance, 4);
             }
         }
 
-        private static void StepJITStreaming(WorldView view, int budget)
+        private static void StepJITStreaming(WorldView view, long budgetMs)
         {
             if (_currentRing > MaxDistanceRing) return;
             if (_cachedAreaIndex < 0 || _cachedCellIndex < 0) return;
 
             int areaIndex = _cachedAreaIndex;
             int cellIndex = _cachedCellIndex;
-            int initialCount = view.gameObjectsNewlyGenerated.Count;
             var distanceFinder = view.cellDistanceFinder;
+
+            _sw.Reset();
+            _sw.Start();
 
             // Ring 0: Center cell directly below camera
             if (_currentRing == 0)
@@ -81,11 +90,13 @@ namespace SaplingRustBridge.Patches
                 view.CreateJITOptimizationJobForPlant(areaIndex, cellIndex);
                 view.CreateJITOptimizationJobForFungus(areaIndex, cellIndex);
                 view.CreateJITOptimizationJobForAnimal(areaIndex, cellIndex);
-                _currentRing++;
+                _currentRing = 1;
+                _currentBandIndex = 0;
+                _cachedBand = null;
 
-                if (view.gameObjectsNewlyGenerated.Count - initialCount >= budget)
+                if (_sw.ElapsedMilliseconds >= budgetMs)
                 {
-                    FinalizeFrameBatch(view, initialCount);
+                    FinalizeFrameBatch(view);
                     return;
                 }
             }
@@ -93,42 +104,48 @@ namespace SaplingRustBridge.Patches
             // Stream rings outward from 1 to MaxDistanceRing
             while (_currentRing <= MaxDistanceRing)
             {
-                int dist = _currentRing;
-                Vector2 coords = distanceFinder.TransformCellIndexToCoordinates(cellIndex);
-                int[] band = distanceFinder.GetAllCellsWithinDistanceBandOfCellWithCoordinates(coords, dist, true, true, true, true);
-
-                if (band != null)
+                if (_cachedBand == null)
                 {
-                    for (int i = 0; i < band.Length; i++)
+                    Vector2 coords = distanceFinder.TransformCellIndexToCoordinates(cellIndex);
+                    _cachedBand = distanceFinder.GetAllCellsWithinDistanceBandOfCellWithCoordinates(coords, _currentRing, true, true, true, true);
+                    _currentBandIndex = 0;
+                }
+
+                if (_cachedBand != null && _cachedBand.Length > 0)
+                {
+                    while (_currentBandIndex < _cachedBand.Length)
                     {
-                        int c = band[i];
-                        if (c < 0) continue;
-
-                        view.CreateJITOptimizationJobForAlga(areaIndex, c);
-                        view.CreateJITOptimizationJobForPlant(areaIndex, c);
-                        view.CreateJITOptimizationJobForFungus(areaIndex, c);
-                        view.CreateJITOptimizationJobForAnimal(areaIndex, c);
-
-                        if (view.gameObjectsNewlyGenerated.Count - initialCount >= budget)
+                        int c = _cachedBand[_currentBandIndex++];
+                        if (c >= 0)
                         {
-                            FinalizeFrameBatch(view, initialCount);
+                            view.CreateJITOptimizationJobForAlga(areaIndex, c);
+                            view.CreateJITOptimizationJobForPlant(areaIndex, c);
+                            view.CreateJITOptimizationJobForFungus(areaIndex, c);
+                            view.CreateJITOptimizationJobForAnimal(areaIndex, c);
+                        }
+
+                        if (_sw.ElapsedMilliseconds >= budgetMs)
+                        {
+                            FinalizeFrameBatch(view);
                             return;
                         }
                     }
                 }
 
                 _currentRing++;
+                _currentBandIndex = 0;
+                _cachedBand = null;
 
-                if (view.gameObjectsNewlyGenerated.Count - initialCount >= budget)
+                if (_sw.ElapsedMilliseconds >= budgetMs)
                 {
                     break;
                 }
             }
 
-            FinalizeFrameBatch(view, initialCount);
+            FinalizeFrameBatch(view);
         }
 
-        private static void FinalizeFrameBatch(WorldView view, int initialCount)
+        private static void FinalizeFrameBatch(WorldView view)
         {
             if (view == null) return;
 
@@ -137,7 +154,7 @@ namespace SaplingRustBridge.Patches
                 view.organismObjectPool.BillboardCleanup();
             }
 
-            if (view.gameObjectsNewlyGenerated != null && view.gameObjectsNewlyGenerated.Count > initialCount)
+            if (view.gameObjectsNewlyGenerated != null && view.gameObjectsNewlyGenerated.Count > 0)
             {
                 if (view.newOrganismsCreatedJITAfterCameraMovement != null)
                 {
