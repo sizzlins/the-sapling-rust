@@ -104,6 +104,9 @@ namespace SaplingRustBridge.Patches
             }
         }
 
+        private static readonly AccessTools.FieldRef<MutationTracker, Queue<int>> MutationHistoryRef =
+            AccessTools.FieldRefAccess<MutationTracker, Queue<int>>("mutationHistory");
+
         // 6. Thread-safe MutationTracker to eliminate cross-thread collection modification exceptions
         [HarmonyPatch(typeof(MutationTracker), nameof(MutationTracker.CountRecentMutations))]
         [HarmonyPrefix]
@@ -114,11 +117,11 @@ namespace SaplingRustBridge.Patches
             {
                 try
                 {
-                    var queue = Traverse.Create(__instance).Field<Queue<int>>("mutationHistory").Value;
+                    var queue = MutationHistoryRef(__instance);
                     if (queue != null)
                     {
                         int sum = 0;
-                        foreach (int item in queue.ToArray()) sum += item;
+                        foreach (int item in queue) sum += item;
                         __result = sum;
                         return false;
                     }
