@@ -27,27 +27,44 @@ namespace SaplingRustBridge.Patches
 
             if (__instance.prebuiltAnimalLibrary != null)
             {
-                __instance.prebuiltAnimalLibrary.profileParameter0IsCrucial = false;
-                __instance.prebuiltAnimalLibrary.profileParameter1IsCrucial = false;
-                __instance.prebuiltAnimalLibrary.profileParameter2IsCrucial = false;
-                __instance.prebuiltAnimalLibrary.profileParameter3IsCrucial = false;
+                // parameter0 = mouth/jaw/mandible shape: MUST be crucial to prevent detached floating mouth parts!
+                __instance.prebuiltAnimalLibrary.profileParameter0IsCrucial = true;
+                __instance.prebuiltAnimalLibrary.profileParameter1IsCrucial = true; // front limbs
+                __instance.prebuiltAnimalLibrary.profileParameter2IsCrucial = true; // back limbs
+                __instance.prebuiltAnimalLibrary.profileParameter3IsCrucial = false; // eyes/minor accessories
             }
 
             if (__instance.prebuiltPlantLibrary != null)
             {
-                __instance.prebuiltPlantLibrary.profileParameter0IsCrucial = false;
-                __instance.prebuiltPlantLibrary.profileParameter1IsCrucial = false;
+                __instance.prebuiltPlantLibrary.profileParameter0IsCrucial = true;
+                __instance.prebuiltPlantLibrary.profileParameter1IsCrucial = true;
                 __instance.prebuiltPlantLibrary.profileParameter2IsCrucial = false;
                 __instance.prebuiltPlantLibrary.profileParameter3IsCrucial = false;
             }
 
-            // Generous thresholds so models spawn reliably and remain visible
-            __instance.algaJITOptimizationThreshold = 20;
-            __instance.plantJITOptimizationThreshold = 25;
-            __instance.animalJITOptimizationThreshold = 20;
+            // Restore vanilla JIT optimization thresholds (vanilla is 10, 15, 10)
+            // Higher thresholds prevent billboard proxies and inflate memory with 600k+ active GameObjects
+            __instance.algaJITOptimizationThreshold = 10;
+            __instance.plantJITOptimizationThreshold = 15;
+            __instance.animalJITOptimizationThreshold = 10;
 
             // Catmull-Clark subdivision iterations: exactly 1 iteration (vanilla requirement for rigs and bone weights)
             __instance.builderSubdividerIterations = 1;
+        }
+
+        // 2. Prevent Unity from spamming 'Default clip could not be found in attached animations list'
+        // Unity defaults Animation.playAutomatically = true, which throws every frame if clip is null
+        [HarmonyPatch(typeof(AnimalView), nameof(AnimalView.AddAnimationsToGameObject))]
+        [HarmonyPostfix]
+        public static void AnimalView_AddAnimationsToGameObject_FixClip(GameObject gameObject)
+        {
+            if (gameObject == null) return;
+            var anim = gameObject.GetComponent<Animation>();
+            if (anim != null)
+            {
+                anim.playAutomatically = false;
+                anim.cullingType = AnimationCullingType.BasedOnRenderers;
+            }
         }
 
         // 4. Ensure AnimalObjectBuilder runs with at least 1 subdivision iteration

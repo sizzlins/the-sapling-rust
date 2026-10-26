@@ -15,8 +15,8 @@ namespace SaplingRustBridge.Patches
     [HarmonyPatch]
     public static class LODPatches
     {
-        public const float CloseDistanceThreshold = 350f; // Vanilla is 350f
-        public const float MidDistanceThreshold = 1000f;  // Vanilla is 1000f
+        public const float CloseDistanceThreshold = 150f;
+        public const float MidDistanceThreshold = 500f;
         public const float PlantDemoteDistance = 450f;
         public const float AnimalDemoteDistance = 1500f;
 
@@ -35,8 +35,8 @@ namespace SaplingRustBridge.Patches
             ActiveWorldView = __instance;
             __instance.cameraCloseDistanceThreshold = CloseDistanceThreshold;
             __instance.cameraMidDistanceThreshold = MidDistanceThreshold;
-            __instance.limitDetailInTheDistance = false;
-            __instance.detailInTheDistanceNrOfCellsThreshold = 50000;
+            __instance.limitDetailInTheDistance = true;
+            __instance.detailInTheDistanceNrOfCellsThreshold = 350;
         }
 
         [HarmonyPatch(typeof(WorldView), "Update")]
@@ -175,7 +175,9 @@ namespace SaplingRustBridge.Patches
             // 1. Legacy animation engine (bone matrix evaluations)
             if (animal.anim != null)
             {
-                animal.anim.enabled = isClose || animal.canFly;
+                animal.anim.playAutomatically = false;
+                animal.anim.cullingType = AnimationCullingType.BasedOnRenderers;
+                animal.anim.enabled = isClose && (animal.anim.clip != null || animal.anim.GetClipCount() > 0);
             }
 
             // 2. Procedural Inverse Kinematics & Walking Controller
@@ -200,7 +202,7 @@ namespace SaplingRustBridge.Patches
                     smr.enabled = true;
                     smr.shadowCastingMode = isClose ? ShadowCastingMode.On : ShadowCastingMode.Off;
                     smr.receiveShadows = isClose;
-                    smr.updateWhenOffscreen = true; // FIX: Prevents Unity from culling procedural meshes with uninitialized bounds!
+                    smr.updateWhenOffscreen = isClose; // Only update offscreen bones if close to camera
                     smr.quality = isClose ? SkinQuality.Bone4 : SkinQuality.Bone2;
                 }
             }
@@ -390,7 +392,7 @@ namespace SaplingRustBridge.Patches
             var renderers = go.GetComponentsInChildren<SkinnedMeshRenderer>(true);
             for (int i = 0; i < renderers.Length; i++)
             {
-                renderers[i].updateWhenOffscreen = true; // FIX: Ensure procedural models are always rendered on camera!
+                renderers[i].updateWhenOffscreen = false; // Allow Unity to cull offscreen procedural meshes
             }
         }
 
@@ -400,7 +402,8 @@ namespace SaplingRustBridge.Patches
             var anims = go.GetComponentsInChildren<Animation>(true);
             for (int i = 0; i < anims.Length; i++)
             {
-                anims[i].cullingType = AnimationCullingType.AlwaysAnimate;
+                anims[i].playAutomatically = false;
+                anims[i].cullingType = AnimationCullingType.BasedOnRenderers;
             }
         }
 
