@@ -62,80 +62,26 @@ namespace SaplingRustBridge.Patches
                     WorldArea area = (timeLine.today != null && timeLine.today.areas != null && timeLine.today.areas.Length > 0)
                         ? timeLine.today.areas[0] : null;
 
-                    IntPtr grid = IntPtr.Zero;
-                    if (area != null)
+                    Plugin.LogWarn($"[AsyncJumpWorker] Starting authentic {totalDays}-day simulation on dedicated worker thread...");
+                    TimeJumpPatches.IsTimeJumpActive = true;
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+
+                    while (_daysRemaining > 0 && _isRunning)
                     {
-                        SpatialPatches.NativeGridManager.EnsureGrid((int)area.size.y, (int)area.size.x);
-                        SpatialPatches.NativeGridManager.SyncOrganisms(area, timeLine);
-                        grid = SpatialPatches.NativeGridManager.Handle;
-                    }
+                        int batch = Math.Min(25, _daysRemaining);
+                        timeLine.JumpAhead(batch);
+                        _daysRemaining -= batch;
 
-                    if (grid != IntPtr.Zero && area != null)
-                    {
-                        Plugin.LogWarn($"[AsyncJumpWorker] Starting authentic {totalDays}-day native Rust warp on worker thread...");
-                        var sw = System.Diagnostics.Stopwatch.StartNew();
-
-                        float mutAlgae = timeLine.chanceForAlgaMutation;
-                        float mutPlants = timeLine.chanceForPlantMutation;
-                        float mutAnimals = timeLine.chanceForAnimalMutation;
-                        float mutFungi = timeLine.chanceForFungusMutation;
-
-                        while (_daysRemaining > 0 && _isRunning)
+                        // Yield briefly to keep CPU cache and thread switching smooth
+                        if (sw.ElapsedMilliseconds >= 25)
                         {
-                            // 25,000-day batch size: runs in ~100ms in Rust, updating UI progress at 60 FPS
-                            int batch = Math.Min(25000, _daysRemaining);
-                            ulong seed = (ulong)(timeLine.dayIndex + _daysRemaining);
-                            NativeSim.NativeDaySummary chunkSummary = default;
-
-                            NativeSim.sapling_grid_warp(
-                                grid,
-                                (uint)batch,
-                                mutAlgae,
-                                mutPlants,
-                                mutAnimals,
-                                mutFungi,
-                                seed,
-                                ref chunkSummary);
-
-                            _daysRemaining -= batch;
-                            timeLine.dayIndex += batch;
-
-                            // Live mutation updates
-                            if (timeLine.algaMutationTracker != null && chunkSummary.AlgaBirths > 0)
-                                timeLine.algaMutationTracker.RegisterMutation();
-                            if (timeLine.plantMutationTracker != null && chunkSummary.PlantBirths > 0)
-                                timeLine.plantMutationTracker.RegisterMutation();
-                            if (timeLine.animalMutationTracker != null && chunkSummary.AnimalBirths > 0)
-                                timeLine.animalMutationTracker.RegisterMutation();
-                            if (timeLine.fungusMutationTracker != null && chunkSummary.FungusBirths > 0)
-                                timeLine.fungusMutationTracker.RegisterMutation();
-
-                            // Smooth 60 FPS UI yield
                             Thread.Sleep(0);
-                        }
-
-                        // Sync final evolved state back into WorldArea
-                        SpatialPatches.NativeGridManager.SyncBackToUnity(area, timeLine);
-                        Plugin.LogWarn($"[AsyncJumpWorker] Native Rust warp complete! Current dayIndex: {timeLine.dayIndex}, elapsed: {sw.ElapsedMilliseconds}ms");
-                    }
-                    else
-                    {
-                        Plugin.LogWarn($"[AsyncJumpWorker] Native grid unavailable, falling back to C# JumpAhead...");
-                        var sw = System.Diagnostics.Stopwatch.StartNew();
-                        while (_daysRemaining > 0 && _isRunning)
-                        {
-                            int batch = Math.Min(250, _daysRemaining);
-                            timeLine.JumpAhead(batch);
-                            _daysRemaining -= batch;
-
-                            if (sw.ElapsedMilliseconds >= 32)
-                            {
-                                Thread.Sleep(0);
-                                sw.Reset();
-                                sw.Start();
-                            }
+                            sw.Reset();
+                            sw.Start();
                         }
                     }
+                    TimeJumpPatches.IsTimeJumpActive = false;
+                    Plugin.LogWarn($"[AsyncJumpWorker] Authentic simulation complete! Current dayIndex: {timeLine.dayIndex}");
                 }
                 catch (Exception ex)
                 {

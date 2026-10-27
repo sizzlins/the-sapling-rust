@@ -27,20 +27,13 @@ namespace SaplingRustBridge.Patches
 
             if (__instance.prebuiltAnimalLibrary != null)
             {
-                // All parameters crucial so models always match anatomy perfectly
-                __instance.prebuiltAnimalLibrary.profileParameter0IsCrucial = true; // mouth/jaw
-                __instance.prebuiltAnimalLibrary.profileParameter1IsCrucial = true; // front limbs
-                __instance.prebuiltAnimalLibrary.profileParameter2IsCrucial = true; // back limbs
-                __instance.prebuiltAnimalLibrary.profileParameter3IsCrucial = true; // eyes/head accessories
+                // Vanilla balance: limb configurations are crucial for animations, mouth/accessories allow blueprint reuse
+                __instance.prebuiltAnimalLibrary.profileParameter0IsCrucial = false; // mouth
+                __instance.prebuiltAnimalLibrary.profileParameter1IsCrucial = true;  // front limbs
+                __instance.prebuiltAnimalLibrary.profileParameter2IsCrucial = true;  // back limbs
+                __instance.prebuiltAnimalLibrary.profileParameter3IsCrucial = false; // accessories
             }
 
-            if (__instance.prebuiltPlantLibrary != null)
-            {
-                __instance.prebuiltPlantLibrary.profileParameter0IsCrucial = true;
-                __instance.prebuiltPlantLibrary.profileParameter1IsCrucial = true;
-                __instance.prebuiltPlantLibrary.profileParameter2IsCrucial = true;
-                __instance.prebuiltPlantLibrary.profileParameter3IsCrucial = true;
-            }
 
             // Restore vanilla JIT optimization thresholds (vanilla is 10, 15, 10)
             // Higher thresholds prevent billboard proxies and inflate memory with 600k+ active GameObjects
@@ -67,7 +60,21 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // 4. Ensure AnimalObjectBuilder runs with at least 1 subdivision iteration
+        // 3. Prevent cyclic graph serialization crash in AnimalInfo.hangingBabyFace
+        public static void SanitizeAnimalInfo(GameObject go)
+        {
+            if (go == null) return;
+            AnimalInfo info = go.GetComponent<AnimalInfo>();
+            if (info != null)
+            {
+                info.hangingBabyFace = null;
+            }
+        }
+
+        // 4. AnimalObjectBuilder runs with 1 subdivision iteration for CatmullClarkSubdivider
+
+
+        // 5. Ensure AnimalObjectBuilder runs with at least 1 subdivision iteration
         // so CatmullClarkSubdivider is non-null for AnimalArmatureBuilder.RecalculateBoneWeightsForSubdividedMesh
         [HarmonyPatch(typeof(AnimalObjectBuilder), nameof(AnimalObjectBuilder.Run))]
         [HarmonyPrefix]
@@ -85,11 +92,7 @@ namespace SaplingRustBridge.Patches
         {
             if (__result != null)
             {
-                AnimalInfo info = __result.GetComponent<AnimalInfo>();
-                if (info != null)
-                {
-                    info.hangingBabyFace = null;
-                }
+                SanitizeAnimalInfo(__result);
 
                 // FIX: Ensure mouth and all multi-part skinned renderers never detach
                 var smrs = __result.GetComponentsInChildren<SkinnedMeshRenderer>(true);
@@ -106,16 +109,46 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // 5. Ensure PlantObjectBuilder has at least 1 subdivision iteration
-        [HarmonyPatch(typeof(PlantObjectBuilder), nameof(PlantObjectBuilder.Run))]
-        [HarmonyPrefix]
-        public static void PlantObjectBuilder_Run_Prefix(PlantObjectBuilder __instance)
+        [HarmonyPatch(typeof(AnimalView), nameof(AnimalView.BuildAnimalGameObject))]
+        [HarmonyPostfix]
+        public static void AnimalView_BuildAnimalGameObject_Postfix(GameObject __result)
         {
-            if (__instance != null && __instance.subdividerIterations < 1)
+            if (__result != null)
             {
-                __instance.subdividerIterations = 1;
+                SanitizeAnimalInfo(__result);
             }
         }
+
+        [HarmonyPatch(typeof(PrebuiltOrganismLibrary), nameof(PrebuiltOrganismLibrary.CacheOrganismProfileBased))]
+        [HarmonyPrefix]
+        public static void PrebuiltOrganismLibrary_CacheOrganismProfileBased_Prefix(GameObject gameObject)
+        {
+            if (gameObject != null)
+            {
+                SanitizeAnimalInfo(gameObject);
+            }
+        }
+
+        [HarmonyPatch(typeof(PrebuiltOrganismLibrary), nameof(PrebuiltOrganismLibrary.CacheOrganism), new Type[] { typeof(int), typeof(int), typeof(bool), typeof(GameObject) })]
+        [HarmonyPrefix]
+        public static void PrebuiltOrganismLibrary_CacheOrganism_Prefix(GameObject gameObject)
+        {
+            if (gameObject != null)
+            {
+                SanitizeAnimalInfo(gameObject);
+            }
+        }
+
+        [HarmonyPatch(typeof(PrebuiltOrganismLibrary), nameof(PrebuiltOrganismLibrary.GetPrebuiltOrganismProfileBased))]
+        [HarmonyPostfix]
+        public static void PrebuiltOrganismLibrary_GetPrebuiltOrganismProfileBased_Postfix(GameObject __result)
+        {
+            if (__result != null)
+            {
+                SanitizeAnimalInfo(__result);
+            }
+        }
+
 
         private static readonly AccessTools.FieldRef<MutationTracker, Queue<int>> MutationHistoryRef =
             AccessTools.FieldRefAccess<MutationTracker, Queue<int>>("mutationHistory");

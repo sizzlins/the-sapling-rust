@@ -99,26 +99,7 @@ namespace SaplingRustBridge.Patches
             return false; // Skip original O(S^2) method!
         }
 
-        // --- 2. Cache TimeLine.GetAllSpecies to eliminate daily array allocations ---
-        private static SpeciesDefinition[] _cachedAllSpecies;
-        private static int _cachedSpeciesCount = -1;
 
-        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.GetAllSpecies))]
-        [HarmonyPrefix]
-        public static bool TimeLine_GetAllSpecies_Prefix(TimeLine __instance, ref SpeciesDefinition[] __result)
-        {
-            if (__instance == null || __instance.allSpecies == null) return true;
-
-            int count = __instance.allSpecies.Count;
-            if (_cachedAllSpecies == null || _cachedSpeciesCount != count)
-            {
-                _cachedAllSpecies = __instance.allSpecies.ToArray();
-                _cachedSpeciesCount = count;
-            }
-
-            __result = _cachedAllSpecies;
-            return false;
-        }
 
         private static WorldController _activeWorldController;
 
@@ -158,31 +139,6 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // --- 6. Cleanse illegal or corrupted plants (e.g. plants in deep water or with null definition) ---
-        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LetAllPlantsInAreaLiveADay))]
-        [HarmonyPrefix]
-        public static void TimeLine_LetAllPlantsInAreaLiveADay_Cleanse_Prefix(TimeLine __instance, int areaIndex)
-        {
-            if (__instance == null || __instance.today == null || __instance.today.areas == null) return;
-            if (areaIndex < 0 || areaIndex >= __instance.today.areas.Length) return;
-            var worldArea = __instance.today.areas[areaIndex];
-            if (worldArea == null || worldArea.cells == null || worldArea.cellIndicesOfPlants == null) return;
 
-            for (int i = worldArea.cellIndicesOfPlants.Count - 1; i >= 0; i--)
-            {
-                int idx = worldArea.cellIndicesOfPlants[i];
-                if (idx < 0 || idx >= worldArea.cells.Length)
-                {
-                    worldArea.cellIndicesOfPlants.RemoveAt(i);
-                    continue;
-                }
-                var cell = worldArea.cells[idx];
-                if (cell == null || cell.plant == null || cell.plant.definition == null || cell.oceanDepth != -1f)
-                {
-                    if (cell != null) cell.plant = null;
-                    worldArea.cellIndicesOfPlants.RemoveAt(i);
-                }
-            }
-        }
     }
 }

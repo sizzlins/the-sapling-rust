@@ -15,9 +15,6 @@ namespace SaplingRustBridge.Patches
     [HarmonyPatch]
     public static class MemoryPatches
     {
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool SetProcessWorkingSetSize(IntPtr proc, IntPtr min, IntPtr max);
-
         public static AnimalTextureFactory SharedAnimalTextureFactory = null;
         private static int _dayCounter = 0;
         private static float _lastTrimTime = 0f;
@@ -32,25 +29,9 @@ namespace SaplingRustBridge.Patches
 
             if (__instance.organismObjectPool != null)
             {
-                // Vanilla keeps dead pooled organisms activeSelf=true in the sky for 300 years!
-                __instance.organismObjectPool.outOfSightInsteadOfDisabling = false; // Disable dead pooled GameObjects!
-                __instance.organismObjectPool.expireAfterYears = 3; // Clean dead pools after 3 years instead of 300!
+                // Vanilla keeps dead pooled organisms out of sight in the sky
+                __instance.organismObjectPool.outOfSightInsteadOfDisabling = true;
             }
-
-            // Vanilla keeps extinct species 3D blueprints in memory for 300 years!
-            SetLibraryCleanupYears(__instance.prebuiltOrganismLibrary, 5);
-            SetLibraryCleanupYears(__instance.prebuiltPlantLibrary, 5);
-            SetLibraryCleanupYears(__instance.prebuiltAnimalLibrary, 5);
-        }
-
-        private static void SetLibraryCleanupYears(PrebuiltOrganismLibrary lib, int years)
-        {
-            if (lib == null) return;
-            try
-            {
-                Traverse.Create(lib).Field("cleanUpAfterNrOfInactiveYears").SetValue(years);
-            }
-            catch { }
         }
 
         // --- 2. SHARE TEXTURE FACTORY ACROSS BUILDERS (Eliminates duplicate GPU textures) ---
@@ -64,7 +45,7 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // --- 3. PERIODIC EXTINCT DEFINITION PRUNING & AUTOMATIC MEMORY RECLAMATION ---
+        // --- 3. PERIODIC EXTINCT DEFINITION PRUNING ---
         [HarmonyPatch(typeof(WorldController), nameof(WorldController.ShowToday))]
         [HarmonyPostfix]
         public static void WorldController_ShowToday_MemoryGovernor(WorldController __instance)
@@ -82,15 +63,9 @@ namespace SaplingRustBridge.Patches
                 }
                 catch { }
             }
-
-            // Automatically reclaim unreferenced native assets and return physical RAM to Windows every 50 in-game days
-            if (_dayCounter % 50 == 0)
-            {
-                TriggerDeepMemoryTrim();
-            }
         }
 
-        // --- 4. MANUAL DEEP MEMORY TRIM & OS WORKING SET RECLAMATION (F9 key) ---
+        // --- 4. MANUAL DEEP MEMORY TRIM (F9 key) ---
         public static void TriggerDeepMemoryTrim()
         {
             if (Time.realtimeSinceStartup - _lastTrimTime < 5f) return;
@@ -105,18 +80,9 @@ namespace SaplingRustBridge.Patches
             catch { }
 
             GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
-
-            try
-            {
-                IntPtr currentProc = Process.GetCurrentProcess().Handle;
-                SetProcessWorkingSetSize(currentProc, (IntPtr)(-1), (IntPtr)(-1));
-            }
-            catch { }
 
             long afterHeap = GC.GetTotalMemory(false) / (1024 * 1024);
-            Plugin.LogWarn($"[MEMORY GOVERNOR] Reclaimed RAM! Managed Heap: {beforeHeap} MB -> {afterHeap} MB (Physical working set flushed to OS).");
+            Plugin.LogWarn($"[MEMORY] Reclaimed RAM! Managed Heap: {beforeHeap} MB -> {afterHeap} MB.");
         }
 
         // --- 5. SAFE CAMERA FOCUS GUARD (Eliminates NullReferenceException when clicking animals) ---
@@ -143,6 +109,43 @@ namespace SaplingRustBridge.Patches
             vector.y = 0f;
             Vector3 vector2 = __instance.worldCamera.transform.position - vector + (__instance.baseDistanceCameraToFocusedOrganism + y * __instance.animalSizeToCameraDistanceFactor) * vector.normalized;
             vector2.y = __instance.animalViewInFocus.gameObject.transform.position.y + y * __instance.animalSizeToCameraDistanceFactor;
+            __result = vector2;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.GetNewCameraPositionForCurrentFocusedPlant))]
+        [HarmonyPrefix]
+        public static bool GetNewCameraPositionForCurrentFocusedPlant_Prefix(WorldView __instance, ref Vector3 __result)
+        {
+            if (__instance == null || __instance.plantViewInFocus == null || __instance.plantViewInFocus.gameObject == null || __instance.worldCamera == null)
+            {
+                __result = __instance != null && __instance.worldCamera != null ? __instance.worldCamera.transform.position : Vector3.zero;
+                return false;
+            }
+
+            if (Vector3.Distance(__instance.cameraFocusPointOnPlane, __instance.plantViewInFocus.gameObject.transform.position) < 0.1f)
+            {
+                __result = __instance.worldCamera.transform.position;
+                return false;
+            }
+
+            var smr = __instance.plantViewInFocus.gameObject.GetComponentInChildren<SkinnedMeshRenderer>();
+            float y = 1.0f;
+            if (smr != null && smr.sharedMesh != null)
+            {
+                y = smr.sharedMesh.bounds.size.y;
+            }
+            else
+            {
+                var mf = __instance.plantViewInFocus.gameObject.GetComponentInChildren<MeshFilter>();
+                if (mf != null && mf.sharedMesh != null) y = mf.sharedMesh.bounds.size.y;
+            }
+
+            float num = __instance.worldScaleFactor * y;
+            Vector3 vector = __instance.worldCamera.transform.position - __instance.plantViewInFocus.gameObject.transform.position;
+            vector.y = 0f;
+            Vector3 vector2 = __instance.worldCamera.transform.position - vector + (__instance.baseDistanceCameraToFocusedOrganism + num * __instance.plantSizeToCameraDistanceFactor) * vector.normalized;
+            vector2.y = __instance.plantViewInFocus.gameObject.transform.position.y + num * __instance.plantSizeToCameraDistanceFactor;
             __result = vector2;
             return false;
         }

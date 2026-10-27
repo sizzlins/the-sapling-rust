@@ -153,16 +153,7 @@ namespace SaplingRustBridge.Patches
             return true;
         }
 
-        // 3. Clear gameObjectsNewlyGenerated buffer to prevent quadratic re-binding loops on camera movement
-        [HarmonyPatch(typeof(WorldController), nameof(WorldController.AddHoverActionsToNewlyGeneratedGameObjects))]
-        [HarmonyPostfix]
-        public static void AddHoverActions_Postfix(WorldController __instance)
-        {
-            if (__instance != null && __instance.view != null && __instance.view.gameObjectsNewlyGenerated != null)
-            {
-                __instance.view.gameObjectsNewlyGenerated.Clear();
-            }
-        }
+
 
         // 4. Root fix for IndexOutOfRangeException in WalkingAnimationControllerV2.SolveInverseKinematicsForLeg:
         // Protects against array index mismatches in asymmetrical or hopping mutant creatures.
@@ -227,31 +218,7 @@ namespace SaplingRustBridge.Patches
             return true;
         }
 
-        // 7. Root fix for NullReferenceException in WorldView.ShowAnimalViewsForArea:
-        // Automatically prunes stale/dead entries from animalPositions so the renderer never encounters a null LivingAnimal.
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.ShowAnimalViewsForArea))]
-        [HarmonyPrefix]
-        public static void ShowAnimalViewsForArea_SanitizePositions_Prefix(WorldArea area)
-        {
-            if (area == null || area.animalPositionTracker == null || area.animalPositionTracker.animalPositions == null) return;
 
-            try
-            {
-                area.animalPositionTracker.animalPositions.RemoveWhere(ap =>
-                {
-                    LivingAnimal a = area.GetAnimalInCell(ap.cellIndex, ap.locationType);
-                    return a == null || a.definition == null;
-                });
-            }
-            catch {}
-        }
-
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.ShowAnimalViewsForArea))]
-        [HarmonyFinalizer]
-        public static Exception ShowAnimalViewsForArea_Finalizer(Exception __exception)
-        {
-            return null; // Suppress any remaining JIT null reference exceptions so frame rendering never breaks
-        }
 
         [HarmonyPatch(typeof(AnimalView), nameof(AnimalView.SetAnimationSpeed))]
         [HarmonyPrefix]

@@ -34,6 +34,10 @@
       <HintPath>D:\The_Sapling\The Sapling\the_sapling_Data\Managed\UnityEngine.AnimationModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.ParticleSystemModule">
+      <HintPath>D:\The_Sapling\The Sapling\the_sapling_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
 
     <!-- Game logic assemblies -->
     <Reference Include="Assembly-CSharp">

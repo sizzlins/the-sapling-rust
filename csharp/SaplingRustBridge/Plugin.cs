@@ -26,13 +26,10 @@ namespace SaplingRustBridge
             }
         }
 
-        private float _lastAutoTrimTime = 0f;
-
         void Update()
         {
-            if (Input.GetKeyDown(KeyCode.F9) || (Time.realtimeSinceStartup - _lastAutoTrimTime > 60f))
+            if (Input.GetKeyDown(KeyCode.F9))
             {
-                _lastAutoTrimTime = Time.realtimeSinceStartup;
                 Patches.MemoryPatches.TriggerDeepMemoryTrim();
             }
         }

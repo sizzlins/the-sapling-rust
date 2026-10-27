@@ -15,8 +15,8 @@ namespace SaplingRustBridge.Patches
     [HarmonyPatch]
     public static class LODPatches
     {
-        public const float CloseDistanceThreshold = 150f;
-        public const float MidDistanceThreshold = 500f;
+        public const float CloseDistanceThreshold = 350f;
+        public const float MidDistanceThreshold = 1000f;
         public const float PlantDemoteDistance = 450f;
         public const float AnimalDemoteDistance = 1500f;
 
@@ -24,8 +24,6 @@ namespace SaplingRustBridge.Patches
         private static float _lastLODScanTime = 0f;
         private const float LODScanInterval = 0.25f; // Scan 4 times per second (negligible CPU cost)
 
-        private static readonly AccessTools.FieldRef<WalkingAnimationControllerV2, Vector3> GoalRef =
-            AccessTools.FieldRefAccess<WalkingAnimationControllerV2, Vector3>("goal");
 
         [HarmonyPatch(typeof(WorldView), "Start")]
         [HarmonyPostfix]
@@ -35,8 +33,6 @@ namespace SaplingRustBridge.Patches
             ActiveWorldView = __instance;
             __instance.cameraCloseDistanceThreshold = CloseDistanceThreshold;
             __instance.cameraMidDistanceThreshold = MidDistanceThreshold;
-            __instance.limitDetailInTheDistance = true;
-            __instance.detailInTheDistanceNrOfCellsThreshold = 350;
         }
 
         [HarmonyPatch(typeof(WorldView), "Update")]
@@ -120,53 +116,7 @@ namespace SaplingRustBridge.Patches
             return;
         }
 
-        // Fast-Forward Optimization:
-        // Skip scanning 60,000-120,000 empty map cells every world state change;
-        // directly query the active animals from AnimalPositionTracker in O(active animals)
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateAnimationsBetweenWorldStates))]
-        [HarmonyPrefix]
-        public static bool UpdateAnimationsBetweenWorldStates_Prefix(WorldView __instance, float percentageOfInterStateTimePassed, WorldState lastShownState)
-        {
-            if (__instance == null || !__instance.stateWasShownLastFrame || lastShownState == null) return true;
 
-            __instance.animalViewsForWhichToUpdateRoughAnimations.Clear();
-            __instance.animalViewsForWhichToUpdateDetailedAnimations.Clear();
-            __instance.cellIndicesForWhichToUpdateAnimations.Clear();
-            __instance.cellLocationTypesForWhichToUpdateAnimations.Clear();
-            __instance.areaIndicesForWhichToUpdateAnimations.Clear();
-
-            var areas = lastShownState.areas;
-            if (areas != null)
-            {
-                for (int i = 0; i < areas.Length; i++)
-                {
-                    var tracker = areas[i].animalPositionTracker;
-                    if (tracker == null || tracker.animalPositions == null) continue;
-
-                    foreach (var ap in tracker.animalPositions)
-                    {
-                        int cIdx = ap.cellIndex;
-                        var loc = ap.locationType;
-                        var array = __instance.GetAnimalViewsForArea(i, loc);
-                        if (array != null && cIdx >= 0 && cIdx < array.Length)
-                        {
-                            var av = array[cIdx];
-                            if (av != null)
-                            {
-                                __instance.animalViewsForWhichToUpdateDetailedAnimations.Add(av);
-                                __instance.cellLocationTypesForWhichToUpdateAnimations.Add(loc);
-                                __instance.cellIndicesForWhichToUpdateAnimations.Add(cIdx);
-                                __instance.areaIndicesForWhichToUpdateAnimations.Add(i);
-                            }
-                        }
-                    }
-                }
-            }
-
-            __instance.stateWasShownLastFrame = false;
-            __instance.roughAnimationsPending = true;
-            return false; // Skip the 360,000-cell vanilla scan
-        }
 
         private static void ApplyAnimalLOD(AnimalView animal, bool isClose)
         {
@@ -222,13 +172,129 @@ namespace SaplingRustBridge.Patches
             OptimizeAnimalInstance(__instance);
         }
 
-        [HarmonyPatch(typeof(PlantView), nameof(PlantView.Start))]
-        [HarmonyPostfix]
-        public static void PlantView_Start_Postfix(PlantView __instance)
+        // Null-safe animation speed update: prevents NullReferenceException when plantView.gameObject is null or animator is unassigned
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.SetAnimationsToSpeedWithIndex))]
+        [HarmonyPrefix]
+        public static bool WorldView_SetAnimationsToSpeedWithIndex_Prefix(WorldView __instance, int speedIndex)
         {
-            if (__instance == null) return;
-            OptimizePlantInstance(__instance);
+            if (__instance == null) return false;
+
+            AlgaView[][] algaArrays = new AlgaView[6][]
+            {
+                __instance.macroAlgaViewsArea0, __instance.macroAlgaViewsArea1, __instance.macroAlgaViewsArea2,
+                __instance.planktonViewsArea0, __instance.planktonViewsArea1, __instance.planktonViewsArea2
+            };
+            for (int i = 0; i < algaArrays.Length; i++)
+            {
+                AlgaView[] arr = algaArrays[i];
+                if (arr == null) continue;
+                for (int j = 0; j < arr.Length; j++)
+                {
+                    var av = arr[j];
+                    if (av != null && !av.JITOptimized && av.animator != null && __instance.windAnimationSpeeds != null && speedIndex >= 0 && speedIndex < __instance.windAnimationSpeeds.Length)
+                    {
+                        av.SetAnimationSpeed(av.animator, __instance.windAnimationSpeeds[speedIndex]);
+                    }
+                }
+            }
+
+            PlantView[][] plantArrays = new PlantView[3][]
+            {
+                __instance.plantViewsArea0, __instance.plantViewsArea1, __instance.plantViewsArea2
+            };
+            for (int k = 0; k < plantArrays.Length; k++)
+            {
+                PlantView[] pArr = plantArrays[k];
+                if (pArr == null) continue;
+                for (int l = 0; l < pArr.Length; l++)
+                {
+                    var pv = pArr[l];
+                    if (pv == null || pv.JITOptimized) continue;
+
+                    if (pv.gameObject == null)
+                    {
+                        pv.gameObject = pv.currentlyShowingYoungVersion ? pv.gameObjectYoungVersion : pv.gameObjectOldVersion;
+                        if (pv.gameObject == null) pv.gameObject = pv.gameObjectYoungVersion ?? pv.gameObjectOldVersion;
+                    }
+
+                    if (pv.gameObject != null)
+                    {
+                        var anim = pv.gameObject.GetComponent<Animator>();
+                        if (anim != null && __instance.windAnimationSpeeds != null && speedIndex >= 0 && speedIndex < __instance.windAnimationSpeeds.Length)
+                        {
+                            pv.SetAnimationSpeed(anim, __instance.windAnimationSpeeds[speedIndex]);
+                        }
+                    }
+                }
+            }
+
+            FungusView[][] fungusArrays = new FungusView[3][]
+            {
+                __instance.fungusViewsArea0, __instance.fungusViewsArea1, __instance.fungusViewsArea2
+            };
+            for (int m = 0; m < fungusArrays.Length; m++)
+            {
+                FungusView[] fArr = fungusArrays[m];
+                if (fArr == null) continue;
+                for (int n = 0; n < fArr.Length; n++)
+                {
+                    var fv = fArr[n];
+                    if (fv != null && __instance.windAnimationSpeeds != null && speedIndex >= 0 && speedIndex < __instance.windAnimationSpeeds.Length)
+                    {
+                        fv.animationSpeed = __instance.windAnimationSpeeds[speedIndex];
+                    }
+                }
+            }
+
+            if (__instance.particleSystems != null)
+            {
+                for (int p = 0; p < __instance.particleSystems.Count; p++)
+                {
+                    var ps = __instance.particleSystems[p];
+                    if (ps != null)
+                    {
+                        if (speedIndex == 0) ps.Pause();
+                        else ps.Play();
+                    }
+                }
+            }
+
+            return false;
         }
+
+        [HarmonyPatch(typeof(PlantView), nameof(PlantView.UpdateAnimatorActivityBasedOnDistanceToCamera))]
+        [HarmonyPrefix]
+        public static bool PlantView_UpdateAnimatorActivity_Prefix(PlantView __instance, float newDistanceToCamera, float threshold)
+        {
+            if (__instance == null || __instance.JITOptimized) return false;
+
+            if (__instance.gameObject == null)
+            {
+                __instance.gameObject = __instance.currentlyShowingYoungVersion ? __instance.gameObjectYoungVersion : __instance.gameObjectOldVersion;
+                if (__instance.gameObject == null) __instance.gameObject = __instance.gameObjectYoungVersion ?? __instance.gameObjectOldVersion;
+            }
+
+            if (__instance.gameObject == null) return false;
+
+            __instance.distanceToCamera = newDistanceToCamera;
+            float scale = __instance.gameObject.transform.localScale.x;
+            __instance.SetAnimatorActivity(newDistanceToCamera < threshold * scale);
+            return false;
+        }
+
+        [HarmonyPatch(typeof(PlantView), nameof(PlantView.SetAnimatorActivity))]
+        [HarmonyPrefix]
+        public static bool PlantView_SetAnimatorActivity_Prefix(PlantView __instance, bool active)
+        {
+            if (__instance == null || __instance.JITOptimized || __instance.gameObject == null)
+                return false;
+
+            var component = __instance.gameObject.GetComponent<Animator>();
+            if (component == null) return false;
+
+            return true;
+        }
+
 
         [HarmonyPatch(typeof(AnimalView), nameof(AnimalView.AnimateIdle))]
         [HarmonyPrefix]
@@ -298,44 +364,12 @@ namespace SaplingRustBridge.Patches
                 __instance.enabled = false;
             }
         }
-
-        [HarmonyPatch(typeof(WalkingAnimationControllerV2), "Update")]
-        [HarmonyPrefix]
-        public static bool WalkingAnimationControllerV2_Update_Prefix(WalkingAnimationControllerV2 __instance)
-        {
-            if (__instance == null || !__instance.walking || __instance.paused) return true;
-
-            // When distant (solveIK is false), perform lightweight linear movement without bone/joint/raycast calculations
-            if (!__instance.solveIK)
-            {
-                Vector3 curPos = __instance.transform.position;
-                Vector3 goal = GoalRef(__instance);
-
-                __instance.transform.position = Vector3.MoveTowards(curPos, goal, __instance.speed * Time.deltaTime * __instance.timeSpeed);
-
-                if (Vector3.Distance(goal, __instance.transform.position) < 0.05f)
-                {
-                    __instance.StopWalking();
-                }
-                return false; // Skip MovePrimitive, MoveNormal, UpdateTail, UpdateNeck, and leg trigonometry!
-            }
-
-            return true;
-        }
-
         [HarmonyPatch(typeof(AnimalView), "UpdateAnimationActivityBasedOnDistanceToCamera")]
         [HarmonyPrefix]
         public static void AnimalView_UpdateAnimationActivity_Prefix(ref float midThreshold, ref float farThreshold)
         {
             if (midThreshold > CloseDistanceThreshold) midThreshold = CloseDistanceThreshold;
             if (farThreshold > MidDistanceThreshold) farThreshold = MidDistanceThreshold;
-        }
-
-        [HarmonyPatch(typeof(PlantView), "UpdateAnimatorActivityBasedOnDistanceToCamera")]
-        [HarmonyPrefix]
-        public static void PlantView_UpdateAnimatorActivity_Prefix(ref float threshold)
-        {
-            if (threshold > CloseDistanceThreshold) threshold = CloseDistanceThreshold;
         }
 
         private static void OptimizeAnimalInstance(AnimalView animal)
@@ -356,33 +390,6 @@ namespace SaplingRustBridge.Patches
             {
                 ConfigureSkinnedMesh(animal.gameObjectOldVersion);
                 ConfigureLegacyAnimation(animal.gameObjectOldVersion);
-            }
-        }
-
-        private static void OptimizePlantInstance(PlantView plant)
-        {
-            if (plant == null) return;
-
-            if (plant.gameObjectYoungVersion != null)
-            {
-                ConfigureSkinnedMesh(plant.gameObjectYoungVersion);
-                ConfigureAnimator(plant.gameObjectYoungVersion);
-
-                if (!plant.currentlyShowingYoungVersion)
-                {
-                    plant.gameObjectYoungVersion.SetActive(false);
-                }
-            }
-
-            if (plant.gameObjectOldVersion != null)
-            {
-                ConfigureSkinnedMesh(plant.gameObjectOldVersion);
-                ConfigureAnimator(plant.gameObjectOldVersion);
-
-                if (plant.currentlyShowingYoungVersion)
-                {
-                    plant.gameObjectOldVersion.SetActive(false);
-                }
             }
         }
 
