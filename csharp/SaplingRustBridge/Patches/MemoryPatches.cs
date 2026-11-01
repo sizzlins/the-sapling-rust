@@ -1,6 +1,4 @@
 using System;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
 using HarmonyLib;
 using UnityEngine;
 
@@ -9,8 +7,10 @@ namespace SaplingRustBridge.Patches
     /// <summary>
     /// Memory governor and stability patches for The Sapling.
     /// 1. Shares AnimalTextureFactory across builders to eliminate duplicate GPU textures.
-    /// 2. Camera focus guard prevents NullReferenceException when focusing on animals.
-    /// 3. Deep memory trim (F9 key) flushes unused assets, runs GC, and returns physical RAM to Windows.
+    /// 2. Periodic extinct-definition pruning.
+    /// 3. Manual deep memory trim (F9) flushes unused assets and returns physical RAM to Windows.
+    /// 4. Slims the historical timeline while loading a save (fixes the multi-GB load OOM).
+    /// 5. Camera focus guards prevent NullReferenceException when focusing on organisms.
     /// </summary>
     [HarmonyPatch]
     public static class MemoryPatches
@@ -85,7 +85,77 @@ namespace SaplingRustBridge.Patches
             Plugin.LogWarn($"[MEMORY] Reclaimed RAM! Managed Heap: {beforeHeap} MB -> {afterHeap} MB.");
         }
 
-        // --- 5. SAFE CAMERA FOCUS GUARD (Eliminates NullReferenceException when clicking animals) ---
+        // --- 5. SLIM THE HISTORICAL TIMELINE WHILE LOADING A SAVE ---
+        // GameSaver.Decode() rebuilds one WorldState per simulated day: a 878k-day save means
+        // 878k WorldState objects. Measured from the load probe, WorldState's constructor costs
+        // ~28.3 KB of committed memory per instance (39 Dictionary<int,Travel>/<int,int>, 9
+        // Hashtables and 4 Lists, plus Mono's array overhead), and none of it is ever read again.
+        // The running game already discards them: TimeLine.LiveADay() does
+        // "line[line.Count - 2] = null" and appends the new day, so at rest only the last two
+        // entries ever hold data. Skipping the historical ones keeps line.Count (and therefore
+        // dayIndex and species indices) identical while removing the multi-GB allocation spike
+        // that OOMs the load.
+        private const long BytesPerWorldState = 28300L;
+        private static long _skippedWorldStates = 0;
+
+        [HarmonyPatch(typeof(GameSaver), "GetWorldState")]
+        [HarmonyPrefix]
+        public static bool GameSaver_GetWorldState_Prefix(GameSaver __instance)
+        {
+            // IMPORTANT: GameSaver derives from MonoBehaviour, but the game constructs it with
+            // "new GameSaver()" (OverallController.cs:306, SaveGameController.cs:1900/1991/...),
+            // so m_CachedPtr stays zero and Unity's overloaded == operator reports the live
+            // object as null. ReferenceEquals tests the managed reference, which is what we
+            // actually care about. Using "== null" here made every call take the early return,
+            // so all 878k WorldStates were still built and the load still OOM'd.
+            if (ReferenceEquals(__instance, null)) return true;
+
+            int dayIndex = __instance.dayIndex;
+
+            // Keep the last two entries, matching the steady-state shape LiveADay() leaves
+            // behind: index dayIndex - 1 is TimeLine.today after the load, and dayIndex - 2 is
+            // the "yesterday" that WorldController reads as line[line.Count - 2] and hands to
+            // WorldView.UpdateAnimationsBetweenWorldStates, which dereferences its .areas
+            // without a null check.
+            if (dayIndex <= 2 || __instance.worldStates == null || __instance.worldStates.Count >= dayIndex - 2)
+            {
+                return true;
+            }
+
+            // Still consume the four (count, values...) blocks so the stream stays aligned.
+            for (int group = 0; group < 4; group++)
+            {
+                int count = __instance.GetHighInteger();
+                for (int i = 0; i < count; i++)
+                {
+                    __instance.GetHighInteger();
+                }
+            }
+
+            _skippedWorldStates++;
+            // Returning false without touching __result leaves the return value at its
+            // default, which is null for a reference type: exactly the skipped marker.
+            return false;
+        }
+
+        [HarmonyPatch(typeof(GameSaver), "Decode")]
+        [HarmonyPrefix]
+        public static void GameSaver_Decode_Prefix()
+        {
+            _skippedWorldStates = 0;
+        }
+
+        [HarmonyPatch(typeof(GameSaver), "Decode")]
+        [HarmonyPostfix]
+        public static void GameSaver_Decode_Postfix(GameSaver __instance)
+        {
+            if (_skippedWorldStates <= 0 || ReferenceEquals(__instance, null)) return;
+
+            Plugin.LogWarn($"[MEMORY] Skipped {_skippedWorldStates} historical WorldState objects (~{_skippedWorldStates * BytesPerWorldState / 1048576L} MB) while loading day {__instance.dayIndex}.");
+            _skippedWorldStates = 0;
+        }
+
+        // --- 6. SAFE CAMERA FOCUS GUARD (Eliminates NullReferenceException when clicking animals) ---
         [HarmonyPatch(typeof(WorldView), nameof(WorldView.GetNewCameraPositionForCurrentFocusedAnimal))]
         [HarmonyPrefix]
         public static bool GetNewCameraPositionForCurrentFocusedAnimal_Prefix(WorldView __instance, ref Vector3 __result)

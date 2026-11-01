@@ -3,6 +3,13 @@ using System.Runtime.InteropServices;
 
 namespace SaplingRustBridge
 {
+    /// <summary>
+    /// UNWIRED (kept for reference). The native sapling_rust engine is no longer loaded:
+    /// Plugin.Awake does not create a world and no patch calls these entry points. Only six of
+    /// them were ever used, and the only live one (a per-day 50-plant sandbox tick plus an
+    /// unbounded Vec&lt;DeltaSnapshot&gt; push) burned CPU and leaked heap without feeding
+    /// anything back into the game. Left on disk so the experiment can be revived deliberately.
+    /// </summary>
     public static class NativeSim
     {
         private const string DllName = "sapling_rust";

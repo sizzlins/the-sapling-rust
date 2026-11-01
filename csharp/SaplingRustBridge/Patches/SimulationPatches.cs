@@ -7,11 +7,11 @@ using UnityEngine;
 namespace SaplingRustBridge.Patches
 {
     /// <summary>
-    /// Supercharges simulation throughput during Fast Forward and Time Skip:
-    /// 1. Replaces O(S^2) boxed reflection scanning in Notificator.ProcessNewState with O(S) HashSet lookups.
-    /// 2. Eliminates daily allSpecies.ToArray() heap churn in TimeLine.GetAllSpecies.
-    /// 3. Prunes 80-90% of spatial mate searches when creatures are not ready to mate.
-    /// 4. Provides adaptive time-budgeting for Time Skip to eliminate frame freezes in crowded worlds.
+    /// Simulation-side cleanups:
+    /// 1. Replaces the O(S^2) boxed reflection scanning in Notificator.ProcessNewState with O(S)
+    ///    HashSet lookups (this runs on every simulated day).
+    /// 2. Keeps the calendar display and the night-cycle colours in sync with the real dayIndex
+    ///    after a time jump.
     /// </summary>
     [HarmonyPatch]
     public static class SimulationPatches
@@ -117,7 +117,7 @@ namespace SaplingRustBridge.Patches
             _activeWorldController = __instance;
         }
 
-        // --- 4. Synchronize Calendar Display with actual DayIndex ---
+        // --- 2. Synchronize Calendar Display with actual DayIndex ---
         [HarmonyPatch(typeof(WorldUIView), nameof(WorldUIView.UpdateTimeIndicators))]
         [HarmonyPrefix]
         public static void WorldUIView_UpdateTimeIndicators_Prefix(ref int numberOfYears)
@@ -128,7 +128,7 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // --- 5. Synchronize Night Cycle colors with actual DayIndex ---
+        // --- 3. Synchronize Night Cycle colors with actual DayIndex ---
         [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateColorsForNightCycle))]
         [HarmonyPrefix]
         public static void WorldView_UpdateColorsForNightCycle_Prefix(ref int currentDayNr)

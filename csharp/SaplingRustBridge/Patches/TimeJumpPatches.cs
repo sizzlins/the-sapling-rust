@@ -7,11 +7,11 @@ using UnityEngine;
 namespace SaplingRustBridge.Patches
 {
     /// <summary>
-    /// Accelerates simulation throughput and Time Jumps by 5x-10x:
-    /// 1. Boosts TimeJumpController.nrOfDaysToJumpPerFrame from 10 to 50 days/frame.
-    /// 2. Eliminates millions of AnimalPosition[] heap allocations in AnimalPositionTracker.ToArray().
-    /// 3. Hooks the daily simulation step into NativeSim (Rust DLL) for SIMD/CSR math ticks.
-    /// 4. Offloads Time Jumps to AsyncJumpWorker so the UI stays at 60+ FPS.
+    /// Accelerates simulation throughput and Time Jumps:
+    /// 1. Budgeted main-thread time jumps (150 ms/frame, 25 days per batch) with a responsive UI.
+    /// 2. Zero-GC WorldState cloning (ping-pong buffers) during time jumps.
+    /// 3. Bypasses 5 Boo Array allocations in JumpAhead and guards GetYesterday.
+    /// 4. Fixes vanilla edge cases: fungus mutation default, cheat-console pausing, asset unloads.
     /// </summary>
     [HarmonyPatch]
     public static class TimeJumpPatches
@@ -198,8 +198,6 @@ namespace SaplingRustBridge.Patches
             return true;
         }
 
-        private static ushort[] _speciesCountBuffer;
-
         private static int SafeCountMutations(MutationTracker tracker)
         {
             if (tracker == null) return 0;
@@ -213,7 +211,7 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // 2b. Prevent ArgumentOutOfRangeException in TimeLine.GetYesterday()
+        // 2. Prevent ArgumentOutOfRangeException in TimeLine.GetYesterday()
         [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.GetYesterday))]
         [HarmonyPrefix]
         public static bool TimeLine_GetYesterday_Prefix(TimeLine __instance, ref WorldState __result)
@@ -226,7 +224,7 @@ namespace SaplingRustBridge.Patches
             return true;
         }
 
-        // 2c. Bypass 5 Boo Array allocations in TimeLine.JumpAhead during Time Jumps
+        // 3. Bypass 5 Boo Array allocations in TimeLine.JumpAhead during Time Jumps
         [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.JumpAhead))]
         [HarmonyPrefix]
         public static bool TimeLine_JumpAhead_Prefix(TimeLine __instance, int numberOfDays)
@@ -242,7 +240,7 @@ namespace SaplingRustBridge.Patches
             return true;
         }
 
-        // 3. Ensure fungus can evolve whenever evolution is active
+        // 4. Ensure fungus can evolve whenever evolution is active
         [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LiveADay))]
         [HarmonyPrefix]
         public static void TimeLine_LiveADay_FungusEvolution_Prefix(TimeLine __instance)
@@ -251,42 +249,6 @@ namespace SaplingRustBridge.Patches
             {
                 float avg = Mathf.Max(__instance.chanceForPlantMutation, __instance.chanceForAnimalMutation);
                 __instance.chanceForFungusMutation = avg > 0f ? avg : 0.075f;
-            }
-        }
-
-        // 4. Step the native Rust world on each simulated day and store demographic history in Rust
-        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LiveADay))]
-        [HarmonyPostfix]
-        public static void TimeLine_LiveADay_Postfix(TimeLine __instance)
-        {
-            // During time jumps, allow timeline line.Count to advance naturally for authentic speciation & events
-            if (IsTimeJumpActive)
-            {
-                return;
-            }
-
-            IntPtr world = Plugin.RustWorldHandle;
-            if (world != IntPtr.Zero)
-            {
-                NativeSim.sapling_world_tick(world);
-
-                if (__instance != null && __instance.today != null)
-                {
-                    var pop = __instance.today.numberOfLivingOrganismsPerSpecies;
-                    int count = pop != null ? pop.Count : 0;
-                    if (count > 0)
-                    {
-                        if (_speciesCountBuffer == null || _speciesCountBuffer.Length < count)
-                        {
-                            _speciesCountBuffer = new ushort[count];
-                        }
-                        for (int i = 0; i < count; i++)
-                        {
-                            _speciesCountBuffer[i] = (ushort)Math.Min(pop[i], ushort.MaxValue);
-                        }
-                        NativeSim.sapling_timeline_push(world, (uint)__instance.dayIndex, 0, 0, _speciesCountBuffer, (uint)count);
-                    }
-                }
             }
         }
 
@@ -488,18 +450,12 @@ namespace SaplingRustBridge.Patches
             return true;
         }
 
-        [HarmonyPatch(typeof(WorldController), "Update")]
-        [HarmonyPostfix]
-        public static void WorldController_Update_Postfix()
-        {
-        }
-
-        // 6. Prevent ~700ms main-thread freeze from Resources.UnloadUnusedAssets() during Time Jumps
+        // 7. Prevent ~700ms main-thread freeze from Resources.UnloadUnusedAssets() during Time Jumps
         [HarmonyPatch(typeof(Resources), nameof(Resources.UnloadUnusedAssets))]
         [HarmonyPrefix]
         public static bool Resources_UnloadUnusedAssets_Prefix(ref AsyncOperation __result)
         {
-            if (AsyncJumpWorker.IsRunning || IsTimeJumpActive)
+            if (IsTimeJumpActive)
             {
                 __result = null;
                 return false; // Skip the synchronous 50,000+ asset sweep during time skips!
@@ -507,7 +463,7 @@ namespace SaplingRustBridge.Patches
             return true;
         }
 
-        // 7. Fix vanilla bug: Typing 'p' in cheat console triggers Pause/Unpause
+        // 8. Fix vanilla bug: Typing 'p' in cheat console triggers Pause/Unpause
         [HarmonyPatch(typeof(WorldController), nameof(WorldController.Pause))]
         [HarmonyPrefix]
         public static bool WorldController_Pause_Prefix(WorldController __instance)

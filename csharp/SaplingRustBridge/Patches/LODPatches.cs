@@ -10,11 +10,14 @@ namespace SaplingRustBridge.Patches
     /// <summary>
     /// High-performance LOD, Animation, and Inverse Kinematics Governor.
     /// Eliminates CPU framerate collapse at high populations even when the camera is still.
-    /// Distant (>35m) creatures bypass 40-bone evaluations, IK raycasts, and shadow caster draw calls.
+    /// Distant (>350 m, matching vanilla's cameraCloseDistanceThreshold) creatures bypass
+    /// 40-bone evaluations, IK raycasts, and shadow caster draw calls.
     /// </summary>
     [HarmonyPatch]
     public static class LODPatches
     {
+        // These are vanilla's own defaults (WorldView.cs:1551-1552). The previous class comment
+        // claimed ">35m", which was simply wrong: 350 m / 1000 m is the shipped behaviour.
         public const float CloseDistanceThreshold = 350f;
         public const float MidDistanceThreshold = 1000f;
         public const float PlantDemoteDistance = 450f;
@@ -23,6 +26,35 @@ namespace SaplingRustBridge.Patches
         public static WorldView ActiveWorldView = null;
         private static float _lastLODScanTime = 0f;
         private const float LODScanInterval = 0.25f; // Scan 4 times per second (negligible CPU cost)
+
+        // GetComponentsInChildren allocates a fresh array on every call. During a camera sweep
+        // an animal can cross a distance boundary many times, so cache the renderer arrays per
+        // GameObject instance ID. The pool recycles whole hierarchies, so the renderer set is
+        // stable for a given ID. The cache is capped so a long session cannot grow it forever.
+        private sealed class RendererCache
+        {
+            public SkinnedMeshRenderer[] Skinned;
+            public MeshRenderer[] Meshes;
+        }
+
+        private const int MaxRendererCaches = 2048;
+        private static readonly Dictionary<int, RendererCache> _rendererCaches = new Dictionary<int, RendererCache>();
+
+        private static RendererCache GetRendererCache(GameObject go)
+        {
+            int id = go.GetInstanceID();
+
+            RendererCache cache;
+            if (_rendererCaches.TryGetValue(id, out cache)) return cache;
+
+            cache = new RendererCache();
+            cache.Skinned = go.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            cache.Meshes = go.GetComponentsInChildren<MeshRenderer>(true);
+
+            if (_rendererCaches.Count >= MaxRendererCaches) _rendererCaches.Clear();
+            _rendererCaches[id] = cache;
+            return cache;
+        }
 
 
         [HarmonyPatch(typeof(WorldView), "Start")]
@@ -49,7 +81,7 @@ namespace SaplingRustBridge.Patches
                 __instance.cameraMidDistanceThreshold = MidDistanceThreshold;
             }
 
-            if (AsyncJumpWorker.IsRunning || TimeJumpPatches.IsTimeJumpActive)
+            if (TimeJumpPatches.IsTimeJumpActive)
             {
                 return;
             }
@@ -143,7 +175,9 @@ namespace SaplingRustBridge.Patches
             }
 
             // 3. Renderers (Shadows, Offscreen Updates, and Multi-part meshes)
-            var renderers = animal.gameObject.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            RendererCache cache = GetRendererCache(animal.gameObject);
+
+            var renderers = cache.Skinned;
             for (int r = 0; r < renderers.Length; r++)
             {
                 var smr = renderers[r];
@@ -157,7 +191,7 @@ namespace SaplingRustBridge.Patches
                 }
             }
 
-            var meshRenderers = animal.gameObject.GetComponentsInChildren<MeshRenderer>(true);
+            var meshRenderers = cache.Meshes;
             for (int m = 0; m < meshRenderers.Length; m++)
             {
                 if (meshRenderers[m] != null) meshRenderers[m].enabled = true;

@@ -6,10 +6,11 @@ using UnityEngine;
 namespace SaplingRustBridge.Patches
 {
     /// <summary>
-    /// Background thread worker for 100% authentic The Sapling time jumps.
-    /// Simulates every single day using vanilla TimeLine.JumpAhead(1) / LiveADay().
-    /// Runs at maximum speed on a background worker thread while keeping the UI responsive.
-    /// No shortcuts, no skipped days, no faked mutations, no altered thresholds.
+    /// UNWIRED (kept for reference). Background thread worker for "authentic" time jumps.
+    /// Nothing calls StartJump/Stop/CheckMainThreadCompletion any more: time jumps now run on
+    /// the main thread with a per-frame budget (see TimeJumpPatches), which keeps UI updates
+    /// smooth without handing Unity objects to a second thread. Kept because the thread-based
+    /// approach is the obvious next step if the budgeted main-thread loop ever proves too slow.
     /// </summary>
     public static class AsyncJumpWorker
     {

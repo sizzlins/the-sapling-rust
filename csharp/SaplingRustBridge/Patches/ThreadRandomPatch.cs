@@ -5,10 +5,10 @@ using HarmonyLib;
 namespace SaplingRustBridge.Patches
 {
     /// <summary>
-    /// Makes UnityEngine.Random safe to call from background worker threads (like AsyncJumpWorker).
-    /// Unity's native Random icalls throw UnityException when called outside the main thread.
-    /// This patch redirects background thread calls to a ThreadStatic System.Random instance,
-    /// while main-thread calls continue using vanilla Unity Random.
+    /// UNWIRED (kept for reference). Makes UnityEngine.Random safe to call from background
+    /// threads. It was only needed by AsyncJumpWorker, which is no longer started, so Plugin
+    /// does not register this class. Keeping it out of the patch list also avoids silently
+    /// replacing vanilla RNG behaviour on any background thread the game itself might own.
     /// </summary>
     [HarmonyPatch(typeof(UnityEngine.Random))]
     public static class ThreadRandomPatch

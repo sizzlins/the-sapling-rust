@@ -1,0 +1,311 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using HarmonyLib;
+using UnityEngine;
+
+namespace SaplingRustBridge.Patches
+{
+    /// <summary>
+    /// Frame/day profiler used to find the real hot spots instead of guessing at them.
+    ///
+    /// Every listed method is wrapped with a Stopwatch timestamp prefix and a postfix that
+    /// accumulates inclusive wall time. A table is written every 5 seconds to the BepInEx log
+    /// and to %LocalLow%\Wessel Stoop\The Sapling\sapling_profile.log (the BepInEx log is
+    /// buffered and loses its tail on a hard crash, the append-only file does not).
+    ///
+    /// Times are INCLUSIVE: WorldView.Update contains the per-view Update calls below it, so
+    /// nested rows overlap and the percentages do not sum to 100.
+    ///
+    /// Toggle with F8 to measure the profiler's own overhead (run 5 s on, 5 s off and compare).
+    /// </summary>
+    public static class ProfilerPatches
+    {
+        private const int ReportIntervalMs = 5000;
+
+        private sealed class Sample
+        {
+            public string Name;
+            public long Ticks;
+            public long Calls;
+            public long MaxTicks;
+        }
+
+        // Harmony declares __state as a local of this type, so a struct costs no allocation and
+        // lets the postfix skip a second dictionary lookup.
+        private struct ProfState
+        {
+            public long Start;
+            public Sample Sample;
+        }
+
+        private static bool _enabled = true;
+        private static bool _installed = false;
+        private static long _windowStart = 0;
+
+        private static readonly Dictionary<MethodBase, Sample> _byMethod = new Dictionary<MethodBase, Sample>();
+        private static readonly List<Sample> _samples = new List<Sample>();
+        private static Sample _frameSample;
+        private static Sample _daySample;
+
+        private static string _logPath = null;
+        private static bool _logPathResolved = false;
+
+        public static bool Enabled { get { return _enabled; } }
+
+        public static void Toggle()
+        {
+            _enabled = !_enabled;
+            _windowStart = _enabled ? Stopwatch.GetTimestamp() : 0;
+            Plugin.LogWarn("[PROF] profiler " + (_enabled ? "ON" : "OFF"));
+        }
+
+        public static void Install(Harmony harmony)
+        {
+            if (_installed) return;
+            _installed = true;
+
+            MethodInfo prefix = typeof(ProfilerPatches).GetMethod("Prefix", BindingFlags.Static | BindingFlags.NonPublic);
+            MethodInfo postfix = typeof(ProfilerPatches).GetMethod("Postfix", BindingFlags.Static | BindingFlags.NonPublic);
+            if (prefix == null || postfix == null)
+            {
+                Plugin.LogWarn("[PROF] could not resolve own prefix/postfix; profiler disabled.");
+                _enabled = false;
+                return;
+            }
+
+            // --- per-frame / per-day entry points ---
+            _frameSample = Add(harmony, prefix, postfix, typeof(WorldView), "Update");
+            _daySample = Add(harmony, prefix, postfix, typeof(TimeLine), "LiveADay");
+            Add(harmony, prefix, postfix, typeof(WorldController), "Update");
+            Add(harmony, prefix, postfix, typeof(WorldController), "ShowToday");
+
+            // --- the expensive "show every organism" rebuild paths ---
+            Add(harmony, prefix, postfix, typeof(WorldView), "ShowAnimalViewsForArea");
+            Add(harmony, prefix, postfix, typeof(WorldView), "ShowPlantViewsForArea");
+            Add(harmony, prefix, postfix, typeof(WorldView), "UpdateNests");
+            Add(harmony, prefix, postfix, typeof(WorldView), "SetAnimationsToSpeedWithIndex");
+
+            // --- per-organism view work ---
+            Add(harmony, prefix, postfix, typeof(AnimalView), "UpdateAnimationActivityBasedOnDistanceToCamera");
+            Add(harmony, prefix, postfix, typeof(PlantView), "UpdateAnimatorActivityBasedOnDistanceToCamera");
+            Add(harmony, prefix, postfix, typeof(PlantView), "Update");
+
+            // --- simulation ---
+            Add(harmony, prefix, postfix, typeof(TimeLine), "JumpAhead");
+            Add(harmony, prefix, postfix, typeof(Notificator), "ProcessNewState");
+
+            // --- this mod's own hooks, so their cost is visible too ---
+            Add(harmony, prefix, postfix, typeof(LODPatches), "WorldView_Update_LODGovernor");
+            Add(harmony, prefix, postfix, typeof(CleanLogPatches), "WorldView_UpdateNests_Postfix");
+            Add(harmony, prefix, postfix, typeof(CleanLogPatches), "WorldController_ShowToday_SanitizeNests");
+            Add(harmony, prefix, postfix, typeof(MemoryPatches), "WorldController_ShowToday_MemoryGovernor");
+
+            _windowStart = Stopwatch.GetTimestamp();
+            Plugin.LogWarn("[PROF] profiling " + _samples.Count + " methods; table every " + (ReportIntervalMs / 1000) + "s. F8 toggles.");
+        }
+
+        private static Sample Add(Harmony harmony, MethodInfo prefix, MethodInfo postfix, Type type, string name)
+        {
+            MethodInfo target = null;
+            try
+            {
+                target = AccessTools.Method(type, name);
+            }
+            catch (Exception e)
+            {
+                Plugin.LogWarn("[PROF] ambiguous target " + type.Name + "." + name + ": " + e.Message);
+                return null;
+            }
+
+            if (target == null)
+            {
+                Plugin.LogWarn("[PROF] target missing: " + type.Name + "." + name);
+                return null;
+            }
+
+            try
+            {
+                harmony.Patch(target, new HarmonyMethod(prefix), new HarmonyMethod(postfix));
+                Sample s = new Sample();
+                s.Name = type.Name + "." + name;
+                _byMethod[target] = s;
+                _samples.Add(s);
+                return s;
+            }
+            catch (Exception e)
+            {
+                Plugin.LogWarn("[PROF] patch failed: " + type.Name + "." + name + ": " + e.Message);
+                return null;
+            }
+        }
+
+        // Harmony injects __state (prefix by ref, postfix by value) and __originalMethod.
+        private static void Prefix(ref ProfState __state, MethodBase __originalMethod)
+        {
+            if (!_enabled) return;
+
+            Sample s;
+            if (!_byMethod.TryGetValue(__originalMethod, out s)) return;
+
+            __state.Sample = s;
+            __state.Start = Stopwatch.GetTimestamp();
+        }
+
+        private static void Postfix(ProfState __state)
+        {
+            if (!_enabled || __state.Sample == null || __state.Start == 0) return;
+
+            long d = Stopwatch.GetTimestamp() - __state.Start;
+            Sample s = __state.Sample;
+            s.Ticks += d;
+            s.Calls++;
+            if (d > s.MaxTicks) s.MaxTicks = d;
+        }
+
+        public static void Tick()
+        {
+            if (!_enabled || _windowStart == 0) return;
+
+            long now = Stopwatch.GetTimestamp();
+            long elapsed = now - _windowStart;
+            if (elapsed * 1000L / Stopwatch.Frequency < ReportIntervalMs) return;
+
+            Report(elapsed);
+            _windowStart = now;
+        }
+
+        private static void Report(long elapsedTicks)
+        {
+            double secs = elapsedTicks / (double)Stopwatch.Frequency;
+
+            _samples.Sort(delegate (Sample a, Sample b) { return b.Ticks.CompareTo(a.Ticks); });
+
+            int frames = (_frameSample != null) ? (int)_frameSample.Calls : 0;
+            int days = (_daySample != null) ? (int)_daySample.Calls : 0;
+
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            sb.AppendLine();
+            sb.AppendLine(string.Format(
+                "[PROF] === window {0:0.0}s | frames {1} | days {2} | commit {3} MB | gc {4} MB ===",
+                secs, frames, days, CommitMb(), GC.GetTotalMemory(false) / 1048576L));
+
+            for (int i = 0; i < _samples.Count; i++)
+            {
+                Sample s = _samples[i];
+                if (s.Calls == 0) continue;
+
+                double ms = s.Ticks * 1000.0 / Stopwatch.Frequency;
+                double pct = s.Ticks / (double)elapsedTicks * 100.0;
+                double perSec = s.Calls / secs;
+                double maxMs = s.MaxTicks * 1000.0 / Stopwatch.Frequency;
+
+                sb.AppendLine(string.Format(
+                    "[PROF] {0,-52} {1,9:0.0}ms {2,6:0.0}% {3,8:0.0}/s max {4,7:0.00}ms",
+                    s.Name, ms, pct, perSec, maxMs));
+            }
+
+            string text = sb.ToString();
+            try { Plugin.LogWarn(text); } catch { }
+            AppendToFile(text);
+
+            for (int i = 0; i < _samples.Count; i++)
+            {
+                _samples[i].Ticks = 0;
+                _samples[i].Calls = 0;
+                _samples[i].MaxTicks = 0;
+            }
+        }
+
+        // --- output channel -------------------------------------------------------
+
+        private static void AppendToFile(string text)
+        {
+            string path = ResolveLogPath();
+            if (path == null) return;
+
+            try { File.AppendAllText(path, text); } catch { }
+        }
+
+        private static string ResolveLogPath()
+        {
+            if (_logPathResolved) return _logPath;
+            _logPathResolved = true;
+
+            string dir = null;
+            try { dir = Application.persistentDataPath; } catch { }
+            if (string.IsNullOrEmpty(dir))
+            {
+                try { dir = Directory.GetCurrentDirectory(); } catch { }
+            }
+            if (string.IsNullOrEmpty(dir)) return null;
+
+            try
+            {
+                _logPath = Path.Combine(dir, "sapling_profile.log");
+                File.AppendAllText(_logPath,
+                    Environment.NewLine +
+                    "=== SaplingRustBridge profile session " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
+                    " (Unity " + Application.unityVersion + ") ===" + Environment.NewLine);
+            }
+            catch
+            {
+                _logPath = null;
+            }
+
+            return _logPath;
+        }
+
+        // --- process commit charge ------------------------------------------------
+        // Mono's Process.PrivateMemorySize64 returns 0 on this build, so ask Win32 instead.
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_MEMORY_COUNTERS
+        {
+            public uint cb;
+            public uint PageFaultCount;
+            public IntPtr PeakWorkingSetSize;
+            public IntPtr WorkingSetSize;
+            public IntPtr QuotaPeakPagedPoolUsage;
+            public IntPtr QuotaPagedPoolUsage;
+            public IntPtr QuotaPeakNonPagedPoolUsage;
+            public IntPtr QuotaNonPagedPoolUsage;
+            public IntPtr PagefileUsage;
+            public IntPtr PeakPagefileUsage;
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool K32GetProcessMemoryInfo(IntPtr process, out PROCESS_MEMORY_COUNTERS counters, uint size);
+
+        private static long CommitMb()
+        {
+            try
+            {
+                PROCESS_MEMORY_COUNTERS c;
+                c.cb = (uint)Marshal.SizeOf(typeof(PROCESS_MEMORY_COUNTERS));
+                c.PageFaultCount = 0;
+                c.PeakWorkingSetSize = IntPtr.Zero;
+                c.WorkingSetSize = IntPtr.Zero;
+                c.QuotaPeakPagedPoolUsage = IntPtr.Zero;
+                c.QuotaPagedPoolUsage = IntPtr.Zero;
+                c.QuotaPeakNonPagedPoolUsage = IntPtr.Zero;
+                c.QuotaNonPagedPoolUsage = IntPtr.Zero;
+                c.PagefileUsage = IntPtr.Zero;
+                c.PeakPagefileUsage = IntPtr.Zero;
+
+                if (K32GetProcessMemoryInfo(GetCurrentProcess(), out c, c.cb))
+                {
+                    return (long)c.PagefileUsage / 1048576L;
+                }
+            }
+            catch { }
+            return -1;
+        }
+    }
+}

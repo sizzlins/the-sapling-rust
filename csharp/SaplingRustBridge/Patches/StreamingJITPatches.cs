@@ -8,10 +8,11 @@ namespace SaplingRustBridge.Patches
 {
     /// <summary>
     /// Smooth, hitch-free organism streaming and spawning.
-    /// Fixes two critical engine bottlenecks:
-    /// 1. Disables strict crucial profile parameter checks in PrebuiltOrganismLibrary so mutant
-    ///    creatures and plants reuse the prebuilt species 3D model (taking < 1ms via Instantiate)
-    ///    instead of freezing the engine for 350ms-2700ms building meshes from scratch on the main thread.
+    /// Disables strict crucial profile parameter checks in PrebuiltOrganismLibrary so mutant
+    /// creatures and plants reuse the prebuilt species 3D model (taking < 1ms via Instantiate)
+    /// instead of freezing the engine for 350ms-2700ms building meshes from scratch on the main thread.
+    /// Also sanitises AnimalInfo to avoid a cyclic-graph serialization crash and makes
+    /// MutationTracker thread-safe.
     /// </summary>
     [HarmonyPatch]
     public static class StreamingJITPatches
