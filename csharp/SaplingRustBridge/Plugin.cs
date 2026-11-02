@@ -49,6 +49,10 @@ namespace SaplingRustBridge
             }
 
             try { Patches.ProfilerPatches.Tick(); } catch { }
+
+            // Drain RCON requests here: the socket thread only enqueues, so every
+            // Unity object is read on the main thread.
+            try { RconServer.Tick(); } catch { }
         }
 
         void Awake()
@@ -79,6 +83,7 @@ namespace SaplingRustBridge
                 typeof(Patches.StreamingJITPatches),
                 typeof(Patches.SimulationPatches),
                 typeof(Patches.TimeJumpPatches),
+                typeof(Patches.SteamPatches),
                 typeof(Patches.CleanLogPatches)
             };
 
@@ -103,10 +108,20 @@ namespace SaplingRustBridge
             {
                 Logger.LogError($"SaplingRustBridge: Profiler install failed (game is unaffected): {ex.Message}");
             }
+
+            try
+            {
+                RconServer.Start();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"SaplingRustBridge: RCON failed to start (game is unaffected): {ex.Message}");
+            }
         }
 
         void OnDestroy()
         {
+            RconServer.Stop();
             if (_harmony != null)
             {
                 _harmony.UnpatchSelf();
