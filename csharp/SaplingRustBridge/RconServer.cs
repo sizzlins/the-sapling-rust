@@ -202,6 +202,7 @@ namespace SaplingRustBridge
                 case "find": return Find(parts);
                 case "count": return Counts();
                 case "kill_animals": return KillAnimals(parts);
+                case "kill": return KillCommand(parts);
                 case "quit":
                 case "exit": return "{\"status\":\"ok\"}";
                 case "eval": return JsonError("eval is disabled in the read-only build");
@@ -217,7 +218,8 @@ namespace SaplingRustBridge
                    "- species [offset] [n]  : page of species rows (default 0 50, max 500)\n" +
                    "- species <id>          : one species with lineage and population\n" +
                    "- find <text>           : case-insensitive species-name search (max 50)\n" +
-                   "- kill_animals confirm  : exterminate every ANIMAL species; plants/fungi/algae stay\n" +
+                   "- kill <kingdom> confirm: exterminate every species of alga|plant|animal|fungus\n" +
+                   "- kill_animals confirm  : alias for 'kill animal confirm'\n" +
                    "- quit                  : close the connection\n" +
                    "Mutation is refused unless [Rcon] AllowMutation = true in the BepInEx config.";
         }
@@ -276,28 +278,50 @@ namespace SaplingRustBridge
         /// </summary>
         static string KillAnimals(string[] parts)
         {
+            return KillKingdom(parts, OrganismType.Animal);
+        }
+
+        static string KillCommand(string[] parts)
+        {
+            if (parts.Length < 2) return JsonError("Usage: kill <alga|plant|animal|fungus> confirm");
+            switch (parts[1].ToLowerInvariant())
+            {
+                case "alga":
+                case "algae": return KillKingdom(parts, OrganismType.Alga);
+                case "plant":
+                case "plants": return KillKingdom(parts, OrganismType.Plant);
+                case "animal":
+                case "animals": return KillKingdom(parts, OrganismType.Animal);
+                case "fungus":
+                case "fungi": return KillKingdom(parts, OrganismType.Fungus);
+                default: return JsonError("unknown kingdom: " + parts[1]);
+            }
+        }
+
+        static string KillKingdom(string[] parts, OrganismType type)
+        {
             if (!AllowMutation)
                 return JsonError("mutation disabled: set [Rcon] AllowMutation = true in BepInEx/config/com.sizzlins.saplingrust.cfg and restart");
 
-            if (parts.Length < 2 || !string.Equals(parts[1], "confirm", StringComparison.OrdinalIgnoreCase))
-                return JsonError("Usage: kill_animals confirm");
+            if (parts.Length < 2 || !string.Equals(parts[parts.Length - 1], "confirm", StringComparison.OrdinalIgnoreCase))
+                return JsonError("Usage: kill <alga|plant|animal|fungus> confirm");
 
             WorldController wc = World();
             if (wc == null || wc.timeLine == null) return JsonError("no world");
             TimeLine tl = wc.timeLine;
             if (tl.allSpecies == null) return JsonError("no species table");
 
-            int animalSpecies = 0;
+            int killedSpecies = 0;
             int removed = 0;
             int failed = 0;
             List<int> lifeForms = new List<int>();
-            int before = LivingAnimals(tl);
+            int before = LivingOfType(tl, type);
 
             for (int i = 0; i < tl.allSpecies.Count; i++)
             {
                 SpeciesDefinition s = tl.allSpecies[i];
-                if (s == null || s.speciesType != OrganismType.Animal) continue;
-                animalSpecies++;
+                if (s == null || s.speciesType != type) continue;
+                killedSpecies++;
                 try
                 {
                     List<int> gone = tl.ExterminateSpecies(i);
@@ -327,7 +351,24 @@ namespace SaplingRustBridge
                 {
                     for (int a = 0; a < tl.today.areas.Length; a++)
                     {
-                        wc.view.CleanUpAnimalViewsWithLifeFormIndicesInArea(lifeForms, a);
+                        WorldArea area = tl.today.areas[a];
+                        if (type == OrganismType.Alga)
+                        {
+                            wc.view.CleanUpAlgaViewsInArea(area.indicesOfCellsWhereAMacroAlgaDied, a, false);
+                            wc.view.CleanUpAlgaViewsInArea(area.indicesOfCellsWherePlanktonDied, a, true);
+                        }
+                        else if (type == OrganismType.Plant)
+                        {
+                            wc.view.CleanUpPlantViewsInArea(area.indicesOfCellsWhereAPlantDied, a);
+                        }
+                        else if (type == OrganismType.Fungus)
+                        {
+                            wc.view.CleanUpFungusViewsInArea(area.indicesOfCellsWhereAFungusDied, a);
+                        }
+                        else
+                        {
+                            wc.view.CleanUpAnimalViewsWithLifeFormIndicesInArea(lifeForms, a);
+                        }
                     }
                 }
             }
@@ -345,16 +386,17 @@ namespace SaplingRustBridge
             try { wc.ShowToday(); } catch { }
 
             StringBuilder b = new StringBuilder();
-            b.Append("{\"animalSpecies\":").Append(animalSpecies);
+            b.Append("{\"kingdom\":\"").Append(type.ToString()).Append("\"");
+            b.Append(",\"species\":").Append(killedSpecies);
             b.Append(",\"removed\":").Append(removed);
             b.Append(",\"failedSpecies\":").Append(failed);
-            b.Append(",\"livingAnimalsBefore\":").Append(before);
-            b.Append(",\"livingAnimalsAfter\":").Append(LivingAnimals(tl));
+            b.Append(",\"livingBefore\":").Append(before);
+            b.Append(",\"livingAfter\":").Append(LivingOfType(tl, type));
             b.Append("}");
             return b.ToString();
         }
 
-        static int LivingAnimals(TimeLine tl)
+        static int LivingOfType(TimeLine tl, OrganismType type)
         {
             if (tl.today == null || tl.today.numberOfLivingOrganismsPerSpecies == null || tl.allSpecies == null) return 0;
             int total = 0;
@@ -362,7 +404,7 @@ namespace SaplingRustBridge
             for (int i = 0; i < n; i++)
             {
                 SpeciesDefinition s = tl.allSpecies[i];
-                if (s != null && s.speciesType == OrganismType.Animal) total += Population(tl, i);
+                if (s != null && s.speciesType == type) total += Population(tl, i);
             }
             return total;
         }
