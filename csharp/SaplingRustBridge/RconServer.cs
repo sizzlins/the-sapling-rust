@@ -23,7 +23,15 @@ namespace SaplingRustBridge
     {
         public const int Port = 27016;
         const string BindAddress = "127.0.0.1";
-        const int RequestTimeoutMs = 5000;
+        // Species extermination walks every area and can take seconds; a frozen
+        // main thread (save/load) must not be reported as a dead server.
+        const int RequestTimeoutMs = 120000;
+
+        /// <summary>
+        /// Bound from BepInEx config <c>[Rcon] AllowMutation</c>. When false, every
+        /// command that changes the world refuses. Read the backup before enabling.
+        /// </summary>
+        public static bool AllowMutation;
 
         sealed class Request
         {
@@ -193,6 +201,7 @@ namespace SaplingRustBridge
                 case "species": return Species(parts);
                 case "find": return Find(parts);
                 case "count": return Counts();
+                case "kill_animals": return KillAnimals(parts);
                 case "quit":
                 case "exit": return "{\"status\":\"ok\"}";
                 case "eval": return JsonError("eval is disabled in the read-only build");
@@ -208,8 +217,9 @@ namespace SaplingRustBridge
                    "- species [offset] [n]  : page of species rows (default 0 50, max 500)\n" +
                    "- species <id>          : one species with lineage and population\n" +
                    "- find <text>           : case-insensitive species-name search (max 50)\n" +
+                   "- kill_animals confirm  : exterminate every ANIMAL species; plants/fungi/algae stay\n" +
                    "- quit                  : close the connection\n" +
-                   "Read-only: no command mutates the world or the save.";
+                   "Mutation is refused unless [Rcon] AllowMutation = true in the BepInEx config.";
         }
 
         static string Status()
@@ -257,6 +267,104 @@ namespace SaplingRustBridge
             b.Append(",\"fungi\":").Append(fungi);
             b.Append("}");
             return b.ToString();
+        }
+
+        /// <summary>
+        /// Exterminate every species whose type is Animal, using the game's own path
+        /// (`TimeLine.ExterminateSpecies`) so death causes, eggs and trackers stay
+        /// consistent. Plants, fungi, algae, grass and carrion are untouched.
+        /// </summary>
+        static string KillAnimals(string[] parts)
+        {
+            if (!AllowMutation)
+                return JsonError("mutation disabled: set [Rcon] AllowMutation = true in BepInEx/config/com.sizzlins.saplingrust.cfg and restart");
+
+            if (parts.Length < 2 || !string.Equals(parts[1], "confirm", StringComparison.OrdinalIgnoreCase))
+                return JsonError("Usage: kill_animals confirm");
+
+            WorldController wc = World();
+            if (wc == null || wc.timeLine == null) return JsonError("no world");
+            TimeLine tl = wc.timeLine;
+            if (tl.allSpecies == null) return JsonError("no species table");
+
+            int animalSpecies = 0;
+            int removed = 0;
+            int failed = 0;
+            List<int> lifeForms = new List<int>();
+            int before = LivingAnimals(tl);
+
+            for (int i = 0; i < tl.allSpecies.Count; i++)
+            {
+                SpeciesDefinition s = tl.allSpecies[i];
+                if (s == null || s.speciesType != OrganismType.Animal) continue;
+                animalSpecies++;
+                try
+                {
+                    List<int> gone = tl.ExterminateSpecies(i);
+                    if (gone != null)
+                    {
+                        removed += gone.Count;
+                        lifeForms.AddRange(gone);
+                    }
+                    // The per-day counter is normally refreshed by LiveADay; zero it now so
+                    // status/count reads are correct before the next tick.
+                    if (tl.today != null && tl.today.numberOfLivingOrganismsPerSpecies != null &&
+                        i < tl.today.numberOfLivingOrganismsPerSpecies.Count)
+                    {
+                        tl.today.numberOfLivingOrganismsPerSpecies[i] = 0;
+                    }
+                }
+                catch
+                {
+                    failed++;
+                }
+            }
+
+            // The species-detail path cleans the views and refreshes the UI; mirror it.
+            try
+            {
+                if (wc.view != null && tl.today != null && tl.today.areas != null)
+                {
+                    for (int a = 0; a < tl.today.areas.Length; a++)
+                    {
+                        wc.view.CleanUpAnimalViewsWithLifeFormIndicesInArea(lifeForms, a);
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                if (wc.notificator != null && tl.deathTracker != null)
+                {
+                    wc.notificator.ProcessNewState(tl.allSpecies.ToArray(), tl.today.numberOfLivingOrganismsPerSpecies, tl.deathTracker);
+                }
+            }
+            catch { }
+
+            try { wc.ShowToday(); } catch { }
+
+            StringBuilder b = new StringBuilder();
+            b.Append("{\"animalSpecies\":").Append(animalSpecies);
+            b.Append(",\"removed\":").Append(removed);
+            b.Append(",\"failedSpecies\":").Append(failed);
+            b.Append(",\"livingAnimalsBefore\":").Append(before);
+            b.Append(",\"livingAnimalsAfter\":").Append(LivingAnimals(tl));
+            b.Append("}");
+            return b.ToString();
+        }
+
+        static int LivingAnimals(TimeLine tl)
+        {
+            if (tl.today == null || tl.today.numberOfLivingOrganismsPerSpecies == null || tl.allSpecies == null) return 0;
+            int total = 0;
+            int n = tl.allSpecies.Count;
+            for (int i = 0; i < n; i++)
+            {
+                SpeciesDefinition s = tl.allSpecies[i];
+                if (s != null && s.speciesType == OrganismType.Animal) total += Population(tl, i);
+            }
+            return total;
         }
 
         static string Counts()

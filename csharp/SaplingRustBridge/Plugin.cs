@@ -1,5 +1,6 @@
 using System;
 using BepInEx;
+using BepInEx.Configuration;
 using HarmonyLib;
 using UnityEngine;
 
@@ -111,6 +112,11 @@ namespace SaplingRustBridge
 
             try
             {
+                RconServer.AllowMutation = Config.Bind(
+                    "Rcon",
+                    "AllowMutation",
+                    false,
+                    "Allow mutating commands (kill_animals). Back up the save first.").Value;
                 RconServer.Start();
             }
             catch (Exception ex)
