@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
@@ -39,16 +41,6 @@ namespace SaplingRustBridge
 
         void Update()
         {
-            if (Input.GetKeyDown(KeyCode.F9))
-            {
-                Patches.MemoryPatches.TriggerDeepMemoryTrim();
-            }
-
-            if (Input.GetKeyDown(KeyCode.F8))
-            {
-                try { Patches.ProfilerPatches.Toggle(); } catch { }
-            }
-
             try { Patches.ProfilerPatches.Tick(); } catch { }
 
             // Drain RCON requests here: the socket thread only enqueues, so every
@@ -68,15 +60,18 @@ namespace SaplingRustBridge
             // Turn on "continuous" cheatcode by default so the game keeps running when alt-tabbed
             Application.runInBackground = true;
 
-            // The native Rust engine is deliberately NOT loaded. Only six FFI entry points were
-            // ever called, and the only live one (a per-day 50-plant sandbox tick plus an
-            // unbounded Vec<DeltaSnapshot> push) cost CPU and leaked heap without feeding
-            // anything back into the game. NativeSim.cs / SpatialPatches.cs / AsyncJumpWorker.cs
-            // / ThreadRandomPatch.cs are kept on disk for reference but are no longer wired up.
-            Logger.LogInfo("SaplingRustBridge: starting in managed-only mode (native engine unwired).");
+            Logger.LogInfo("SaplingRustBridge: starting with managed patches + verified native distance band (sapling_rust.dll).");
 
             // Initialize Harmony with resilient per-class patching
             _harmony = new Harmony("com.sizzlins.saplingrust");
+
+            // Automatic shadow-pass cap: 2 cascades and 100 m shadow distance cut shadow draw calls
+            // in half on dense late-game worlds while keeping shadows crisp around the camera.
+            if (QualitySettings.shadowDistance > 100f) QualitySettings.shadowDistance = 100f;
+            if (QualitySettings.shadowCascades > 2) QualitySettings.shadowCascades = 2;
+
+            Patches.BandPatches.VerifyManagedAgainstNative();
+
             Type[] patchTypes = new Type[]
             {
                 typeof(Patches.MemoryPatches),
@@ -85,20 +80,14 @@ namespace SaplingRustBridge
                 typeof(Patches.SimulationPatches),
                 typeof(Patches.TimeJumpPatches),
                 typeof(Patches.SteamPatches),
-                typeof(Patches.CleanLogPatches)
+                typeof(Patches.CleanLogPatches),
+                typeof(Patches.BandPatches),
+                typeof(Patches.FastSimPatches)
             };
 
             foreach (var t in patchTypes)
             {
-                try
-                {
-                    _harmony.CreateClassProcessor(t).Patch();
-                    Logger.LogInfo($"SaplingRustBridge: Patched {t.Name} successfully.");
-                }
-                catch (Exception ex)
-                {
-                    Logger.LogError($"SaplingRustBridge: Patching {t.Name} failed: {ex.Message}");
-                }
+                PatchClassResilient(t);
             }
 
             try
@@ -125,9 +114,106 @@ namespace SaplingRustBridge
             }
         }
 
+        private void PatchClassResilient(Type t)
+        {
+            int patched = 0;
+            int failed = 0;
+            MethodInfo[] methods;
+            try
+            {
+                methods = t.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"SaplingRustBridge: Inspecting {t.Name} failed: {ex.Message}");
+                return;
+            }
+
+            for (int i = 0; i < methods.Length; i++)
+            {
+                MethodInfo m = methods[i];
+                List<HarmonyMethod> attrs;
+                try
+                {
+                    attrs = HarmonyMethodExtensions.GetFromMethod(m);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"SaplingRustBridge: Reading attributes on {t.Name}.{m.Name} failed: {ex.Message}");
+                    failed++;
+                    continue;
+                }
+
+                if (attrs == null || attrs.Count == 0) continue;
+
+                HarmonyMethod info = HarmonyMethod.Merge(attrs);
+                if (info.declaringType == null) continue;
+
+                bool isPrefix = m.IsDefined(typeof(HarmonyPrefix), false);
+                bool isPostfix = m.IsDefined(typeof(HarmonyPostfix), false);
+                bool isTranspiler = m.IsDefined(typeof(HarmonyTranspiler), false);
+                bool isFinalizer = m.IsDefined(typeof(HarmonyFinalizer), false);
+                if (!isPrefix && !isPostfix && !isTranspiler && !isFinalizer) continue;
+
+                try
+                {
+                    MethodBase original = ResolveOriginalMethod(info);
+                    if (original == null)
+                    {
+                        Logger.LogError($"SaplingRustBridge: Target not found for {t.Name}.{m.Name} ({info.declaringType.Name}.{info.methodName}).");
+                        failed++;
+                        continue;
+                    }
+
+                    HarmonyMethod hm = new HarmonyMethod(m);
+                    _harmony.Patch(
+                        original,
+                        prefix: isPrefix ? hm : null,
+                        postfix: isPostfix ? hm : null,
+                        transpiler: isTranspiler ? hm : null,
+                        finalizer: isFinalizer ? hm : null,
+                        ilmanipulator: null);
+                    patched++;
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"SaplingRustBridge: Patching {t.Name}.{m.Name} failed: {ex.Message}");
+                    failed++;
+                }
+            }
+
+            if (failed == 0)
+            {
+                Logger.LogInfo($"SaplingRustBridge: Patched {t.Name} successfully ({patched} patches).");
+            }
+            else
+            {
+                Logger.LogWarning($"SaplingRustBridge: Patched {t.Name} with {patched} ok, {failed} failed.");
+            }
+        }
+
+        private static MethodBase ResolveOriginalMethod(HarmonyMethod info)
+        {
+            MethodType kind = info.methodType ?? MethodType.Normal;
+            switch (kind)
+            {
+                case MethodType.Constructor:
+                    return AccessTools.Constructor(info.declaringType, info.argumentTypes ?? new Type[0]);
+                case MethodType.StaticConstructor:
+                    return AccessTools.Constructor(info.declaringType, null, true);
+                case MethodType.Getter:
+                    return AccessTools.PropertyGetter(info.declaringType, info.methodName);
+                case MethodType.Setter:
+                    return AccessTools.PropertySetter(info.declaringType, info.methodName);
+                default:
+                    return AccessTools.Method(info.declaringType, info.methodName, info.argumentTypes);
+            }
+        }
+
         void OnDestroy()
         {
             RconServer.Stop();
+            Patches.BandPatches.Cleanup();
             if (_harmony != null)
             {
                 _harmony.UnpatchSelf();

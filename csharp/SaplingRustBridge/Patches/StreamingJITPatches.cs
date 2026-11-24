@@ -28,10 +28,13 @@ namespace SaplingRustBridge.Patches
 
             if (__instance.prebuiltAnimalLibrary != null)
             {
-                // Vanilla balance: limb configurations are crucial for animations, mouth/accessories allow blueprint reuse
+                // Reuse the species' prebuilt 3D model for mutated individuals instead of
+                // synchronously running Catmull-Clark + armature builds (400-800ms + ~150MB GC each)
+                // whenever a mutant's limbs differ slightly from its species example.
+                // Brand-new species still build their own unique 3D model cleanly.
                 __instance.prebuiltAnimalLibrary.profileParameter0IsCrucial = false; // mouth
-                __instance.prebuiltAnimalLibrary.profileParameter1IsCrucial = true;  // front limbs
-                __instance.prebuiltAnimalLibrary.profileParameter2IsCrucial = true;  // back limbs
+                __instance.prebuiltAnimalLibrary.profileParameter1IsCrucial = false; // front limbs
+                __instance.prebuiltAnimalLibrary.profileParameter2IsCrucial = false; // back limbs
                 __instance.prebuiltAnimalLibrary.profileParameter3IsCrucial = false; // accessories
             }
 
@@ -57,7 +60,7 @@ namespace SaplingRustBridge.Patches
             if (anim != null)
             {
                 anim.playAutomatically = false;
-                anim.cullingType = AnimationCullingType.AlwaysAnimate;
+                anim.cullingType = AnimationCullingType.BasedOnRenderers;
             }
         }
 
@@ -95,17 +98,18 @@ namespace SaplingRustBridge.Patches
             {
                 SanitizeAnimalInfo(__result);
 
-                // FIX: Ensure mouth and all multi-part skinned renderers never detach
+                // Start frustum-culled so pooled and distant rigs are not skinned offscreen;
+                // LODPatches.ApplyAnimalLOD promotes Close animals when in camera range.
                 var smrs = __result.GetComponentsInChildren<SkinnedMeshRenderer>(true);
                 for (int i = 0; i < smrs.Length; i++)
                 {
-                    smrs[i].updateWhenOffscreen = true;
+                    smrs[i].updateWhenOffscreen = false;
                 }
                 var anims = __result.GetComponentsInChildren<Animation>(true);
                 for (int i = 0; i < anims.Length; i++)
                 {
                     anims[i].playAutomatically = false;
-                    anims[i].cullingType = AnimationCullingType.AlwaysAnimate;
+                    anims[i].cullingType = AnimationCullingType.BasedOnRenderers;
                 }
             }
         }
@@ -142,8 +146,24 @@ namespace SaplingRustBridge.Patches
 
         [HarmonyPatch(typeof(PrebuiltOrganismLibrary), nameof(PrebuiltOrganismLibrary.GetPrebuiltOrganismProfileBased))]
         [HarmonyPostfix]
-        public static void PrebuiltOrganismLibrary_GetPrebuiltOrganismProfileBased_Postfix(GameObject __result)
+        public static void PrebuiltOrganismLibrary_GetPrebuiltOrganismProfileBased_Postfix(
+            PrebuiltOrganismLibrary __instance,
+            int definitionIndex,
+            int sexIndex,
+            int speciesIndex,
+            LibraryProfile profile,
+            bool youngVersion,
+            ref GameObject __result)
         {
+            // Root fix for 10+ second/day freezes & 100 MB/day RAM leaks on multi-sex species:
+            // WorldView.ShowAnimalViewsForArea caches speciesDefinition.exampleOrganism (currentSex == 0)
+            // under (speciesIndex, 0). Animals with currentSex > 0 then miss (speciesIndex, sexIndex)
+            // on every single day, causing vanilla to rebuild exampleOrganism twice per individual forever.
+            // If no sex-specific model exists yet, fall back to the already-cached sex 0 model.
+            if (__result == null && sexIndex != 0 && __instance != null)
+            {
+                __result = __instance.GetPrebuiltOrganismProfileBased(definitionIndex, 0, speciesIndex, profile, youngVersion);
+            }
             if (__result != null)
             {
                 SanitizeAnimalInfo(__result);
@@ -180,16 +200,24 @@ namespace SaplingRustBridge.Patches
 
         [HarmonyPatch(typeof(MutationTracker), nameof(MutationTracker.EndOfDay))]
         [HarmonyPrefix]
-        public static void MutationTracker_EndOfDay_Prefix(MutationTracker __instance)
+        public static void MutationTracker_EndOfDay_Prefix(MutationTracker __instance, ref bool __state)
         {
-            System.Threading.Monitor.Enter(__instance);
+            if (__instance != null)
+            {
+                System.Threading.Monitor.Enter(__instance);
+                __state = true;
+            }
         }
 
         [HarmonyPatch(typeof(MutationTracker), nameof(MutationTracker.EndOfDay))]
-        [HarmonyPostfix]
-        public static void MutationTracker_EndOfDay_Postfix(MutationTracker __instance)
+        [HarmonyFinalizer]
+        public static Exception MutationTracker_EndOfDay_Finalizer(MutationTracker __instance, bool __state, Exception __exception)
         {
-            System.Threading.Monitor.Exit(__instance);
+            if (__state && __instance != null)
+            {
+                System.Threading.Monitor.Exit(__instance);
+            }
+            return __exception;
         }
     }
 }

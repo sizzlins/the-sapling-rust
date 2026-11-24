@@ -38,18 +38,6 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        private static void SanitizeNestArray(GameObject[] nests)
-        {
-            if (nests == null) return;
-            for (int i = 0; i < nests.Length; i++)
-            {
-                if (nests[i] != null)
-                {
-                    StripConflictingLODGroups(nests[i]);
-                }
-            }
-        }
-
         // 1. Root fix for 77,000+ LODGroup warnings:
         // Strip duplicate child LODGroups from all nest prefabs when WorldView starts.
         [HarmonyPatch(typeof(WorldView), "Start")]
@@ -70,29 +58,6 @@ namespace SaplingRustBridge.Patches
             for (int i = 0; i < prefabs.Length; i++)
             {
                 StripConflictingLODGroups(prefabs[i]);
-            }
-        }
-
-        // Sanitize active nests whenever nests are updated or day progresses
-        [HarmonyPatch(typeof(WorldView), nameof(WorldView.UpdateNests))]
-        [HarmonyPostfix]
-        public static void WorldView_UpdateNests_Postfix(WorldView __instance)
-        {
-            if (__instance == null) return;
-            SanitizeNestArray(__instance.nestsArea0);
-            SanitizeNestArray(__instance.nestsArea1);
-            SanitizeNestArray(__instance.nestsArea2);
-        }
-
-        [HarmonyPatch(typeof(WorldController), nameof(WorldController.ShowToday))]
-        [HarmonyPrefix]
-        public static void WorldController_ShowToday_SanitizeNests(WorldController __instance)
-        {
-            if (__instance != null && __instance.view != null)
-            {
-                SanitizeNestArray(__instance.view.nestsArea0);
-                SanitizeNestArray(__instance.view.nestsArea1);
-                SanitizeNestArray(__instance.view.nestsArea2);
             }
         }
 
@@ -145,7 +110,8 @@ namespace SaplingRustBridge.Patches
             {
                 string text = eventArgs.Data.ToString();
                 if (text.IndexOf("is registered with more than one LODGroup", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    text.IndexOf("Default clip could not be found", StringComparison.OrdinalIgnoreCase) >= 0)
+                    text.IndexOf("Default clip could not be found", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    text.IndexOf("Billboard cleanup is only supported", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     return false;
                 }
@@ -444,6 +410,119 @@ namespace SaplingRustBridge.Patches
             }
 
             return true;
+        }
+
+        // 12. Fix vanilla ArgumentOutOfRangeException (-1) in SpeciesListView.GetRectForCurrentClickableArea
+        // (SpeciesListView.cs:1588 forgot the index == -1 guard that line 1602 has).
+        [HarmonyPatch(typeof(SpeciesListView), nameof(SpeciesListView.GetRectForCurrentClickableArea))]
+        [HarmonyPrefix]
+        public static bool SpeciesListView_GetRectForCurrentClickableArea_Prefix(SpeciesListView __instance, ref Rect __result)
+        {
+            if (__instance == null || __instance.clickableAreas == null ||
+                __instance.indexOfClickableAreaCurrentlyHighlighted < 0 ||
+                __instance.indexOfClickableAreaCurrentlyHighlighted >= __instance.clickableAreas.Count)
+            {
+                __result = default(Rect);
+                return false;
+            }
+            return true;
+        }
+
+        // 13. Fix vanilla NullReferenceException in CatmullClarkSubdivider.CalculateEdgePointForEdge
+        // when a late-game evolved animal has a degenerate quad-mesh edge (FindEdgeForVertices returns null).
+        // Covers both PrebuildMostFrequentDefinitions (which otherwise traps OverallController.LoadScene
+        // in an infinite 5s reload loop) and WorldView.ShowAnimalViewsForArea during ShowToday.
+        [HarmonyPatch(typeof(CatmullClarkSubdivider), nameof(CatmullClarkSubdivider.CalculateEdgePointForEdge))]
+        [HarmonyPrefix]
+        public static bool CatmullClarkSubdivider_CalculateEdgePointForEdge_Prefix(
+            CatmullClarkSubdivider __instance,
+            QuadMeshEdge edge,
+            ref EdgePoint __result)
+        {
+            if (__instance == null) return true;
+            if (edge == null || edge.pointA == null || edge.pointB == null ||
+                __instance.facesThatContainEdge == null ||
+                edge.index < 0 || edge.index >= __instance.facesThatContainEdge.Length ||
+                __instance.facesThatContainEdge[edge.index] == null)
+            {
+                Vector3 pos = (edge != null && edge.pointA != null && edge.pointB != null)
+                    ? (edge.pointA.position + edge.pointB.position) * 0.5f
+                    : Vector3.zero;
+                Vector2 uv = (edge != null && edge.pointA != null && edge.pointB != null)
+                    ? (edge.pointA.uv + edge.pointB.uv) * 0.5f
+                    : Vector2.zero;
+                QuadMeshVertex fallback = __instance.FindOrCreateVertexWithPositionAndUV(pos, uv);
+                __result = new EdgePoint(fallback, edge);
+                return false;
+            }
+            return true;
+        }
+
+        // 14. Fix vanilla ArgumentOutOfRangeException in AnimalArmatureBuilder.GenerateBoneWeightsForMesh
+        // when a late-game evolved animal's QuadMesh has more vertices than limbIndicesPerVertex
+        // (extra vertices fall back to -1 = torso spine bone weights).
+        [HarmonyPatch(typeof(AnimalArmatureBuilder), nameof(AnimalArmatureBuilder.GenerateBoneWeightsForMesh))]
+        [HarmonyPrefix]
+        public static void AnimalArmatureBuilder_GenerateBoneWeightsForMesh_Prefix(
+            AnimalArmatureBuilder __instance,
+            QuadMesh quadMesh)
+        {
+            if (__instance == null || quadMesh == null || quadMesh.vertices == null) return;
+            if (__instance.limbIndicesPerVertex == null)
+            {
+                __instance.limbIndicesPerVertex = new UnityScript.Lang.Array();
+            }
+            int needed = quadMesh.vertices.Length;
+            while (__instance.limbIndicesPerVertex.Count < needed)
+            {
+                __instance.limbIndicesPerVertex.Add(-1);
+            }
+        }
+
+        [HarmonyPatch(typeof(AnimalArmatureBuilder), nameof(AnimalArmatureBuilder.FindVerticesAroundVertex))]
+        [HarmonyPrefix]
+        public static bool AnimalArmatureBuilder_FindVerticesAroundVertex_Prefix(
+            QuadMeshVertex vertex,
+            int vertexIndex,
+            CatmullClarkSubdivider subdivider,
+            ref Vector3[] __result)
+        {
+            if (vertex == null || subdivider == null || subdivider.resultEdgesThatContainResultVertex == null ||
+                vertexIndex < 0 || vertexIndex >= subdivider.resultEdgesThatContainResultVertex.Length ||
+                subdivider.resultEdgesThatContainResultVertex[vertexIndex] == null)
+            {
+                __result = new Vector3[4];
+                return false;
+            }
+            return true;
+        }
+
+        // 15. Fix vanilla bug where manually placed / reintroduced animals spawn with isChild = true
+        // even though UpdateStats and ProcessNewAnimalDefinition give them full adult stats
+        // (LivingAnimal.cs:464, 483-488). Leaving isChild = true lets tiny adult carnivores
+        // swallow freshly reintroduced giant land animals whole via PredationCheck's baby rule.
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.InsertAnimal))]
+        [HarmonyPostfix]
+        public static void TimeLine_InsertAnimal_AdultManualSpawn_Postfix(
+            TimeLine __instance,
+            int areaIndex,
+            int cellIndex,
+            CellLocationType locationType,
+            bool manuallyAdded,
+            bool __result)
+        {
+            if (!__result || !manuallyAdded || __instance == null || __instance.today == null || __instance.today.areas == null) return;
+            if (areaIndex < 0 || areaIndex >= __instance.today.areas.Length) return;
+            WorldArea area = __instance.today.areas[areaIndex];
+            if (area == null || area.cells == null) return;
+            if (cellIndex < 0 || (float)cellIndex > area.size.x * area.size.y) cellIndex = 55;
+            if (cellIndex < 0 || cellIndex >= area.cells.Length) return;
+
+            LivingAnimal placed = area.GetAnimalInCell(cellIndex, locationType);
+            if (placed != null && placed.manuallyAdded)
+            {
+                placed.isChild = false;
+            }
         }
     }
 }

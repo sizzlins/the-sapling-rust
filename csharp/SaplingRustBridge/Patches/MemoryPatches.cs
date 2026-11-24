@@ -8,7 +8,7 @@ namespace SaplingRustBridge.Patches
     /// Memory governor and stability patches for The Sapling.
     /// 1. Shares AnimalTextureFactory across builders to eliminate duplicate GPU textures.
     /// 2. Periodic extinct-definition pruning.
-    /// 3. Manual deep memory trim (F9) flushes unused assets and returns physical RAM to Windows.
+    /// 3. Frees leaked red-flash Materials created whenever an animal takes damage.
     /// 4. Slims the historical timeline while loading a save (fixes the multi-GB load OOM).
     /// 5. Camera focus guards prevent NullReferenceException when focusing on organisms.
     /// </summary>
@@ -29,8 +29,11 @@ namespace SaplingRustBridge.Patches
 
             if (__instance.organismObjectPool != null)
             {
-                // Vanilla keeps dead pooled organisms out of sight in the sky
-                __instance.organismObjectPool.outOfSightInsteadOfDisabling = true;
+                // Disable pooled organisms instead of leaving them SetActive(true) in the sky,
+                // so pooled Renderers/SkinnedMeshRenderers/Animators leave Unity's active scene.
+                // Also expire unused pooled species after 15 years instead of 300.
+                __instance.organismObjectPool.outOfSightInsteadOfDisabling = false;
+                __instance.organismObjectPool.expireAfterYears = 15;
             }
         }
 
@@ -65,7 +68,22 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // --- 4. MANUAL DEEP MEMORY TRIM (F9 key) ---
+        // --- 3b. FREE LEAKED ANIMAL HURT-FLASH MATERIALS ---
+        // WorldView.ShowAnimalViewsForArea allocates `new Material(Shader.Find("Standard"))`
+        // every time an animal is hurt, and AnimalFlashingRed.Reset() only destroys the
+        // MonoBehaviour without ever destroying redMaterial.
+        [HarmonyPatch(typeof(AnimalFlashingRed), nameof(AnimalFlashingRed.Reset))]
+        [HarmonyPostfix]
+        public static void AnimalFlashingRed_Reset_FreeMaterial(AnimalFlashingRed __instance)
+        {
+            if (__instance != null && __instance.redMaterial != null)
+            {
+                UnityEngine.Object.Destroy(__instance.redMaterial);
+                __instance.redMaterial = null;
+            }
+        }
+
+        // --- 4. DEEP MEMORY TRIM (invocable via RCON) ---
         public static void TriggerDeepMemoryTrim()
         {
             if (Time.realtimeSinceStartup - _lastTrimTime < 5f) return;

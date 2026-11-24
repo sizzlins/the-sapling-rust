@@ -19,8 +19,6 @@ namespace SaplingRustBridge.Patches
     ///
     /// Times are INCLUSIVE: WorldView.Update contains the per-view Update calls below it, so
     /// nested rows overlap and the percentages do not sum to 100.
-    ///
-    /// Toggle with F8 to measure the profiler's own overhead (run 5 s on, 5 s off and compare).
     /// </summary>
     public static class ProfilerPatches
     {
@@ -54,6 +52,16 @@ namespace SaplingRustBridge.Patches
         private static string _logPath = null;
         private static bool _logPathResolved = false;
 
+        // Frame-time distribution and GC pressure per window. The method table
+        // alone cannot distinguish "uniformly slow" from "a few long stalls",
+        // or "GC churn" from "real work" - these can.
+        private static readonly List<float> _frameMs = new List<float>(4096);
+        private static int _gc0AtStart;
+        private static int _gc2AtStart;
+        private static long _renderTicks;
+        private static long _renderStart;
+        private static int _windowCount;
+
         public static bool Enabled { get { return _enabled; } }
 
         public static void Toggle()
@@ -62,6 +70,8 @@ namespace SaplingRustBridge.Patches
             _windowStart = _enabled ? Stopwatch.GetTimestamp() : 0;
             Plugin.LogWarn("[PROF] profiler " + (_enabled ? "ON" : "OFF"));
         }
+
+        public static bool ProfileInnerLoops = false;
 
         public static void Install(Harmony harmony)
         {
@@ -80,32 +90,78 @@ namespace SaplingRustBridge.Patches
             // --- per-frame / per-day entry points ---
             _frameSample = Add(harmony, prefix, postfix, typeof(WorldView), "Update");
             _daySample = Add(harmony, prefix, postfix, typeof(TimeLine), "LiveADay");
+
+            // Inner per-cell/per-plant methods run 100k-1.2M times/sec.
+            // Only patch them when explicitly requested via ProfileInnerLoops = true,
+            // otherwise the Harmony + Stopwatch trampoline itself burns significant CPU.
+            if (ProfileInnerLoops)
+            {
+                Add(harmony, prefix, postfix, typeof(TimeLine), "SearchNearbyCellsForInstinctTrigger");
+                Add(harmony, prefix, postfix, typeof(TimeLine), "CheckCellForVisualInstinctTrigger");
+                Add(harmony, prefix, postfix, typeof(TimeLine), "CellContainsFoodTypeWithIndexForAnimal");
+                Add(harmony, prefix, postfix, typeof(PlantView), "Update");
+            }
             Add(harmony, prefix, postfix, typeof(WorldController), "Update");
             Add(harmony, prefix, postfix, typeof(WorldController), "ShowToday");
 
             // --- the expensive "show every organism" rebuild paths ---
-            Add(harmony, prefix, postfix, typeof(WorldView), "ShowAnimalViewsForArea");
-            Add(harmony, prefix, postfix, typeof(WorldView), "ShowPlantViewsForArea");
+            Add(harmony, prefix, postfix, typeof(WorldView), "ShowAnimalViewsForArea");            Add(harmony, prefix, postfix, typeof(WorldView), "ShowPlantViewsForArea");
             Add(harmony, prefix, postfix, typeof(WorldView), "UpdateNests");
             Add(harmony, prefix, postfix, typeof(WorldView), "SetAnimationsToSpeedWithIndex");
 
             // --- per-organism view work ---
             Add(harmony, prefix, postfix, typeof(AnimalView), "UpdateAnimationActivityBasedOnDistanceToCamera");
             Add(harmony, prefix, postfix, typeof(PlantView), "UpdateAnimatorActivityBasedOnDistanceToCamera");
-            Add(harmony, prefix, postfix, typeof(PlantView), "Update");
 
             // --- simulation ---
             Add(harmony, prefix, postfix, typeof(TimeLine), "JumpAhead");
             Add(harmony, prefix, postfix, typeof(Notificator), "ProcessNewState");
 
+            // --- the per-day hot path (these run inside LiveADay, so they are subsets of it) ---
+            Add(harmony, prefix, postfix, typeof(TimeLine), "LetAllAlgaeInAreaLiveADay");
+            Add(harmony, prefix, postfix, typeof(TimeLine), "LetAllPlantsInAreaLiveADay");
+            Add(harmony, prefix, postfix, typeof(TimeLine), "LetAllAnimalsInAreaLiveADay");
+            Add(harmony, prefix, postfix, typeof(TimeLine), "LetAllFungiInAreaLiveADay");
+            Add(harmony, prefix, postfix, typeof(TimeLine), "GetAllSpecies");
+            Add(harmony, prefix, postfix, typeof(TimeLine), "UpdateEpoch");
+            Add(harmony, prefix, postfix, typeof(WorldState), "Clone");
+
+            // --- Steam IPC, which the daily simulation calls through ICallable callbacks ---
+            // UnlockAchive runs once per day forever (playedALongTimeCallBack) and once per
+            // predation event (animalGetsEatenCallBack); both do SteamUserStats IPC + StoreStats.
+            Add(harmony, prefix, postfix, typeof(SteamEvents), "UnlockAchive");
+            Add(harmony, prefix, postfix, typeof(SteamEvents), "StoreStats");
+
             // --- this mod's own hooks, so their cost is visible too ---
             Add(harmony, prefix, postfix, typeof(LODPatches), "WorldView_Update_LODGovernor");
-            Add(harmony, prefix, postfix, typeof(CleanLogPatches), "WorldView_UpdateNests_Postfix");
-            Add(harmony, prefix, postfix, typeof(CleanLogPatches), "WorldController_ShowToday_SanitizeNests");
             Add(harmony, prefix, postfix, typeof(MemoryPatches), "WorldController_ShowToday_MemoryGovernor");
+            Add(harmony, prefix, postfix, typeof(FastSimPatches), "TimeLine_LetAllPlantsInAreaLiveADay_Prefix");
+            Add(harmony, prefix, postfix, typeof(FastSimPatches), "LetAllAnimalsInAreaLiveADay_Prefix");
 
             _windowStart = Stopwatch.GetTimestamp();
-            Plugin.LogWarn("[PROF] profiling " + _samples.Count + " methods; table every " + (ReportIntervalMs / 1000) + "s. F8 toggles.");
+            _gc0AtStart = GC.CollectionCount(0);
+            _gc2AtStart = GC.CollectionCount(2);
+            Plugin.LogWarn("[PROF] profiling " + _samples.Count + " methods; table every " + (ReportIntervalMs / 1000) + "s.");
+
+            // Whether we are capped or genuinely slow decides the whole strategy.
+            try
+            {
+                Plugin.LogWarn(string.Format(
+                    "[PROF] display vsync={0} refresh={1}Hz targetFps={2} quality={3} res={4}x{5}",
+                    QualitySettings.vSyncCount,
+                    Screen.currentResolution.refreshRate,
+                    Application.targetFrameRate,
+                    QualitySettings.GetQualityLevel(),
+                    Screen.width,
+                    Screen.height));
+
+                // Splits the frame into "our managed work" (the table below) and
+                // "the engine drawing it" (this row). Everything else in a frame
+                // is engine internals we cannot probe from managed code.
+                Camera.onPreRender += OnPreRender;
+                Camera.onPostRender += OnPostRender;
+            }
+            catch { }
         }
 
         private static Sample Add(Harmony harmony, MethodInfo prefix, MethodInfo postfix, Type type, string name)
@@ -170,6 +226,9 @@ namespace SaplingRustBridge.Patches
         {
             if (!_enabled || _windowStart == 0) return;
 
+            // Called once per frame from Plugin.Update.
+            _frameMs.Add(Time.unscaledDeltaTime * 1000f);
+
             long now = Stopwatch.GetTimestamp();
             long elapsed = now - _windowStart;
             if (elapsed * 1000L / Stopwatch.Frequency < ReportIntervalMs) return;
@@ -187,11 +246,14 @@ namespace SaplingRustBridge.Patches
             int frames = (_frameSample != null) ? (int)_frameSample.Calls : 0;
             int days = (_daySample != null) ? (int)_daySample.Calls : 0;
 
+            int gc0 = GC.CollectionCount(0) - _gc0AtStart;
+            int gc2 = GC.CollectionCount(2) - _gc2AtStart;
+
             System.Text.StringBuilder sb = new System.Text.StringBuilder();
             sb.AppendLine();
             sb.AppendLine(string.Format(
-                "[PROF] === window {0:0.0}s | frames {1} | days {2} | commit {3} MB | gc {4} MB ===",
-                secs, frames, days, CommitMb(), GC.GetTotalMemory(false) / 1048576L));
+                "[PROF] === window {0:0.0}s | frames {1} | days {2} | commit {3} MB | gc {4} MB | {5} | gc0 {6} gc2 {7} ===",
+                secs, frames, days, CommitMb(), GC.GetTotalMemory(false) / 1048576L, FrameStats(), gc0, gc2));
 
             for (int i = 0; i < _samples.Count; i++)
             {
@@ -202,10 +264,35 @@ namespace SaplingRustBridge.Patches
                 double pct = s.Ticks / (double)elapsedTicks * 100.0;
                 double perSec = s.Calls / secs;
                 double maxMs = s.MaxTicks * 1000.0 / Stopwatch.Frequency;
-
                 sb.AppendLine(string.Format(
                     "[PROF] {0,-52} {1,9:0.0}ms {2,6:0.0}% {3,8:0.0}/s max {4,7:0.00}ms",
                     s.Name, ms, pct, perSec, maxMs));
+            }
+
+            // Engine-side rendering, measured around the camera's own callback.            // Everything in a frame that is neither this nor the table above is
+            // engine internals (culling, animation, physics, GC).
+            {
+                double renderMs = _renderTicks * 1000.0 / Stopwatch.Frequency;
+                double renderPct = _renderTicks / (double)elapsedTicks * 100.0;
+                sb.AppendLine(string.Format(
+                    "[PROF] {0,-52} {1,9:0.0}ms {2,6:0.0}% {3,8:0.0}/s max {4,7:0.00}ms",
+                    "engine.render (Camera pre->post)", renderMs, renderPct, frames / secs, 0.0));
+                _renderTicks = 0;
+            }
+
+            string animalBreakdown = FastSimPatches.ConsumeAnimalBreakdown();
+            if (animalBreakdown != null)
+            {
+                sb.AppendLine(animalBreakdown);
+            }
+
+            // Scene census, occasionally. This is what tells us whether the
+            // unaccounted frame time is "the world" or "objects that should not
+            // exist any more". Sampled rarely because FindObjectsOfType is costly.
+            _windowCount++;
+            if (_windowCount % 6 == 1)
+            {
+                sb.AppendLine(Census());
             }
 
             string text = sb.ToString();
@@ -217,6 +304,74 @@ namespace SaplingRustBridge.Patches
                 _samples[i].Ticks = 0;
                 _samples[i].Calls = 0;
                 _samples[i].MaxTicks = 0;
+            }
+
+            _frameMs.Clear();
+            _gc0AtStart = GC.CollectionCount(0);
+            _gc2AtStart = GC.CollectionCount(2);
+        }
+
+        /// <summary>p50 / p95 / max frame time in the current window.</summary>
+        private static string FrameStats()
+        {
+            if (_frameMs.Count == 0)
+            {
+                return "frame n/a";
+            }
+            _frameMs.Sort();
+            int n = _frameMs.Count;
+            float p50 = _frameMs[n / 2];
+            float p95 = _frameMs[Math.Min(n - 1, (int)(n * 0.95))];
+            float max = _frameMs[n - 1];
+            return string.Format("frame p50 {0:0.0} p95 {1:0.0} max {2:0.0} ms", p50, p95, max);
+        }
+
+        private static void OnPreRender(Camera cam)
+        {
+            _renderStart = Stopwatch.GetTimestamp();
+        }
+        private static void OnPostRender(Camera cam)
+        {
+            if (_renderStart == 0)
+            {
+                return;
+            }
+            _renderTicks += Stopwatch.GetTimestamp() - _renderStart;
+            _renderStart = 0;
+        }
+
+        /// <summary>
+        /// Live object counts. A frame that is slow with few living organisms is
+        /// almost always slow because of objects that are still in the scene -
+        /// pooled bodies, orphaned views, animators on things that are not
+        /// visible. Counting them separates "the world is busy" from "the world
+        /// is leaking".
+        /// </summary>
+        private static string Census()
+        {
+            try
+            {
+                SkinnedMeshRenderer[] skinned = UnityEngine.Object.FindObjectsOfType<SkinnedMeshRenderer>();
+                int offscreenSkinned = 0;
+                for (int i = 0; i < skinned.Length; i++)
+                {
+                    if (skinned[i] != null && skinned[i].updateWhenOffscreen) offscreenSkinned++;
+                }
+                return string.Format(
+                    "[PROF] census animators={0} renderers={1} skinned={2} offscreenSkinned={3} lodBias={4:0.00} shadows={5}({6:0}m/{7}c) | {8}",
+                    UnityEngine.Object.FindObjectsOfType<Animator>().Length,
+                    UnityEngine.Object.FindObjectsOfType<Renderer>().Length,
+                    skinned.Length,
+                    offscreenSkinned,
+                    QualitySettings.lodBias,
+                    QualitySettings.shadows,
+                    QualitySettings.shadowDistance,
+                    QualitySettings.shadowCascades,
+                    BandPatches.Status());
+            }
+            catch (Exception ex)
+            {
+                return "[PROF] census failed: " + ex.GetType().Name;
             }
         }
 

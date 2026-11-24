@@ -8,15 +8,90 @@ namespace SaplingRustBridge.Patches
 {
     /// <summary>
     /// Accelerates simulation throughput and Time Jumps:
-    /// 1. Budgeted main-thread time jumps (150 ms/frame, 25 days per batch) with a responsive UI.
+    /// 1. Budgeted main-thread time jumps (900 ms/frame, 50 days per batch) with a responsive UI.
     /// 2. Zero-GC WorldState cloning (ping-pong buffers) during time jumps.
     /// 3. Bypasses 5 Boo Array allocations in JumpAhead and guards GetYesterday.
     /// 4. Fixes vanilla edge cases: fungus mutation default, cheat-console pausing, asset unloads.
+    /// 5. Reports jump throughput (days/second) to the BepInEx log.
     /// </summary>
     [HarmonyPatch]
     public static class TimeJumpPatches
     {
         public static volatile bool IsTimeJumpActive = false;
+
+        // Two different budgets, because the two jump paths are not the same thing.
+        //
+        // 1. TimeJumpController is the dedicated "jump N years" screen. Measured
+        //    engine.render during it: ~0.4 ms, i.e. it draws a progress bar and
+        //    nothing else. Throughput is all that matters there, so a large budget
+        //    is correct and is NOT a cheat: every day still runs LiveADay.
+        //
+        // 2. WorldController's in-world jump runs with the world visible, so a
+        //    large budget there is a visibly frozen frame. This one stays small.
+        public static int JumpScreenBudgetMs = 850;
+        public static int InWorldJumpBudgetMs = 12;
+
+        // Days handed to JumpAhead at a time. Purely a cancellation-granularity knob; the time
+        // budget is what actually ends the frame.
+        private const int JumpBatchDays = 25;
+
+        // Throughput reporting so a jump's days/second can be read straight out of the log.
+        private static long _jumpStartTimestamp;
+        private static long _nextJumpReportTimestamp;
+        private static int _jumpDaysTotal;
+        private static int _jumpDaysDone;
+        private static int _lastFrameDays;
+        private static long _lastFrameMs;
+        private static bool _jumpRunning;
+
+        private static void BeginJumpThroughput(int totalDays)
+        {
+            _jumpStartTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+            _nextJumpReportTimestamp = _jumpStartTimestamp + System.Diagnostics.Stopwatch.Frequency * 5L;
+            _jumpDaysTotal = totalDays;
+            _jumpDaysDone = 0;
+            _lastFrameDays = 0;
+            _lastFrameMs = 0;
+            _jumpRunning = true;
+        }
+
+        private static void MaybeLogJumpThroughput(TimeLine timeLine)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now < _nextJumpReportTimestamp) return;
+            _nextJumpReportTimestamp = now + System.Diagnostics.Stopwatch.Frequency * 5L;
+
+            double secs = (now - _jumpStartTimestamp) / (double)System.Diagnostics.Stopwatch.Frequency;
+            if (secs <= 0.0) return;
+
+            double daysPerSec = _jumpDaysDone / secs;
+            double remainingSecs = daysPerSec > 0.0 ? (_jumpDaysTotal - _jumpDaysDone) / daysPerSec : 0.0;
+
+            Plugin.LogWarn(string.Format(
+                "[JUMP] {0:0} days/s | {1} / {2} days | last frame {3} days in {4} ms | elapsed {5:0}s | eta {6:0}s | dayIndex {7}",
+                daysPerSec, _jumpDaysDone, _jumpDaysTotal, _lastFrameDays, _lastFrameMs, secs, remainingSecs,
+                timeLine != null ? timeLine.dayIndex : -1));
+        }
+
+        // Runs exactly once when a jump stops (completed, cancelled or errored): replays any
+        // achievement unlocks that were deferred during the jump and logs the final throughput.
+        private static void FinishJump(TimeLine timeLine)
+        {
+            if (!_jumpRunning) return;
+            _jumpRunning = false;
+
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            double secs = (now - _jumpStartTimestamp) / (double)System.Diagnostics.Stopwatch.Frequency;
+            if (secs > 0.0 && _jumpDaysDone > 0)
+            {
+                Plugin.LogWarn(string.Format(
+                    "[JUMP] finished: {0} days in {1:0.0}s = {2:0} days/s (avg). dayIndex {3}",
+                    _jumpDaysDone, secs, _jumpDaysDone / secs,
+                    timeLine != null ? timeLine.dayIndex : -1));
+            }
+
+            SteamPatches.Flush();
+        }
 
         // 1. Initial Time Jump
         [HarmonyPatch(typeof(TimeJumpController), nameof(TimeJumpController.Jump))]
@@ -27,6 +102,8 @@ namespace SaplingRustBridge.Patches
             {
                 IsTimeJumpActive = true;
                 ResetPingPongBuffers();
+                SteamPatches.Reset();
+                BeginJumpThroughput(__instance.nrOfYearsToJump);
             }
         }
 
@@ -235,7 +312,20 @@ namespace SaplingRustBridge.Patches
                 {
                     __instance.LiveADay();
                 }
-                return false; // Skip allocating 5 Boo Array instances every call!
+
+                // Vanilla JumpAhead resets these five Boo arrays after every batch.
+                // The first version of this prefix skipped that along with the
+                // allocations, which meant nothing drained them for the duration
+                // of a jump: one boxed Vector2 per damaged/died plant per day,
+                // never read until the jump ended. Restoring the reset keeps the
+                // jump byte-for-byte vanilla while still avoiding the
+                // reallocation cost inside the day loop.
+                __instance.areaAndCellIndexOfPlantsRecentlyDiedFromSoftness = new UnityScript.Lang.Array();
+                __instance.areaAndCellIndexOfPlantsRecentlyDiedFromIncorrectGroundWater = new UnityScript.Lang.Array();
+                __instance.areaAndCellIndexOfPlantsRecentlyDamagedByHighTemperature = new UnityScript.Lang.Array();
+                __instance.areaAndCellIndexOfPlantsRecentlyDamagedByLowTemperature = new UnityScript.Lang.Array();
+                __instance.areaAndCellIndexOfPlantsRecentlyDamagedByWind = new UnityScript.Lang.Array();
+                return false;
             }
             return true;
         }
@@ -266,6 +356,7 @@ namespace SaplingRustBridge.Patches
                 {
                     IsTimeJumpActive = false;
                     ResetPingPongBuffers();
+                    SteamPatches.Reset();
                     __instance.nrOfYearsToJump = 0;
                     var cb = __instance.timeJumpReady;
                     __instance.timeJumpReady = null;
@@ -279,21 +370,28 @@ namespace SaplingRustBridge.Patches
 
                 if (__instance.nrOfYearsToJump > 0)
                 {
-                    // Calibrated frame budget: simulate continuously up to 150ms per frame (~6 UI updates/sec)
-                    // Every single day is authentically simulated via vanilla JumpAhead / LiveADay. No days skipped.
-                    // Achieves 90%+ CPU simulation duty cycle without freezing Windows message pump.
+                    // Simulate continuously up to JumpFrameBudgetMs per frame. Every single day is
+                    // authentically simulated via vanilla JumpAhead / LiveADay; no days are skipped.
+                    // Throughput is (days per frame) / (frame time); with the frame dominated by this
+                    // loop, that converges on 1 / (cost of one day), i.e. a ~100% simulation duty cycle.
                     var sw = System.Diagnostics.Stopwatch.StartNew();
-                    while (__instance.nrOfYearsToJump > 0 && sw.ElapsedMilliseconds < 150)
+                    int daysThisFrame = 0;
+                    while (__instance.nrOfYearsToJump > 0 && sw.ElapsedMilliseconds < JumpScreenBudgetMs)
                     {
                         if (Input.GetKey(KeyCode.Escape) || (Input.GetMouseButton(0) && __instance.uiView != null && __instance.uiView.interruptButtonHovered))
                         {
                             break;
                         }
 
-                        int batch = Math.Min(25, __instance.nrOfYearsToJump);
+                        int batch = Math.Min(JumpBatchDays, __instance.nrOfYearsToJump);
                         __instance.timeLine.JumpAhead(batch);
                         __instance.nrOfYearsToJump -= batch;
+                        daysThisFrame += batch;
                     }
+                    _lastFrameDays = daysThisFrame;
+                    _lastFrameMs = sw.ElapsedMilliseconds;
+                    _jumpDaysDone += daysThisFrame;
+                    MaybeLogJumpThroughput(__instance.timeLine);
 
                     // Update UI progress bar and species counts smoothly from main thread
                     if (__instance.uiView != null)
@@ -338,6 +436,7 @@ namespace SaplingRustBridge.Patches
                 {
                     IsTimeJumpActive = false;
                     ResetPingPongBuffers();
+                    FinishJump(__instance.timeLine);
                     var cb = __instance.timeJumpReady;
                     __instance.timeJumpReady = null;
                     if (cb != null)
@@ -352,6 +451,7 @@ namespace SaplingRustBridge.Patches
             {
                 IsTimeJumpActive = false;
                 ResetPingPongBuffers();
+                FinishJump(__instance.timeLine);
                 Plugin.LogWarn("[TimeJumpController_Update_Prefix] " + ex.ToString());
                 return true;
             }
@@ -382,16 +482,24 @@ namespace SaplingRustBridge.Patches
                     __instance.nrOfDaysToDoInCurrentTimeJump = 0;
                 }
 
-                IsTimeJumpActive = true;
+                if (!IsTimeJumpActive)
+                {
+                    IsTimeJumpActive = true;
+                    ResetPingPongBuffers();
+                    SteamPatches.Reset();
+                    BeginJumpThroughput(__instance.nrOfDaysToDoInCurrentTimeJump);
+                }
+
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 int daysThisFrame = 0;
-                while (__instance.nrOfDaysToDoInCurrentTimeJump > 0 && sw.ElapsedMilliseconds < 50)
+                while (__instance.nrOfDaysToDoInCurrentTimeJump > 0 && sw.ElapsedMilliseconds < InWorldJumpBudgetMs)
                 {
-                    int batch = Math.Min(10, __instance.nrOfDaysToDoInCurrentTimeJump);
+                    int batch = Math.Min(JumpBatchDays, __instance.nrOfDaysToDoInCurrentTimeJump);
                     __instance.timeLine.JumpAhead(batch);
                     __instance.nrOfDaysToDoInCurrentTimeJump -= batch;
                     daysThisFrame += batch;
                 }
+                _jumpDaysDone += daysThisFrame;
 
                 if (__instance.view != null)
                 {
@@ -412,6 +520,7 @@ namespace SaplingRustBridge.Patches
                 {
                     IsTimeJumpActive = false;
                     ResetPingPongBuffers();
+                    FinishJump(__instance.timeLine);
                     __instance.nrOfDaysToDoInCurrentTimeJump = 0;
                     if (__instance.uiView != null)
                     {

@@ -83,8 +83,9 @@ namespace SaplingRustBridge.Patches
                     if (!_extinctSpeciesSet.Contains(i) && def.peakNumberOfLivingOrganisms >= threshold)
                     {
                         var deathCauses = (deathTracker != null) ? deathTracker.GetRecentDeathCauses(i) : null;
-                        var notif = __instance.CreateExtinctionNotificationForSpecies(i, def.name, deathCauses);
-                        __instance.AddNotification(notif);
+                        // Retail CreateExtinctionNotificationForSpecies already calls AddNotification(notif)
+                        // (Notificator.cs:153); calling it again here duplicated every extinction notice.
+                        __instance.CreateExtinctionNotificationForSpecies(i, def.name, deathCauses);
                         if (deathTracker != null)
                         {
                             deathTracker.Clear(i);
