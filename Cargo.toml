@@ -3,11 +3,13 @@ name = "sapling-rust"
 version = "0.1.0"
 edition = "2021"
 
-# No dependencies. The sim core is pure logic: adding Bevy here would buy nothing for
-# correctness or complexity, and would cost a multi-minute build on every cargo test.
-# Renderer wiring is a separate, later step (see SPEC.md "Deviations").
+# Zero dependencies: sapling_rust.dll ships only the parity-verified distance-band primitive.
 [dependencies]
-rayon = "1.10"
+
+[features]
+# Deliberately breaks the band direction gates so the differential harness can
+# prove it detects real defects (mutation test). Never enable in a shipped build.
+mutate = []
 
 [lib]
 name = "sapling_rust"
