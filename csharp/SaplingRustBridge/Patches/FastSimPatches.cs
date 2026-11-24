@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using HarmonyLib;
 using UnityEngine;
 
@@ -36,6 +37,10 @@ namespace SaplingRustBridge.Patches
         // Reusable scratch buffers for plant seed filtering, predation counting,
         // fungus reproduction, travel steps, and animal iteration (eliminates per-day churn).
         private static readonly List<int> _seedKeepScratch = new List<int>(16);
+        private static readonly List<LivingPlant> _dieSeedsScratch = new List<LivingPlant>(16);
+        private static readonly List<bool> _dieSeedChangedScratch = new List<bool>(16);
+        private static readonly int[] _aroundScratch = new int[8];
+        private static readonly Stack<Travel> _travelPool = new Stack<Travel>(512);
         private static readonly List<int> _fungusCellsScratch = new List<int>(128);
         private static readonly List<int> _travelStepsScratch = new List<int>(16);
         private static readonly List<int> _emptyIntList = new List<int>(0);
@@ -44,9 +49,31 @@ namespace SaplingRustBridge.Patches
         private static AnimalPosition[] _animalPosScratch = new AnimalPosition[1024];
         private static readonly object[] EmptyArgs = new object[0];
         private static readonly PlantStatsCalculator _sharedPlantStatsCalc = new PlantStatsCalculator();
+        private static readonly PlantStatsCalculator _sharedPlantFillCalc = new PlantStatsCalculator();
         private static readonly HeatTextureBuilder _sharedHeatBuilder = new HeatTextureBuilder();
         private static readonly float[] _emptyFloatArray = new float[0];
+        private static readonly int[] _emptyIntArray = new int[0];
+        private static readonly bool[] _emptyBoolArray = new bool[0];
         private static readonly float[] _tempSexBrackets = new float[7] { 0.1f, 0.3f, 0.45f, 0.55f, 0.7f, 0.9f, 1f };
+
+        // Copy-on-write empty sentinels shared by newborn LivingAnimals until mutated
+        // by AttachPollen / CarrySeed / CarryFungalSpore (eliminates 5-7 allocs per birth).
+        private static readonly Hashtable _emptyPollen = new Hashtable(0);
+        private static readonly List<LivingPlant> _emptySeeds = new List<LivingPlant>(0);
+        private static readonly List<bool> _emptySeedBools = new List<bool>(0);
+        private static readonly List<LivingFungus> _emptySpores = new List<LivingFungus>(0);
+        private static readonly List<bool> _emptySporeBools = new List<bool>(0);
+
+        private static uint _fastRng = 0x9E3779B9u;
+        private static uint NextFastRng()
+        {
+            uint x = _fastRng;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            _fastRng = x;
+            return x;
+        }
 
         // Fast shallow copy for AnimalDefinition using CLR object.MemberwiseClone.
         // Safe for unmutated births and AnimalBlender (which only overwrites scalar fields and
@@ -74,6 +101,7 @@ namespace SaplingRustBridge.Patches
         private static readonly Dictionary<string, MaterialType> _materialTypeCache = new Dictionary<string, MaterialType>(64, StringComparer.Ordinal);
         private static readonly Dictionary<string, MaterialType> _specialMaterialTypeCache = new Dictionary<string, MaterialType>(64, StringComparer.Ordinal);
         private static readonly Dictionary<string, float> _lightIntensityCache = new Dictionary<string, float>(64, StringComparer.Ordinal);
+        private static readonly Dictionary<string, bool> _hasSecondaryColorCache = new Dictionary<string, bool>(64, StringComparer.Ordinal);
 
         private static void EnsureImporterCache(OrganismObjectFileImporter importer)
         {
@@ -84,7 +112,38 @@ namespace SaplingRustBridge.Patches
                 _materialTypeCache.Clear();
                 _specialMaterialTypeCache.Clear();
                 _lightIntensityCache.Clear();
+                _hasSecondaryColorCache.Clear();
+                _shapeGraphCache.Clear();
+                _precreatedLeaves.Clear();
+                _precreatedPollenOrgans.Clear();
+                _precreatedPlantAccessoires.Clear();
+                _precreatedSeeds.Clear();
             }
+        }
+
+        private static string GetAttackParticleEffectFast(OrganismObjectFileImporter importer, string shapeName)
+        {
+            if (importer == null || !importer.importFinished || shapeName == null) return string.Empty;
+            EnsureImporterCache(importer);
+            string res;
+            if (_attackParticleCache.TryGetValue(shapeName, out res)) return res;
+            object raw = importer.attackParticleEffectForBodyPartShape[shapeName.ToLower()];
+            res = (raw as string) ?? string.Empty;
+            _attackParticleCache[shapeName] = res;
+            return res;
+        }
+
+        private static bool HasSecondaryColorFast(OrganismObjectFileImporter importer, string shapeName)
+        {
+            if (importer == null || !importer.importFinished || shapeName == null) return false;
+            EnsureImporterCache(importer);
+            bool res;
+            if (_hasSecondaryColorCache.TryGetValue(shapeName, out res)) return res;
+            res = importer.ImportMaterialType(shapeName) == MaterialType.Secondary
+                || importer.ImportSpecialMaterialType(shapeName) == MaterialType.Secondary
+                || importer.ImportLightIntensityOfBodyPartShape(shapeName) > 0f;
+            _hasSecondaryColorCache[shapeName] = res;
+            return res;
         }
 
         // Cached night-cycle lookup per (TimeLine, dayIndex, dayDuration) so
@@ -114,6 +173,28 @@ namespace SaplingRustBridge.Patches
         private static long _aCountMutations;
         private static long _aCountInstinctCalls;
 
+        // Lightweight plant breakdown accumulators.
+        private static long _pTicksLive;
+        private static long _pTicksPollen;
+        private static long _pTicksSeed;
+        private static long _pTicksDie;
+        private static long _pCountPlants;
+        private static long _pCountSeeds;
+
+        public static string ConsumePlantBreakdown()
+        {
+            long total = _pTicksLive + _pTicksPollen + _pTicksSeed + _pTicksDie;
+            if (total == 0) return null;
+            double k = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            string line = string.Format(
+                "[PROF] plants n={0} seeds={1} | live={2:0.0}ms pollen={3:0.0}ms seed={4:0.0}ms die={5:0.0}ms",
+                _pCountPlants, _pCountSeeds,
+                _pTicksLive * k, _pTicksPollen * k, _pTicksSeed * k, _pTicksDie * k);
+            _pTicksLive = _pTicksPollen = _pTicksSeed = _pTicksDie = 0;
+            _pCountPlants = _pCountSeeds = 0;
+            return line;
+        }
+
         public static string ConsumeAnimalBreakdown()
         {
             long total = _aTicksLive + _aTicksDie + _aTicksEatDmg + _aTicksBirth + _aTicksInstinct + _aTicksTravel + _aTicksMateFood;
@@ -141,72 +222,77 @@ namespace SaplingRustBridge.Patches
         public static bool LivingPlant_LiveADay_Prefix(LivingPlant __instance, int periodIndex)
         {
             if (!Enabled || __instance == null) return true;
+            LiveADayPlantFast(__instance, periodIndex);
+            return false;
+        }
 
-            __instance.age++;
-            if (__instance.burning)
+        private static void LiveADayPlantFast(LivingPlant p, int periodIndex)
+        {
+            p.age++;
+            if (p.burning)
             {
-                __instance.health -= __instance.damageByFire;
-                if (!(__instance.health > 0f))
+                p.health -= p.damageByFire;
+                if (!(p.health > 0f))
                 {
-                    __instance.dying = true;
+                    p.dying = true;
                 }
             }
-            if (__instance.dormant)
+            if (p.dormant)
             {
-                __instance.healthDeterioratesAtAge++;
-                __instance.maximumAge++;
-                if (__instance.maximumAge >= __instance.absoluteMaximumAge)
+                p.healthDeterioratesAtAge++;
+                p.maximumAge++;
+                if (p.maximumAge >= p.absoluteMaximumAge)
                 {
-                    __instance.dying = true;
+                    p.dying = true;
                 }
-                return false;
+                return;
             }
-            if (!((float)__instance.age < __instance.healthDeterioratesAtAge))
+            if (!((float)p.age < p.healthDeterioratesAtAge))
             {
-                __instance.health -= __instance.healthDeteriorationRatePerDayAtOldAge;
+                p.health -= p.healthDeteriorationRatePerDayAtOldAge;
             }
-            __instance.health -= __instance.damagePerDay;
-            __instance.health -= __instance.parasiteDamage;
-            if (__instance.age >= __instance.maximumAge || !(__instance.health >= 0f))
+            p.health -= p.damagePerDay;
+            p.health -= p.parasiteDamage;
+            if (p.age >= p.maximumAge || !(p.health >= 0f))
             {
-                __instance.dying = true;
+                p.dying = true;
             }
 
             float num = 0f;
             switch (periodIndex)
             {
                 case 2:
-                    num = __instance.energyProfitPerDayDuringDayTime;
+                    num = p.energyProfitPerDayDuringDayTime;
                     break;
                 case 1:
                 case 3:
-                    num = __instance.energyProfitPerDayAtTwilight;
+                    num = p.energyProfitPerDayAtTwilight;
                     break;
                 case 0:
                 case 4:
-                    num = __instance.energyProfitPerDayAtNight;
+                    num = p.energyProfitPerDayAtNight;
                     break;
             }
 
             // Vanilla allocates `new List<int>()` on every plant every day even though
             // nothing in LiveADay populates it. Clearing when non-empty is 0 allocs.
-            var almostReady = __instance.indicesOfFruitsThatAreAlmostReady;
+            var almostReady = p.indicesOfFruitsThatAreAlmostReady;
             if (almostReady == null)
             {
-                __instance.indicesOfFruitsThatAreAlmostReady = new List<int>();
+                p.indicesOfFruitsThatAreAlmostReady = new List<int>();
             }
             else if (almostReady.Count > 0)
             {
                 almostReady.Clear();
             }
 
-            if (!__instance.damageByDrought && !__instance.damageByHighTemperature && !__instance.damageByLowTemperature &&
-                !__instance.damageByWind && !__instance.burning && !__instance.damageByMoisture)
+            if (!p.damageByDrought && !p.damageByHighTemperature && !p.damageByLowTemperature &&
+                !p.damageByWind && !p.burning && !p.damageByMoisture)
             {
-                int nrOfSeeds = __instance.nrOfSeeds;
-                float[] energySaved = __instance.energySavedPerSeed;
-                float needed = __instance.energyNeededForFruitProduction;
-                var ready = __instance.indicesOfSeedsThatAreReady;
+                int nrOfSeeds = p.nrOfSeeds;
+                float[] energySaved = p.energySavedPerSeed;
+                float needed = p.energyNeededForFruitProduction;
+                var ready = p.indicesOfSeedsThatAreReady;
                 for (int i = 0; i < nrOfSeeds; i++)
                 {
                     float saved = energySaved[i];
@@ -224,22 +310,20 @@ namespace SaplingRustBridge.Patches
                 }
             }
 
-            if (__instance.young && __instance.age >= __instance.ageToGrowOld)
+            if (p.young && p.age >= p.ageToGrowOld)
             {
-                __instance.young = false;
+                p.young = false;
             }
 
-            if (!(__instance.nectarAvailabilityPercentage >= 1f))
+            if (!(p.nectarAvailabilityPercentage >= 1f))
             {
-                __instance.nectarAvailabilityPercentage += __instance.nectarRegenerationSpeed;
-                if (!(__instance.nectarAvailabilityPercentage < 1f))
+                p.nectarAvailabilityPercentage += p.nectarRegenerationSpeed;
+                if (!(p.nectarAvailabilityPercentage < 1f))
                 {
-                    __instance.nectarAvailabilityPercentage = 1f;
-                    __instance.hasNectar = true;
+                    p.nectarAvailabilityPercentage = 1f;
+                    p.hasNectar = true;
                 }
             }
-
-            return false;
         }
 
         // =========================================================================
@@ -276,6 +360,8 @@ namespace SaplingRustBridge.Patches
             float sizeX = worldArea.size.x;
             float sizeY = worldArea.size.y;
             bool canDirectBand = BandPatches.Enabled && BandPatches.ManagedBandReady && (int)sizeY > 0 && sizeX > 0f;
+            // Sample Stopwatch QPC syscalls 1-in-16 days (eliminates ~3.2M icalls/5s on dense worlds).
+            bool prof = (__instance.dayIndex & 15) == 0;
 
             for (int num5 = plantIndices.Count - 1; num5 >= 0; num5--)
             {
@@ -284,7 +370,10 @@ namespace SaplingRustBridge.Patches
                 LivingPlant livingPlant = worldCell.plant;
                 if (livingPlant == null) continue;
 
-                livingPlant.LiveADay(period);
+                _pCountPlants++;
+                long tp0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+                LiveADayPlantFast(livingPlant, period);
+                if (prof) _pTicksLive += (System.Diagnostics.Stopwatch.GetTimestamp() - tp0) << 4;
 
                 if (!(worldCell.distanceToWater <= 4f))
                 {
@@ -325,6 +414,7 @@ namespace SaplingRustBridge.Patches
 
                 if (livingPlant.usesWindPollination && livingPlant.age == livingPlant.ageToSpreadPollen)
                 {
+                    long tpp = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                     int num8 = livingPlant.nrOfPollen / 1000;
                     int maxDist = livingPlant.pollenMovementDistance;
                     int ownDefIdx = livingPlant.definition.definitionIndex;
@@ -379,6 +469,7 @@ namespace SaplingRustBridge.Patches
                             }
                         }
                     }
+                    if (prof) _pTicksPollen += (System.Diagnostics.Stopwatch.GetTimestamp() - tpp) << 4;
                 }
 
                 if (livingPlant.nutrientsOkay)
@@ -387,6 +478,7 @@ namespace SaplingRustBridge.Patches
                     int readyCount = readySeeds.Count;
                     if (readyCount > 0)
                     {
+                        long tps = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                         _seedKeepScratch.Clear();
                         for (int num6 = 0; num6 < readyCount; num6++)
                         {
@@ -421,6 +513,7 @@ namespace SaplingRustBridge.Patches
 
                             if (num13 != -1)
                             {
+                                _pCountSeeds++;
                                 WorldCell seedCell = cells[num13];
                                 LivingPlant seed = __instance.PickSeedFromPlant(livingPlant);
                                 bool plantChanged = livingPlant.fertilized || livingPlant.mutatedLatestOffspring;
@@ -433,6 +526,7 @@ namespace SaplingRustBridge.Patches
                         {
                             readySeeds.Add(_seedKeepScratch[k]);
                         }
+                        if (prof) _pTicksSeed += (System.Diagnostics.Stopwatch.GetTimestamp() - tps) << 4;
                     }
                 }
 
@@ -465,18 +559,29 @@ namespace SaplingRustBridge.Patches
 
                 if (livingPlant.dying)
                 {
-                    worldArea.RemovePlantFromCell(num5, num);
+                    long tpd = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+                    // O(1) swap-remove on cellIndicesOfPlants (safe because loop iterates backwards from Count-1..0,
+                    // so the last element has already been processed this day).
+                    worldCell.plant = null;
+                    worldArea.indicesOfCellsWhereAPlantDied.Add(num);
+                    int lastPlantIdx = plantIndices.Count - 1;
+                    if (num5 != lastPlantIdx) plantIndices[num5] = plantIndices[lastPlantIdx];
+                    plantIndices.RemoveAt(lastPlantIdx);
+                    if (worldArea.useLocationGroups)
+                    {
+                        worldArea.GetLocationGroupForCell(num).RemovePlant(livingPlant, num);
+                    }
                     if (livingPlant.nutrientsOkay && livingPlant.indicesOfSeedsThatAreReady.Count > 0)
                     {
                         int seedCount = livingPlant.indicesOfSeedsThatAreReady.Count;
-                        var list2 = new List<LivingPlant>(seedCount);
-                        var list3 = new List<bool>(seedCount);
+                        _dieSeedsScratch.Clear();
+                        _dieSeedChangedScratch.Clear();
                         for (int num12 = 0; num12 < seedCount; num12++)
                         {
-                            list2.Add(__instance.PickSeedFromPlant(livingPlant));
-                            list3.Add(livingPlant.mutatedLatestOffspring);
+                            _dieSeedsScratch.Add(__instance.PickSeedFromPlant(livingPlant));
+                            _dieSeedChangedScratch.Add(livingPlant.mutatedLatestOffspring);
                         }
-                        __instance.PlantSeedPackage(list2, worldArea, areaIndex, num, list3);
+                        __instance.PlantSeedPackage(_dieSeedsScratch, worldArea, areaIndex, num, _dieSeedChangedScratch);
                     }
                     if (livingPlant.infectedByParasite != null)
                     {
@@ -522,6 +627,7 @@ namespace SaplingRustBridge.Patches
                             __instance.AttachSeedsToAnimal(animalInTree, worldArea, num19);
                         }
                     }
+                    if (prof) _pTicksDie += (System.Diagnostics.Stopwatch.GetTimestamp() - tpd) << 4;
                 }
                 else if (popTrackerActive)
                 {
@@ -700,6 +806,10 @@ namespace SaplingRustBridge.Patches
             }
 
             WorldArea worldArea = tl.today.areas[areaIndex];
+            if (object.ReferenceEquals(worldArea, _visionActiveArea))
+            {
+                return SearchNearbyRust(tl, instinct, animal, worldArea, areaIndex, cellIndex, locationType, x, y, ownSpecies, unwarpedPlaceInDayNightCycle, isSee, isHear, cond, cursor);
+            }
             float sizeX = worldArea.size.x;
             float sizeY = worldArea.size.y;
             int sizeXInt = (int)sizeX;
@@ -937,6 +1047,24 @@ namespace SaplingRustBridge.Patches
             DetailedFoodType[] foodTypes = animal.orderedDetailedFoodTypes;
             int len = foodTypes.Length;
 
+            // Hoist AnimalMorph lookup once instead of calling virtual MorphNeedsToBeUsed() per field/cell.
+            bool defUsesMorph = definition.currentSex > 0 && definition.sexes != null && definition.currentSex <= definition.sexes.Length;
+            Vector2 softHue, softBright;
+            bool invSoft;
+            if (defUsesMorph)
+            {
+                int mIdx = definition.currentSex - 1;
+                softHue = definition.sexes[mIdx].softPlantTissueDietHueRange;
+                softBright = definition.sexes[mIdx].softPlantTissueDietBrightnessRange;
+                invSoft = definition.sexes[mIdx].invertSoftPlantTissueDietColorRange;
+            }
+            else
+            {
+                softHue = definition._softPlantTissueDietHueRange;
+                softBright = definition._softPlantTissueDietBrightnessRange;
+                invSoft = definition._invertSoftPlantTissueDietColorRange;
+            }
+
             int cachedPopSpecies = int.MinValue;
             int cachedDictSpecies = int.MinValue;
 
@@ -955,11 +1083,11 @@ namespace SaplingRustBridge.Patches
                         if (lp != null)
                         {
                             PlantDefinition pdef = lp.definition;
-                            bool inRange = !(pdef.colorHue < definition.softPlantTissueDietHueRange.x)
-                                && !(pdef.colorHue > definition.softPlantTissueDietHueRange.y)
-                                && !(pdef.colorBrightness < definition.softPlantTissueDietBrightnessRange.x)
-                                && !(pdef.colorBrightness > definition.softPlantTissueDietBrightnessRange.y);
-                            if (definition.invertSoftPlantTissueDietColorRange ? !inRange : inRange)
+                            bool inRange = !(pdef._colorHue < softHue.x)
+                                && !(pdef._colorHue > softHue.y)
+                                && !(pdef._colorBrightness < softBright.x)
+                                && !(pdef._colorBrightness > softBright.y);
+                            if (invSoft ? !inRange : inRange)
                             {
                                 if (pdef.barkType == BarkType.None || animal.canFly || animal.canClimb)
                                 {
@@ -980,11 +1108,11 @@ namespace SaplingRustBridge.Patches
                     {
                         if (worldCell.grassHeight > 0)
                         {
-                            bool inRange = !(worldCell.grassHue < definition.softPlantTissueDietHueRange.x)
-                                && !(worldCell.grassHue > definition.softPlantTissueDietHueRange.y)
-                                && !(worldCell.grassBrightness < definition.softPlantTissueDietBrightnessRange.x)
-                                && !(worldCell.grassBrightness > definition.softPlantTissueDietBrightnessRange.y);
-                            if (definition.invertSoftPlantTissueDietColorRange ? !inRange : inRange)
+                            bool inRange = !(worldCell.grassHue < softHue.x)
+                                && !(worldCell.grassHue > softHue.y)
+                                && !(worldCell.grassBrightness < softBright.x)
+                                && !(worldCell.grassBrightness > softBright.y);
+                            if (invSoft ? !inRange : inRange)
                             {
                                 return num4;
                             }
@@ -1193,11 +1321,45 @@ namespace SaplingRustBridge.Patches
             int parentLf = carnivore.lifeFormIndexOfParent;
             bool carnIsChild = carnivore.isChild;
 
+            bool carnMorph = definition.currentSex > 0 && definition.sexes != null && definition.currentSex <= definition.sexes.Length;
+            Vector2 wHue, wBright, wSecHue, wSecBright;
+            HashSet<SkinPattern> wExclPat;
+            bool wInvert;
+            int carnSize;
+            if (carnMorph)
+            {
+                int ci = definition.currentSex - 1;
+                wHue = definition.sexes[ci].wholeAnimalDietHueRange;
+                wBright = definition.sexes[ci].wholeAnimalDietBrightnessRange;
+                wSecHue = definition.sexes[ci].wholeAnimalDietSecondaryHueRange;
+                wSecBright = definition.sexes[ci].wholeAnimalDietSecondaryBrightnessRange;
+                wExclPat = definition.sexes[ci].wholeAnimalDietExcludeSkinPatterns;
+                wInvert = definition.sexes[ci].invertWholeAnimalDietColorRange;
+                carnSize = definition.sexes[ci].bodySize;
+            }
+            else
+            {
+                wHue = definition._wholeAnimalDietHueRange;
+                wBright = definition._wholeAnimalDietBrightnessRange;
+                wSecHue = definition._wholeAnimalDietSecondaryHueRange;
+                wSecBright = definition._wholeAnimalDietSecondaryBrightnessRange;
+                wExclPat = definition._wholeAnimalDietExcludeSkinPatterns;
+                wInvert = definition._invertWholeAnimalDietColorRange;
+                carnSize = definition._bodySize;
+            }
+
             for (int i = -1; i < dirs.Length; i++)
             {
-                int num2 = (i != -1)
-                    ? area.StepFromCellWithIndexInDirection(indexOfBaseCell, dirs[i], false, true)
-                    : indexOfBaseCell;
+                int num2;
+                if (i == -1)
+                {
+                    num2 = indexOfBaseCell;
+                }
+                else
+                {
+                    num2 = StepFromCellFast(area, indexOfBaseCell, dirs[i], false, true);
+                    if (num2 == int.MinValue) num2 = area.StepFromCellWithIndexInDirection(indexOfBaseCell, dirs[i], false, true);
+                }
                 if (num2 == -1) continue;
 
                 WorldCell worldCell = cells[num2];
@@ -1258,23 +1420,44 @@ namespace SaplingRustBridge.Patches
                     continue;
                 }
 
-                bool inRange = !(definition2.colorHue < definition.wholeAnimalDietHueRange.x)
-                    && !(definition2.colorHue > definition.wholeAnimalDietHueRange.y)
-                    && !(definition2.colorBrightness < definition.wholeAnimalDietBrightnessRange.x)
-                    && !(definition2.colorBrightness > definition.wholeAnimalDietBrightnessRange.y)
-                    && !(definition2.secondaryColorHue < definition.wholeAnimalDietSecondaryHueRange.x)
-                    && !(definition2.secondaryColorHue > definition.wholeAnimalDietSecondaryHueRange.y)
-                    && !(definition2.secondaryColorBrightness < definition.wholeAnimalDietSecondaryBrightnessRange.x)
-                    && !(definition2.secondaryColorBrightness > definition.wholeAnimalDietSecondaryBrightnessRange.y)
-                    && !definition.wholeAnimalDietExcludeSkinPatterns.Contains(definition2.skinPattern);
+                bool preyMorph = definition2.currentSex > 0 && definition2.sexes != null && definition2.currentSex <= definition2.sexes.Length;
+                float pHue, pBright, pSecHue, pSecBright;
+                SkinPattern pPat;
+                int preySize;
+                if (preyMorph)
+                {
+                    int pi = definition2.currentSex - 1;
+                    pHue = definition2.sexes[pi].colorHue;
+                    pBright = definition2.sexes[pi].colorBrightness;
+                    pSecHue = definition2.sexes[pi].secondaryColorHue;
+                    pSecBright = definition2.sexes[pi].secondaryColorBrightness;
+                    pPat = definition2.sexes[pi].skinPattern;
+                    preySize = definition2.sexes[pi].bodySize;
+                }
+                else
+                {
+                    pHue = definition2._colorHue;
+                    pBright = definition2._colorBrightness;
+                    pSecHue = definition2._secondaryColorHue;
+                    pSecBright = definition2._secondaryColorBrightness;
+                    pPat = definition2._skinPattern;
+                    preySize = definition2._bodySize;
+                }
 
-                if (definition.invertWholeAnimalDietColorRange ? inRange : !inRange)
+                bool inRange = !(pHue < wHue.x)
+                    && !(pHue > wHue.y)
+                    && !(pBright < wBright.x)
+                    && !(pBright > wBright.y)
+                    && !(pSecHue < wSecHue.x)
+                    && !(pSecHue > wSecHue.y)
+                    && !(pSecBright < wSecBright.x)
+                    && !(pSecBright > wSecBright.y)
+                    && (wExclPat == null || !wExclPat.Contains(pPat));
+
+                if (wInvert ? inRange : !inRange)
                 {
                     continue;
                 }
-
-                int carnSize = definition.bodySize;
-                int preySize = definition2.bodySize;
 
                 if (carnIsChild)
                 {
@@ -2260,10 +2443,12 @@ namespace SaplingRustBridge.Patches
                             {
                                 animal.ChangeSex(inst.actionChoice);
                                 animal.UpdateStats(tl.importer, tl.gravity);
+                                SyncVisionCellActive(tl, area, cellIndex);
                             }
                             goto DoneInstinctLoop;
                         case InstinctAction.HideInShell:
                             animal.StartHidingInShell();
+                            SyncVisionCellActive(tl, area, cellIndex);
                             goto DoneInstinctLoop;
                     }
                     if (animal.canMakeNoise && inst.action == InstinctAction.MakeNoise && canVocalize)
@@ -2372,7 +2557,19 @@ namespace SaplingRustBridge.Patches
             float sizeX = worldArea.size.x;
             float sizeY = worldArea.size.y;
             bool canDirectBand = BandPatches.Enabled && BandPatches.ManagedBandReady && (int)sizeY > 0 && sizeX > 0f;
+            // Sample sub-phase Stopwatch icalls 1-in-16 days (~450k vs ~7.2M QPC calls per 5s window).
+            bool prof = (__instance.dayIndex & 15) == 0;
+            bool jumping = TimeJumpPatches.IsTimeJumpActive;
 
+            int sizeXInt = (int)sizeX;
+            int sizeYInt = (int)sizeY;
+            if (_rustVisionAvailable && sizeXInt > 0 && sizeYInt > 0 && (float)sizeXInt == sizeX && (float)sizeYInt == sizeY)
+            {
+                BeginVisionArea(__instance, worldArea, sizeXInt, sizeYInt);
+            }
+
+            try
+            {
             for (int i = 0; i < count; i++)
             {
                 int num = _animalPosScratch[i].cellIndex;
@@ -2381,9 +2578,9 @@ namespace SaplingRustBridge.Patches
                 if (livingAnimal == null || livingAnimal.eaten) continue;
 
                 _aCountAnimals++;
-                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                long t0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 LiveADayAnimalFast(livingAnimal, period);
-                _aTicksLive += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                if (prof) _aTicksLive += (System.Diagnostics.Stopwatch.GetTimestamp() - t0) << 4;
                 WorldCell worldCell = cells[num];
 
                 if (livingAnimal.carryingBaby && (livingAnimal.age == livingAnimal.stopCarryingBabyAtAge || livingAnimal.dying))
@@ -2398,24 +2595,30 @@ namespace SaplingRustBridge.Patches
                     {
                         CellLocationType babyLoc = (!(cells[emptyCell].oceanDepth <= 0f)) ? CellLocationType.UnderWater : CellLocationType.Ground;
                         worldArea.AddAnimalToCell(baby, emptyCell, babyLoc);
+                        SyncVisionCellActive(__instance, worldArea, emptyCell);
                     }
                 }
 
-                int spIdx = usePop
-                    ? __instance.populationBasedAnimalClassifier.LookUp(livingAnimal.definition.definitionIndex)
-                    : __instance.speciesIndexPerDefinitionIndex[livingAnimal.definition.definitionIndex];
-
                 if (livingAnimal.dying)
                 {
-                    long td = System.Diagnostics.Stopwatch.GetTimestamp();
+                    long td = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                     if (livingAnimal.verboseMating) Debug.Log(livingAnimal.logString);
                     if (livingAnimal.buildLifeReport) livingAnimal.LogLifeReport();
 
                     AnimalDefinition definition = livingAnimal.definition;
                     int definitionIndex = definition.definitionIndex;
                     worldArea.RemoveAnimalAtLocation(num, cellLocationType);
-                    __instance.PlantSeedPackage(livingAnimal.seedsCarryingAround, worldArea, areaIndex, num, livingAnimal.changedGenesForSeedsCarryingAround);
-                    __instance.PlantFungalSporePackage(livingAnimal.fungalSporesCarryingAround, worldArea, areaIndex, num, livingAnimal.changedGenesForFungalSporesCarryingAround, spIdx);
+                    if (livingAnimal.seedsCarryingAround != null && livingAnimal.seedsCarryingAround.Count > 0)
+                    {
+                        __instance.PlantSeedPackage(livingAnimal.seedsCarryingAround, worldArea, areaIndex, num, livingAnimal.changedGenesForSeedsCarryingAround);
+                    }
+                    if (livingAnimal.fungalSporesCarryingAround != null && livingAnimal.fungalSporesCarryingAround.Count > 0)
+                    {
+                        int spIdxDie = usePop
+                            ? __instance.populationBasedAnimalClassifier.LookUp(definitionIndex)
+                            : __instance.speciesIndexPerDefinitionIndex[definitionIndex];
+                        __instance.PlantFungalSporePackage(livingAnimal.fungalSporesCarryingAround, worldArea, areaIndex, num, livingAnimal.changedGenesForFungalSporesCarryingAround, spIdxDie);
+                    }
                     if (livingAnimal.infectedByParasite != null)
                     {
                         __instance.FungusReproduces(livingAnimal.infectedByParasite, worldArea, areaIndex, num, -1);
@@ -2492,12 +2695,16 @@ namespace SaplingRustBridge.Patches
                     worldArea.indicesOfCellsWhereAnAnimalDied.Add(num);
                     worldArea.locationTypesOfCellsWhereAnAnimalDied.Add(cellLocationType);
                     __instance.AddCarrionToCell(definition, areaIndex, num);
-                    _aTicksDie += System.Diagnostics.Stopwatch.GetTimestamp() - td;
+                    SyncVisionCellActive(__instance, worldArea, num);
+                    if (prof) _aTicksDie += (System.Diagnostics.Stopwatch.GetTimestamp() - td) << 4;
                     continue;
                 }
 
                 if (popActive)
                 {
+                    int spIdx = usePop
+                        ? __instance.populationBasedAnimalClassifier.LookUp(livingAnimal.definition.definitionIndex)
+                        : __instance.speciesIndexPerDefinitionIndex[livingAnimal.definition.definitionIndex];
                     __instance.populationSizeTracker.Count(spIdx, livingAnimal.manuallyAdded);
                     if (livingAnimal.infectedByParasite != null)
                     {
@@ -2512,18 +2719,25 @@ namespace SaplingRustBridge.Patches
 
                 if (livingAnimal.eating)
                 {
-                    long te = System.Diagnostics.Stopwatch.GetTimestamp();
+                    long te = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                     if ((livingAnimal.eatingFoodOfDetailedType == DetailedFoodType.Plankton || livingAnimal.eatingFoodOfDetailedType == DetailedFoodType.MarineSnow) && livingAnimal.filteringCells != null)
                     {
                         for (int j = 0; j < livingAnimal.filteringCells.Count; j++)
                         {
                             int fc = livingAnimal.filteringCells[j];
                             __instance.EatingAnimalDoesDamage(livingAnimal, worldArea, areaIndex, cells[fc], fc, cellLocationType);
+                            SyncVisionCellActive(__instance, worldArea, fc);
                         }
                     }
                     else if (livingAnimal.aquaticBehavior != LimbAquaticBehavior.Sessile)
                     {
+                        int eatTargetCell = livingAnimal.eatingFromCellWithIndex;
                         __instance.EatingAnimalDoesDamage(livingAnimal, worldArea, areaIndex, worldCell, num, cellLocationType);
+                        SyncVisionCellActive(__instance, worldArea, num);
+                        if (eatTargetCell >= 0 && eatTargetCell < cells.Length && eatTargetCell != num)
+                        {
+                            SyncVisionCellActive(__instance, worldArea, eatTargetCell);
+                        }
                     }
                     else if (worldCell.plankton != null)
                     {
@@ -2532,7 +2746,7 @@ namespace SaplingRustBridge.Patches
                     if (livingAnimal.attackingCell != -1) livingAnimal.attackingCell = -1;
                     livingAnimal.eating = false;
                     if (livingAnimal.verboseTravel) livingAnimal.ChangeLastLog("eating");
-                    _aTicksEatDmg += System.Diagnostics.Stopwatch.GetTimestamp() - te;
+                    if (prof) _aTicksEatDmg += (System.Diagnostics.Stopwatch.GetTimestamp() - te) << 4;
                     continue;
                 }
 
@@ -2546,6 +2760,7 @@ namespace SaplingRustBridge.Patches
                 {
                     __instance.mostRecentCloseParent.StartCarryingBaby(livingAnimal);
                     worldArea.RemoveAnimalFromCell(num, cellLocationType);
+                    SyncVisionCellActive(__instance, worldArea, num);
                     continue;
                 }
 
@@ -2572,24 +2787,25 @@ namespace SaplingRustBridge.Patches
                     !debugWalk)
                 {
                     _aCountBirths++;
-                    long tb = System.Diagnostics.Stopwatch.GetTimestamp();
+                    long tb = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                     bool defChanged = false;
                     bool willBlend = livingAnimal.fertilized && livingAnimal.fertilizedByAnimal != null &&
                                      livingAnimal.definition.definitionIndex != livingAnimal.fertilizedByAnimal.definitionIndex;
 
-                    LivingAnimal child = GiveBirthFast(livingAnimal, worldCell.temperature, willBlend);
+                    int chosenSex;
+                    LivingAnimal child = GiveBirthFast(livingAnimal, worldCell.temperature, willBlend, out chosenSex);
                     child.lifeFormIndexOfParent = livingAnimal.lifeFormIndex;
                     int parentDefIdx = child.definition.definitionIndex;
-                    long tb1 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    _aTicksBirthGive += tb1 - tb;
+                    long tb1 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+                    if (prof) _aTicksBirthGive += (tb1 - tb) << 4;
 
                     if (livingAnimal.fertilized)
                     {
-                        child.definition = BlendAnimalsFast(__instance.animalBlender, child.definition, livingAnimal.fertilizedByAnimal);
+                        child.definition = BlendAnimalsFast(__instance.animalBlender, child.definition, livingAnimal.fertilizedByAnimal, chosenSex);
                         defChanged = __instance.animalBlender.madeChanges;
                     }
-                    long tb2 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    _aTicksBirthBlend += tb2 - tb1;
+                    long tb2 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+                    if (prof) _aTicksBirthBlend += (tb2 - tb1) << 4;
 
                     if (evolution && !(UnityEngine.Random.value >= mutChance))
                     {
@@ -2599,8 +2815,8 @@ namespace SaplingRustBridge.Patches
                         AnimalDefinition deep = CloneAnimalDefinitionFast(child.definition);
                         deep.currentSex = savedSex;
                         child.definition = deep;
-                        long tb2b = System.Diagnostics.Stopwatch.GetTimestamp();
-                        _aTicksBirthClone += tb2b - tb2;
+                        long tb2b = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+                        if (prof) _aTicksBirthClone += (tb2b - tb2) << 4;
 
                         if (__instance.dayIndex > 10000 && __instance.epochs[__instance.epochs.Count - 1].currentNrOfTerrestrialAnimalSpecies < 6 && cells[__instance.latestCellToReproduceIn].oceanDepth == -1f)
                         {
@@ -2631,18 +2847,19 @@ namespace SaplingRustBridge.Patches
                         }
                         __instance.animalMutationTracker.RegisterMutation();
                         defChanged = true;
-                        long tb3 = System.Diagnostics.Stopwatch.GetTimestamp();
-                        _aTicksBirthMut += tb3 - tb2b;
+                        long tb3 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+                        if (prof) _aTicksBirthMut += (tb3 - tb2b) << 4;
                         tb2 = tb3;
                     }
                     long tb3End = tb2;
 
                     if (defChanged && !ProcessNewAnimalDefinitionFast(__instance, child, livingAnimal, cellLocationType, true))
                     {
-                        child = GiveBirthFast(livingAnimal, worldCell.temperature, false);
+                        int fallbackSex;
+                        child = GiveBirthFast(livingAnimal, worldCell.temperature, false, out fallbackSex);
                     }
-                    long tb4 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    _aTicksBirthProc += tb4 - tb3End;
+                    long tb4 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+                    if (prof) _aTicksBirthProc += (tb4 - tb3End) << 4;
 
                     child.definitionIndexOfParent = parentDefIdx;
                     if (livingAnimal.fertilized)
@@ -2662,10 +2879,14 @@ namespace SaplingRustBridge.Patches
                     {
                         __instance.LayEggInCell(child, areaIndex, __instance.latestCellToReproduceIn, livingAnimal.fertilized);
                     }
+                    SyncVisionCellActive(__instance, worldArea, __instance.latestCellToReproduceIn);
                     if (livingAnimal.verboseTravel) livingAnimal.ChangeLastLog("readyToGiveBirth");
-                    long tb5 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    _aTicksBirthSpawn += tb5 - tb4;
-                    _aTicksBirth += tb5 - tb;
+                    if (prof)
+                    {
+                        long tb5 = System.Diagnostics.Stopwatch.GetTimestamp();
+                        _aTicksBirthSpawn += (tb5 - tb4) << 4;
+                        _aTicksBirth += (tb5 - tb) << 4;
+                    }
                     continue;
                 }
 
@@ -2740,6 +2961,7 @@ namespace SaplingRustBridge.Patches
                         {
                             __instance.BuildNestInCell(livingAnimal.definition.nestType, livingAnimal.definition.nestEnclosed, livingAnimal.definition.eggType, livingAnimal.definition.bodySize, areaIndex, num);
                             livingAnimal.energy -= livingAnimal.energyNeededForNestCreation;
+                            SyncVisionCellActive(__instance, worldArea, num);
                         }
                         else
                         {
@@ -2758,14 +2980,14 @@ namespace SaplingRustBridge.Patches
                 if (!livingAnimal.moving || livingAnimal.instinctivelyInterestedInCellWithIndex == -1)
                 {
                     _aCountInstinctCalls++;
-                    long ti = System.Diagnostics.Stopwatch.GetTimestamp();
+                    long ti = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                     UpdateInstinctFast(__instance, livingAnimal, areaIndex, num, cellLocationType);
-                    _aTicksInstinct += System.Diagnostics.Stopwatch.GetTimestamp() - ti;
+                    if (prof) _aTicksInstinct += (System.Diagnostics.Stopwatch.GetTimestamp() - ti) << 4;
                 }
 
-                long tt = System.Diagnostics.Stopwatch.GetTimestamp();
+                long tt = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 Travel travel2 = ManageTravelsFast(__instance, livingAnimal, areaIndex, num, cellLocationType);
-                _aTicksTravel += System.Diagnostics.Stopwatch.GetTimestamp() - tt;
+                if (prof) _aTicksTravel += (System.Diagnostics.Stopwatch.GetTimestamp() - tt) << 4;
                 int num7;
                 if (travel2 == null)
                 {
@@ -2800,6 +3022,7 @@ namespace SaplingRustBridge.Patches
                             livingAnimal.FilterCells(filtered);
                         }
                     }
+                    if (jumping) ReturnTravel(travel2);
                 }
 
                 if (livingAnimal.actionIsInstinctivelyPrioritized)
@@ -2832,7 +3055,7 @@ namespace SaplingRustBridge.Patches
                     }
                     livingAnimal.attackingCell = -1;
 
-                    long tmf = System.Diagnostics.Stopwatch.GetTimestamp();
+                    long tmf = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                     MatingCheckResult mateRes = MatingCheckFast(__instance, livingAnimal, worldArea, num, cellLocationType);
                     if (mateRes == MatingCheckResult.Mate)
                     {
@@ -2845,7 +3068,7 @@ namespace SaplingRustBridge.Patches
                             __instance.matingCheckOtherAnimal.hasSharedGenes = true;
                         }
                         livingAnimal.ageAtLastMating = livingAnimal.age;
-                        _aTicksMateFood += System.Diagnostics.Stopwatch.GetTimestamp() - tmf;
+                        if (prof) _aTicksMateFood += (System.Diagnostics.Stopwatch.GetTimestamp() - tmf) << 4;
                         continue;
                     }
                     if (mateRes == MatingCheckResult.UnfertilizedEgg)
@@ -2870,7 +3093,7 @@ namespace SaplingRustBridge.Patches
                             __instance.matingCheckEgg.fertilizedAsEgg = true;
                             __instance.matingCheckEgg.definitionIndexOfOtherParent = livingAnimal.definition.definitionIndex;
                         }
-                        _aTicksMateFood += System.Diagnostics.Stopwatch.GetTimestamp() - tmf;
+                        if (prof) _aTicksMateFood += (System.Diagnostics.Stopwatch.GetTimestamp() - tmf) << 4;
                         continue;
                     }
 
@@ -2878,7 +3101,7 @@ namespace SaplingRustBridge.Patches
                     int foodIdx = CellContainsFoodFast(__instance, worldArea, cells, areaIndex, num7, cellLocationType, livingAnimal);
                     if (foodIdx == -1)
                     {
-                        _aTicksMateFood += System.Diagnostics.Stopwatch.GetTimestamp() - tmf;
+                        if (prof) _aTicksMateFood += (System.Diagnostics.Stopwatch.GetTimestamp() - tmf) << 4;
                         continue;
                     }
 
@@ -2898,7 +3121,7 @@ namespace SaplingRustBridge.Patches
 
                     if (plantAtCell == null)
                     {
-                        _aTicksMateFood += System.Diagnostics.Stopwatch.GetTimestamp() - tmf;
+                        if (prof) _aTicksMateFood += (System.Diagnostics.Stopwatch.GetTimestamp() - tmf) << 4;
                         continue;
                     }
 
@@ -2914,10 +3137,11 @@ namespace SaplingRustBridge.Patches
                     {
                         plantAtCell.hasNectar = false;
                         plantAtCell.nectarAvailabilityPercentage = 0f;
+                        SyncVisionCellActive(__instance, worldArea, num7);
                     }
                     if (!livingAnimal.eatsNectar)
                     {
-                        _aTicksMateFood += System.Diagnostics.Stopwatch.GetTimestamp() - tmf;
+                        if (prof) _aTicksMateFood += (System.Diagnostics.Stopwatch.GetTimestamp() - tmf) << 4;
                         continue;
                     }
 
@@ -2931,8 +3155,13 @@ namespace SaplingRustBridge.Patches
                         }
                     }
                     livingAnimal.AttachPollen(plantAtCell.shapeIndicesOfAnimalPollinationOrgans, plantAtCell.definition);
-                    _aTicksMateFood += System.Diagnostics.Stopwatch.GetTimestamp() - tmf;
+                    if (prof) _aTicksMateFood += (System.Diagnostics.Stopwatch.GetTimestamp() - tmf) << 4;
                 }
+            }
+            }
+            finally
+            {
+                EndVisionArea();
             }
 
             int liveAnimals = worldArea.animalPositionTracker.animalPositions.Count;
@@ -3121,10 +3350,11 @@ namespace SaplingRustBridge.Patches
 
             if (plantChanged)
             {
+                if (seed.plantStatsCalculator == null) seed.plantStatsCalculator = _sharedPlantFillCalc;
                 seed.plantStatsCalculator.allowedColors = __instance.allowedPlantColors;
                 seed.environmentTemperature = seedCell.temperature;
                 PlantStatsCalculator calc = seed.FillStats();
-                if (OrganismProblemDetection.DetectProblemInPlant(calc, true) != OrganismProblem.NoProblem || !seed.plantStatsCalculator.colorAllowed)
+                if (OrganismProblemDetection.DetectProblemInPlant(calc, true) != OrganismProblem.NoProblem || !calc.colorAllowed)
                 {
                     __instance.RegisterDeathCause(def.definitionIndex, seed.manuallyAdded, DeathCause.UnluckyMutation, OrganismType.Plant);
                     return false;
@@ -3232,7 +3462,7 @@ namespace SaplingRustBridge.Patches
                     float stepsLimit = Mathf.Ceil(num5);
                     for (num3 = 0; (float)num3 < stepsLimit; num3++)
                     {
-                        num = worldArea.MoveSingleStepInDirectionOfCellWithMaxSteepness(num, animal.instinctivelyInterestedInCellWithIndex, animal.maximumSteepness);
+                        num = MoveSingleStepSteepDirect(worldArea, cells, num, animal.instinctivelyInterestedInCellWithIndex, animal.maximumSteepness);
                         if (num == -1) break;
                         if (trackSteps) _travelStepsScratch.Add(num);
                         num2 = num3;
@@ -3317,7 +3547,7 @@ namespace SaplingRustBridge.Patches
                         float lim = Mathf.Ceil(animal.speed - 1f);
                         for (num3 = 1; (float)num3 < lim; num3++)
                         {
-                            num = worldArea.MoveSingleStepInDirectionOfCellWithMaxSteepness(num, animal.instinctivelyInterestedInCellWithIndex, animal.maximumSteepness);
+                            num = MoveSingleStepSteepDirect(worldArea, cells, num, animal.instinctivelyInterestedInCellWithIndex, animal.maximumSteepness);
                             if (num == -1) break;
                             if (trackSteps) _travelStepsScratch.Add(num);
                             num2 = num3;
@@ -3523,7 +3753,7 @@ namespace SaplingRustBridge.Patches
                             float lim = Mathf.Ceil(animal.speed);
                             for (int l = 0; (float)l < lim; l++)
                             {
-                                num = worldArea.StepFromCellWithIndexInDirectionWithMaxSteepness(num, wd, animal.maximumSteepness);
+                                num = StepSteepDirect(worldArea, cells, num, wd, animal.maximumSteepness);
                                 if (trackSteps) _travelStepsScratch.Add(num);
                                 num2++;
                             }
@@ -3554,7 +3784,9 @@ namespace SaplingRustBridge.Patches
                     Dictionary<int, Travel> travelsByGoal = __instance.today.GetTravelsByGoal(areaIndex, cellLocationType);
                     if (!travelsByGoal.ContainsKey(num))
                     {
-                        travel = new Travel(animal, modeOfTransport, cellIndex, num, locationType, cellLocationType, num2);
+                        travel = TimeJumpPatches.IsTimeJumpActive
+                            ? RentTravel(animal, modeOfTransport, cellIndex, num, locationType, cellLocationType, num2)
+                            : new Travel(animal, modeOfTransport, cellIndex, num, locationType, cellLocationType, num2);
                         // Only filterFeeders ever read Travel.intermediateCellIndices (TimeLine.cs:2331).
                         travel.intermediateCellIndices = (animal.filterFeeder && _travelStepsScratch.Count > 0)
                             ? new List<int>(_travelStepsScratch)
@@ -3624,6 +3856,8 @@ namespace SaplingRustBridge.Patches
                             }
                         }
                         travel.succeeded = true;
+                        SyncVisionCellActive(__instance, worldArea, cellIndex);
+                        SyncVisionCellActive(__instance, worldArea, num8);
                     }
                     else
                     {
@@ -3642,6 +3876,7 @@ namespace SaplingRustBridge.Patches
                     {
                         return travel;
                     }
+                    if (TimeJumpPatches.IsTimeJumpActive) ReturnTravel(travel);
                 }
                 else
                 {
@@ -4018,14 +4253,14 @@ namespace SaplingRustBridge.Patches
                 InstinctDefinition[] dstInst = new InstinctDefinition[srcInst.Length];
                 for (int i = 0; i < srcInst.Length; i++)
                 {
-                    dstInst[i] = srcInst[i].Clone() as InstinctDefinition;
+                    dstInst[i] = (InstinctDefinition)_memberwiseClone(srcInst[i]);
                 }
                 copy._instincts = dstInst;
             }
             return copy;
         }
 
-        private static LivingAnimal GiveBirthFast(LivingAnimal p, float temperature, bool skipDefClone)
+        private static LivingAnimal GiveBirthFast(LivingAnimal p, float temperature, bool skipDefClone, out int chosenSex)
         {
             p.readyToGiveBirth = false;
             p.pregnant = false;
@@ -4037,154 +4272,10 @@ namespace SaplingRustBridge.Patches
             if (p.buildLifeReport) p.lifeReportDaysReproducing++;
 
             AnimalDefinition pDef = p.definition;
-            AnimalDefinition childDef = skipDefClone ? pDef : ShallowCopyAnimalDefinition(pDef, false);
-            LivingAnimal c = new LivingAnimal(childDef);
-            c.manuallyAdded = false;
-            c.energy = p.energyNeededToReproduce;
-            c.mostSalientColor = p.mostSalientColor;
-            c.colorBrightness = p.colorBrightness;
-            c.canEat = p.canEat;
-            c.eatsNectar = p.eatsNectar;
-            c.eatsPlants = p.eatsPlants;
-            c.eatsMeat = p.eatsMeat;
-            c.eatsMeatOnly = p.eatsMeatOnly;
-            c.getsMostEnergyFromMeat = p.getsMostEnergyFromMeat;
-            c.orderedDetailedFoodTypes = p.orderedDetailedFoodTypes;
-            c.energyPerDetailedFoodType = p.energyPerDetailedFoodType;
-            c.expectedAge = p.expectedAge;
-            c.matureAtAge = p.matureAtAge;
-            c.healthDeterioratesAtAge = p.healthDeterioratesAtAge;
-            c.healthDeteriorationRatePerDayAtOldAge = p.healthDeteriorationRatePerDayAtOldAge;
-            c.baseAttractiveness = p.baseAttractiveness;
-            c.attractiveness = p.baseAttractiveness;
-            c.extraAttractivenessWhileDisplaying = p.extraAttractivenessWhileDisplaying;
-            c.energyNeededToReproduce = p.energyNeededToReproduce;
-            c.stepSound = p.stepSound;
-
-            c.hasCachedAdultMovementStats = p.hasCachedAdultMovementStats;
-            c.cachedYoungSessile = p.cachedYoungSessile;
-            c.cachedYoungCanWalk = p.cachedYoungCanWalk;
-            c.cachedYoungCanClimb = p.cachedYoungCanClimb;
-            c.cachedYoungCanGlide = p.cachedYoungCanGlide;
-            c.cachedYoungCanFly = p.cachedYoungCanFly;
-            c.cachedYoungCanSwim = p.cachedYoungCanSwim;
-            c.cachedYoungAquaticBehavior = p.cachedYoungAquaticBehavior;
-            c.cachedYoungSpeed = p.cachedYoungSpeed;
-            c.cachedYoungSwimmingSpeed = p.cachedYoungSwimmingSpeed;
-            c.cachedYoungWaterSurfaceBoost = p.cachedYoungWaterSurfaceBoost;
-            c.cachedYoungMaximumSteepness = p.cachedYoungMaximumSteepness;
-            c.cachedYoungCanSteerInTheAir = p.cachedYoungCanSteerInTheAir;
-            c.cachedAdultSessile = p.cachedAdultSessile;
-            c.cachedAdultCanWalk = p.cachedAdultCanWalk;
-            c.cachedAdultCanClimb = p.cachedAdultCanClimb;
-            c.cachedAdultCanGlide = p.cachedAdultCanGlide;
-            c.cachedAdultCanFly = p.cachedAdultCanFly;
-            c.cachedAdultCanSwim = p.cachedAdultCanSwim;
-            c.cachedAdultAquaticBehavior = p.cachedAdultAquaticBehavior;
-            c.cachedAdultSpeed = p.cachedAdultSpeed;
-            c.cachedAdultSwimmingSpeed = p.cachedAdultSwimmingSpeed;
-            c.cachedAdultWaterSurfaceBoost = p.cachedAdultWaterSurfaceBoost;
-            c.cachedAdultMaximumSteepness = p.cachedAdultMaximumSteepness;
-            c.cachedAdultCanSteerInTheAir = p.cachedAdultCanSteerInTheAir;
-
-            if (p.hasCachedAdultMovementStats)
-            {
-                c.sessile = p.cachedYoungSessile;
-                c.canWalk = p.cachedYoungCanWalk;
-                c.canClimb = p.cachedYoungCanClimb;
-                c.canGlide = p.cachedYoungCanGlide;
-                c.canFly = p.cachedYoungCanFly;
-                c.canSwim = p.cachedYoungCanSwim;
-                c.aquaticBehavior = p.cachedYoungAquaticBehavior;
-                c.speed = p.cachedYoungSpeed;
-                c.swimmingSpeed = p.cachedYoungSwimmingSpeed;
-                c.waterSurfaceBoost = p.cachedYoungWaterSurfaceBoost;
-                c.maximumSteepness = p.cachedYoungMaximumSteepness;
-                c.canSteerInTheAir = p.cachedYoungCanSteerInTheAir;
-            }
-            else
-            {
-                c.sessile = p.sessile;
-                c.canWalk = p.canWalk;
-                c.canClimb = p.canClimb;
-                c.canGlide = p.canGlide;
-                c.canFly = p.canFly;
-                c.canSwim = p.canSwim;
-                c.aquaticBehavior = p.aquaticBehavior;
-                c.speed = p.speed;
-                c.swimmingSpeed = p.swimmingSpeed;
-                c.waterSurfaceBoost = p.waterSurfaceBoost;
-                c.maximumSteepness = p.maximumSteepness;
-                c.canSteerInTheAir = p.canSteerInTheAir;
-            }
-
-            c.maximumOceanCurrent = p.maximumOceanCurrent;
-            c.timeInWater = p.timeInWater;
-            c.timeOnLand = p.timeOnLand;
-            c.animationPack = p.animationPack;
-            c.swimAnimationType = p.swimAnimationType;
-            c.flyAnimationType = p.flyAnimationType;
-            c.walkingStyle = p.walkingStyle;
-            c.sprawlingWalk = p.sprawlingWalk;
-            c.attackParticleEffect = p.attackParticleEffect;
-            c.lowestDetectablePitch = p.lowestDetectablePitch;
-            c.highestDetectablePitch = p.highestDetectablePitch;
-            c.colorSeeingMinLimit = p.colorSeeingMinLimit;
-            c.colorSeeingMaxLimit = p.colorSeeingMaxLimit;
-            c.closestHearingDistance = p.closestHearingDistance;
-            c.furthestHearingDistance = p.furthestHearingDistance;
-            c.furthestSeeingDistanceDuringDayTime = p.furthestSeeingDistanceDuringDayTime;
-            c.furthestSeeingDistanceAtTwilight = p.furthestSeeingDistanceAtTwilight;
-            c.furthestSeeingDistanceAtNight = p.furthestSeeingDistanceAtNight;
-            c.furthestUnderWaterSeeingDistanceDuringDayTime = p.furthestUnderWaterSeeingDistanceDuringDayTime;
-            c.furthestUnderWaterSeeingDistanceAtTwilight = p.furthestUnderWaterSeeingDistanceAtTwilight;
-            c.furthestUnderWaterSeeingDistanceAtNight = p.furthestUnderWaterSeeingDistanceAtNight;
-            c.fieldOfView = p.fieldOfView;
-            c.crySound = p.crySound;
-            c.noiseSound = p.noiseSound;
-            c.highestMouthHeight = p.highestMouthHeight;
-            c.canEatAtHeight = p.canEatAtHeight;
-            c.doesEatingDamage = p.doesEatingDamage;
-            c.filterFeeder = p.filterFeeder;
-            c.canGlow = p.canGlow;
-            c.alwaysGlowing = p.alwaysGlowing;
-            c.glowing = p.alwaysGlowing;
-            c.canHangAsBaby = p.canHangAsBaby;
-            c.canHangFromBranch = p.canHangFromBranch;
-            c.canHangUpsideDownFromBranch = p.canHangUpsideDownFromBranch;
-            c.hasLiquidStorage = p.hasLiquidStorage;
-            c.minimumTemperatureThisOrganismCanHandle = p.minimumTemperatureThisOrganismCanHandle;
-            c.maximumTemperatureThisOrganismCanHandle = p.maximumTemperatureThisOrganismCanHandle;
-            c.dailyHealthLossOutsideTemperatureRange = p.dailyHealthLossOutsideTemperatureRange;
-            c.dailyHealthLossWhileSuffocating = p.dailyHealthLossWhileSuffocating;
-            c.dailyHealthLossBelowCurrentSpeedThreshold = p.dailyHealthLossBelowCurrentSpeedThreshold;
-            c.pregnancyTime = p.pregnancyTime;
-            c.timeInEgg = p.timeInEgg;
-            c.attack = p.attack;
-            c.armor = p.armor;
-            c.defenseForEatingSpikes = p.defenseForEatingSpikes;
-            c.venomStrength = p.venomStrength;
-            c.avoidsHeat = p.avoidsHeat;
-            c.avoidsCold = p.avoidsCold;
-            c.ableToBuildNest = p.ableToBuildNest;
-            c.energyNeededForNestCreation = p.energyNeededForNestCreation;
-            c.canHibernate = p.canHibernate;
-            c.providesMilk = p.providesMilk;
-            c.canBlow = p.canBlow;
-            c.canHideInShell = p.canHideInShell;
-            c.canMakeNoise = p.canMakeNoise;
-            c.noiseDuringMovement = p.noiseDuringMovement;
-            c.callSoundPack = p.callSoundPack;
-            c.callSoundPackReferenceBodySize = p.callSoundPackReferenceBodySize;
-            c.genericNoiseSoundPack = p.genericNoiseSoundPack;
-            c.genericNoiseSoundPackReferenceBodySize = p.genericNoiseSoundPackReferenceBodySize;
-            c.movementNoiseSoundPack = p.movementNoiseSoundPack;
-            c.movementNoiseSoundPackReferenceBodySize = p.movementNoiseSoundPackReferenceBodySize;
-            c.offSpringSexChances = p.offSpringSexChances;
-
+            chosenSex = pDef.currentSex;
             if (pDef.sexes != null && pDef.sexes.Length > 0)
             {
-                int chosenSex = 0;
+                chosenSex = 0;
                 OffspringSexDecisionType decType = pDef.offspringSexDecisionType;
                 if (decType == OffspringSexDecisionType.Chance)
                 {
@@ -4219,7 +4310,284 @@ namespace SaplingRustBridge.Patches
                     }
                 }
                 if (chosenSex > pDef.sexes.Length) chosenSex = 0;
-                if (!skipDefClone) childDef.currentSex = chosenSex;
+            }
+
+            // Copy-on-write AnimalDefinition: share pDef directly whenever sex matches (or blending/mutating will clone).
+            AnimalDefinition childDef;
+            if (skipDefClone || chosenSex == pDef.currentSex)
+            {
+                childDef = pDef;
+            }
+            else
+            {
+                childDef = ShallowCopyAnimalDefinition(pDef, false);
+                childDef.currentSex = chosenSex;
+            }
+
+            LivingAnimal c;
+            if (_memberwiseClone != null)
+            {
+                // Single native memcpy of all ~140 stat fields from parent, then reset only per-instance state
+                // and attach copy-on-write empty sentinels (eliminates 7 heap allocations per birth).
+                c = (LivingAnimal)_memberwiseClone(p);
+
+                // LifeForm instance fields
+                c.organismType = OrganismType.Animal;
+                c.lifeFormIndex = -1;
+                c.lifeFormIndexOfParent = -1;
+                c.definitionIndexOfParent = 0;
+                c.visualSalienceOfDifferenceToParent = 0f;
+                c.definitionIndexOfOtherParent = 0;
+                c.age = 0;
+                c.young = true;
+                c.ageToGrowOld = 0;
+                c.health = 10f;
+                c.maximumHealth = 10f;
+                c.doesDamageIfBeingEaten = 0f;
+                c.lookingInDirection = default(WindDirection);
+                c.glowing = p.alwaysGlowing;
+                c.dying = false;
+                c.absoluteMaximumAge = 1000;
+                c.maximumAge = 0;
+                c.manuallyAdded = false;
+                c.fertilized = false;
+                c.mutatedLatestOffspring = false;
+                c.dormant = false;
+                c.logString = string.Empty;
+                c.debugCounted = 0;
+                c.ancestorSpeciesIndices = null;
+                c.infectedByParasite = null;
+                c.parasiteDamage = 0f;
+
+                // LivingAnimal instance fields
+                c.definition = childDef;
+                c.energy = p.energyNeededToReproduce;
+                c.oxygen = 1f;
+                c.maximumRest = 40;
+                c.rest = 40;
+                c.restRestorationSpeed = 3;
+                c.sleeping = false;
+                c.ageAtLastSleep = -1;
+                c.locationType = CellLocationType.Ground;
+                c.oceanFloor = false;
+                c.isChild = true;
+                c.prudentPredation = false;
+                c.pregnant = false;
+                c.readyToGiveBirth = false;
+                c.carryingBaby = false;
+                c.babyBeingCarried = null;
+                c.stopCarryingBabyAtAge = -1;
+                c.moving = false;
+                c.crying = false;
+                c.makingGenericNoise = false;
+                c.makingMovementNoise = false;
+                c.makingIdleSound = false;
+                c.attackingCell = -1;
+                c.eating = false;
+                c.eaten = false;
+                c.eatingFoodOfType = default(FoodType);
+                c.eatingFoodOfDetailedType = default(DetailedFoodType);
+                c.eatingSoftPlantTissueOfType = default(SoftPlantTissueType);
+                c.eatingFromOtherCell = false;
+                c.eatDirection = default(WindDirection);
+                c.eatingFromCellWithIndex = -1;
+                c.eatingEggWithIndex = -1;
+                c.filteringCells = null;
+                c.dailyPoisonDamage = 0f;
+                c.dailyEnergyLoss = 0.1f;
+                c.dailyHealthLoss = 0f;
+                c.dailyHealthLossWhileStarving = 0.5f;
+                c.insideTemperatureRange = true;
+                c.nrOfDaysOutsideTempRange = 0;
+                c.belowOceanCurrentSpeedThreshold = true;
+                c.indexOfCurrentlyActiveInstinct = -1;
+                c.instinctivelyInterestedInCellWithIndex = -1;
+                c.lastInstinctAction = default(InstinctAction);
+                c.actionIsInstinctivelyPrioritized = false;
+                c.ageAtLastCry = -1;
+                c.ageAtLastNoise = -1;
+                c.ageAtLastBirth = -1;
+                c.attachedPollen = _emptyPollen;
+                c.seedsCarryingAround = _emptySeeds;
+                c.changedGenesForSeedsCarryingAround = _emptySeedBools;
+                c.fungalSporesCarryingAround = _emptySpores;
+                c.changedGenesForFungalSporesCarryingAround = _emptySporeBools;
+                c.glowTimer = 0;
+                c.glowTime = 5;
+                c.attractiveness = p.baseAttractiveness;
+                c.displaying = false;
+                c.extraAttractivenessForCryingOrNoise = 0.05f;
+                c.currentlyStoring = DetailedFoodType.None;
+                c.scripted = false;
+                c.babyDueAt = 0;
+                c.nrOfChildren = 0;
+                c.maximumNrOfChildren = 3;
+                c.maximumNrOfChildrenForCarnivores = 2;
+                c.lastHurtAtAge = -1;
+                c.wantsToHibernate = false;
+                c.hidingInShell = false;
+                c.hideTimer = 0;
+                c.hideTime = 8;
+                c.nrOfDaysBetweenCriesOrNoise = 3 + (int)(NextFastRng() % 5u);
+                c.nrOfDaysBetweenIdleSounds = 3 + (int)(NextFastRng() % 5u);
+                c.ageAtLastIdleSound = -1;
+                c.verboseEnergy = false;
+                c.verboseTravel = false;
+                c.verboseMating = false;
+                c.fertilizedByAnimal = null;
+                c.attractivenessOfLastMate = 0f;
+                c.fertilizedAsEgg = false;
+                c.ageAtLastMating = -1;
+                c.ageAtLastSexChange = -1;
+                c.hasSharedGenes = false;
+                c.camouflaged = 0f;
+                c.lastLog = null;
+                c.buildLifeReport = false;
+                c.lifeReportDaysEating = 0;
+                c.lifeReportDaysReproducing = 0;
+                c.lifeReportDaysSleeping = 0;
+
+                if (p.hasCachedAdultMovementStats)
+                {
+                    c.sessile = p.cachedYoungSessile;
+                    c.canWalk = p.cachedYoungCanWalk;
+                    c.canClimb = p.cachedYoungCanClimb;
+                    c.canGlide = p.cachedYoungCanGlide;
+                    c.canFly = p.cachedYoungCanFly;
+                    c.canSwim = p.cachedYoungCanSwim;
+                    c.aquaticBehavior = p.cachedYoungAquaticBehavior;
+                    c.speed = p.cachedYoungSpeed;
+                    c.swimmingSpeed = p.cachedYoungSwimmingSpeed;
+                    c.waterSurfaceBoost = p.cachedYoungWaterSurfaceBoost;
+                    c.maximumSteepness = p.cachedYoungMaximumSteepness;
+                    c.canSteerInTheAir = p.cachedYoungCanSteerInTheAir;
+                }
+            }
+            else
+            {
+                c = new LivingAnimal(childDef);
+                c.manuallyAdded = false;
+                c.energy = p.energyNeededToReproduce;
+                c.mostSalientColor = p.mostSalientColor;
+                c.colorBrightness = p.colorBrightness;
+                c.canEat = p.canEat;
+                c.eatsNectar = p.eatsNectar;
+                c.eatsPlants = p.eatsPlants;
+                c.eatsMeat = p.eatsMeat;
+                c.eatsMeatOnly = p.eatsMeatOnly;
+                c.getsMostEnergyFromMeat = p.getsMostEnergyFromMeat;
+                c.orderedDetailedFoodTypes = p.orderedDetailedFoodTypes;
+                c.energyPerDetailedFoodType = p.energyPerDetailedFoodType;
+                c.expectedAge = p.expectedAge;
+                c.matureAtAge = p.matureAtAge;
+                c.healthDeterioratesAtAge = p.healthDeterioratesAtAge;
+                c.healthDeteriorationRatePerDayAtOldAge = p.healthDeteriorationRatePerDayAtOldAge;
+                c.baseAttractiveness = p.baseAttractiveness;
+                c.attractiveness = p.baseAttractiveness;
+                c.extraAttractivenessWhileDisplaying = p.extraAttractivenessWhileDisplaying;
+                c.energyNeededToReproduce = p.energyNeededToReproduce;
+                c.stepSound = p.stepSound;
+                c.hasCachedAdultMovementStats = p.hasCachedAdultMovementStats;
+                c.cachedYoungSessile = p.cachedYoungSessile;
+                c.cachedYoungCanWalk = p.cachedYoungCanWalk;
+                c.cachedYoungCanClimb = p.cachedYoungCanClimb;
+                c.cachedYoungCanGlide = p.cachedYoungCanGlide;
+                c.cachedYoungCanFly = p.cachedYoungCanFly;
+                c.cachedYoungCanSwim = p.cachedYoungCanSwim;
+                c.cachedYoungAquaticBehavior = p.cachedYoungAquaticBehavior;
+                c.cachedYoungSpeed = p.cachedYoungSpeed;
+                c.cachedYoungSwimmingSpeed = p.cachedYoungSwimmingSpeed;
+                c.cachedYoungWaterSurfaceBoost = p.cachedYoungWaterSurfaceBoost;
+                c.cachedYoungMaximumSteepness = p.cachedYoungMaximumSteepness;
+                c.cachedYoungCanSteerInTheAir = p.cachedYoungCanSteerInTheAir;
+                c.cachedAdultSessile = p.cachedAdultSessile;
+                c.cachedAdultCanWalk = p.cachedAdultCanWalk;
+                c.cachedAdultCanClimb = p.cachedAdultCanClimb;
+                c.cachedAdultCanGlide = p.cachedAdultCanGlide;
+                c.cachedAdultCanFly = p.cachedAdultCanFly;
+                c.cachedAdultCanSwim = p.cachedAdultCanSwim;
+                c.cachedAdultAquaticBehavior = p.cachedAdultAquaticBehavior;
+                c.cachedAdultSpeed = p.cachedAdultSpeed;
+                c.cachedAdultSwimmingSpeed = p.cachedAdultSwimmingSpeed;
+                c.cachedAdultWaterSurfaceBoost = p.cachedAdultWaterSurfaceBoost;
+                c.cachedAdultMaximumSteepness = p.cachedAdultMaximumSteepness;
+                c.cachedAdultCanSteerInTheAir = p.cachedAdultCanSteerInTheAir;
+                c.sessile = p.hasCachedAdultMovementStats ? p.cachedYoungSessile : p.sessile;
+                c.canWalk = p.hasCachedAdultMovementStats ? p.cachedYoungCanWalk : p.canWalk;
+                c.canClimb = p.hasCachedAdultMovementStats ? p.cachedYoungCanClimb : p.canClimb;
+                c.canGlide = p.hasCachedAdultMovementStats ? p.cachedYoungCanGlide : p.canGlide;
+                c.canFly = p.hasCachedAdultMovementStats ? p.cachedYoungCanFly : p.canFly;
+                c.canSwim = p.hasCachedAdultMovementStats ? p.cachedYoungCanSwim : p.canSwim;
+                c.aquaticBehavior = p.hasCachedAdultMovementStats ? p.cachedYoungAquaticBehavior : p.aquaticBehavior;
+                c.speed = p.hasCachedAdultMovementStats ? p.cachedYoungSpeed : p.speed;
+                c.swimmingSpeed = p.hasCachedAdultMovementStats ? p.cachedYoungSwimmingSpeed : p.swimmingSpeed;
+                c.waterSurfaceBoost = p.hasCachedAdultMovementStats ? p.cachedYoungWaterSurfaceBoost : p.waterSurfaceBoost;
+                c.maximumSteepness = p.hasCachedAdultMovementStats ? p.cachedYoungMaximumSteepness : p.maximumSteepness;
+                c.canSteerInTheAir = p.hasCachedAdultMovementStats ? p.cachedYoungCanSteerInTheAir : p.canSteerInTheAir;
+                c.maximumOceanCurrent = p.maximumOceanCurrent;
+                c.timeInWater = p.timeInWater;
+                c.timeOnLand = p.timeOnLand;
+                c.animationPack = p.animationPack;
+                c.swimAnimationType = p.swimAnimationType;
+                c.flyAnimationType = p.flyAnimationType;
+                c.walkingStyle = p.walkingStyle;
+                c.sprawlingWalk = p.sprawlingWalk;
+                c.attackParticleEffect = p.attackParticleEffect;
+                c.lowestDetectablePitch = p.lowestDetectablePitch;
+                c.highestDetectablePitch = p.highestDetectablePitch;
+                c.colorSeeingMinLimit = p.colorSeeingMinLimit;
+                c.colorSeeingMaxLimit = p.colorSeeingMaxLimit;
+                c.closestHearingDistance = p.closestHearingDistance;
+                c.furthestHearingDistance = p.furthestHearingDistance;
+                c.furthestSeeingDistanceDuringDayTime = p.furthestSeeingDistanceDuringDayTime;
+                c.furthestSeeingDistanceAtTwilight = p.furthestSeeingDistanceAtTwilight;
+                c.furthestSeeingDistanceAtNight = p.furthestSeeingDistanceAtNight;
+                c.furthestUnderWaterSeeingDistanceDuringDayTime = p.furthestUnderWaterSeeingDistanceDuringDayTime;
+                c.furthestUnderWaterSeeingDistanceAtTwilight = p.furthestUnderWaterSeeingDistanceAtTwilight;
+                c.furthestUnderWaterSeeingDistanceAtNight = p.furthestUnderWaterSeeingDistanceAtNight;
+                c.fieldOfView = p.fieldOfView;
+                c.crySound = p.crySound;
+                c.noiseSound = p.noiseSound;
+                c.highestMouthHeight = p.highestMouthHeight;
+                c.canEatAtHeight = p.canEatAtHeight;
+                c.doesEatingDamage = p.doesEatingDamage;
+                c.filterFeeder = p.filterFeeder;
+                c.canGlow = p.canGlow;
+                c.alwaysGlowing = p.alwaysGlowing;
+                c.glowing = p.alwaysGlowing;
+                c.canHangAsBaby = p.canHangAsBaby;
+                c.canHangFromBranch = p.canHangFromBranch;
+                c.canHangUpsideDownFromBranch = p.canHangUpsideDownFromBranch;
+                c.hasLiquidStorage = p.hasLiquidStorage;
+                c.minimumTemperatureThisOrganismCanHandle = p.minimumTemperatureThisOrganismCanHandle;
+                c.maximumTemperatureThisOrganismCanHandle = p.maximumTemperatureThisOrganismCanHandle;
+                c.dailyHealthLossOutsideTemperatureRange = p.dailyHealthLossOutsideTemperatureRange;
+                c.dailyHealthLossWhileSuffocating = p.dailyHealthLossWhileSuffocating;
+                c.dailyHealthLossBelowCurrentSpeedThreshold = p.dailyHealthLossBelowCurrentSpeedThreshold;
+                c.pregnancyTime = p.pregnancyTime;
+                c.timeInEgg = p.timeInEgg;
+                c.attack = p.attack;
+                c.armor = p.armor;
+                c.defenseForEatingSpikes = p.defenseForEatingSpikes;
+                c.venomStrength = p.venomStrength;
+                c.avoidsHeat = p.avoidsHeat;
+                c.avoidsCold = p.avoidsCold;
+                c.ableToBuildNest = p.ableToBuildNest;
+                c.energyNeededForNestCreation = p.energyNeededForNestCreation;
+                c.canHibernate = p.canHibernate;
+                c.providesMilk = p.providesMilk;
+                c.canBlow = p.canBlow;
+                c.canHideInShell = p.canHideInShell;
+                c.canMakeNoise = p.canMakeNoise;
+                c.noiseDuringMovement = p.noiseDuringMovement;
+                c.callSoundPack = p.callSoundPack;
+                c.callSoundPackReferenceBodySize = p.callSoundPackReferenceBodySize;
+                c.genericNoiseSoundPack = p.genericNoiseSoundPack;
+                c.genericNoiseSoundPackReferenceBodySize = p.genericNoiseSoundPackReferenceBodySize;
+                c.movementNoiseSoundPack = p.movementNoiseSoundPack;
+                c.movementNoiseSoundPackReferenceBodySize = p.movementNoiseSoundPackReferenceBodySize;
+                c.offSpringSexChances = p.offSpringSexChances;
+                c.libraryProfile = p.libraryProfile;
             }
 
             HormoneDefinition[] hormones = pDef.hormones;
@@ -4236,7 +4604,6 @@ namespace SaplingRustBridge.Patches
                 c.hormoneLevels = hl;
             }
 
-            c.libraryProfile = p.libraryProfile;
             p.nrOfChildren++;
             return c;
         }
@@ -4250,11 +4617,11 @@ namespace SaplingRustBridge.Patches
             ref AnimalDefinition __result)
         {
             if (!Enabled || __instance == null || animalA == null || animalB == null) return true;
-            __result = BlendAnimalsFast(__instance, animalA, animalB);
+            __result = BlendAnimalsFast(__instance, animalA, animalB, animalA.currentSex);
             return false;
         }
 
-        private static AnimalDefinition BlendAnimalsFast(AnimalBlender blender, AnimalDefinition animalA, AnimalDefinition animalB)
+        private static AnimalDefinition BlendAnimalsFast(AnimalBlender blender, AnimalDefinition animalA, AnimalDefinition animalB, int preserveSex)
         {
             if (animalA.definitionIndex == animalB.definitionIndex)
             {
@@ -4321,6 +4688,12 @@ namespace SaplingRustBridge.Patches
                 }
                 dst.instincts = instCopy;
             }
+
+            // Preserve the rolled offspring sex (vanilla AnimalDefinition.Clone() accidentally resets
+            // currentSex to 0, wiping out all non-zero sexes once mutations cause blending).
+            int targetSex = preserveSex >= 0 ? preserveSex : animalA.currentSex;
+            if (dst.sexes == null || targetSex > dst.sexes.Length) targetSex = 0;
+            dst.currentSex = targetSex;
 
             blender.madeChanges = true;
             return dst;
@@ -4542,7 +4915,7 @@ namespace SaplingRustBridge.Patches
                 InstinctDefinition[] iArr = new InstinctDefinition[iLen];
                 for (int i = 0; i < iLen; i++)
                 {
-                    iArr[i] = src._instincts[i].Clone() as InstinctDefinition;
+                    iArr[i] = (InstinctDefinition)_memberwiseClone(src._instincts[i]);
                 }
                 dst._instincts = iArr;
             }
@@ -5095,7 +5468,7 @@ namespace SaplingRustBridge.Patches
                                 c.movementNoiseSoundPack = limb.soundPack as string;
                                 c.movementNoiseSoundPackReferenceBodySize = limb.soundPackReferenceBodySize;
                             }
-                            string atkFx = importer.ImportAttackParticleEffect(limb.shapeName);
+                            string atkFx = GetAttackParticleEffectFast(importer, limb.shapeName);
                             if (atkFx != string.Empty) c.attackParticleEffect = atkFx;
                             if (c.libraryProfile.parameter1 == 0 || c.libraryProfile.parameter1 == -1)
                                 c.libraryProfile.parameter1 = limb.shapeIndex;
@@ -5222,21 +5595,13 @@ namespace SaplingRustBridge.Patches
                                 c.genericNoiseSoundPackReferenceBodySize = acc.soundPackReferenceBodySize;
                             }
                             if (side == TorsoPartSide.Side) c.drag += acc.drag;
-                            string atkFx = importer.ImportAttackParticleEffect(acc.shapeName);
+                            string atkFx = GetAttackParticleEffectFast(importer, acc.shapeName);
                             if (atkFx != string.Empty) c.attackParticleEffect = atkFx;
                         }
 
                         if (!c.hasSecondaryColor)
                         {
-                            c.hasSecondaryColor = importer.ImportMaterialType(part.shapeName) == MaterialType.Secondary;
-                            if (!c.hasSecondaryColor)
-                            {
-                                c.hasSecondaryColor = importer.ImportSpecialMaterialType(part.shapeName) == MaterialType.Secondary;
-                                if (!c.hasSecondaryColor)
-                                {
-                                    c.hasSecondaryColor = importer.ImportLightIntensityOfBodyPartShape(part.shapeName) > 0f;
-                                }
-                            }
+                            c.hasSecondaryColor = HasSecondaryColorFast(importer, part.shapeName);
                         }
                     }
                 }
@@ -5528,6 +5893,94 @@ namespace SaplingRustBridge.Patches
             a.libraryProfile = s.libraryProfile;
         }
 
+        private static void ChangeInstinctsAndDietFast(AnimalDefinition animal, AnimalStatsCalculator calc)
+        {
+            InstinctDefinition[] inst = animal.instincts;
+            if (inst != null && inst.Length > 0)
+            {
+                bool canSee = calc.canSee;
+                bool canHear = calc.canHear;
+                bool canGlow = calc.canGlow;
+                float minColor = calc.colorSeeingMinLimit;
+                float maxColor = calc.colorSeeingMaxLimit;
+                float minPitch = calc.lowestDetectablePitch;
+                float maxPitch = calc.highestDetectablePitch;
+
+                int kept = 0;
+                for (int i = 0; i < inst.Length; i++)
+                {
+                    InstinctDefinition d = inst[i];
+                    InstinctConditionSense sense = d.conditionSense;
+                    if ((sense == InstinctConditionSense.See && !canSee) ||
+                        (sense == InstinctConditionSense.Hear && !canHear))
+                    {
+                        continue;
+                    }
+                    if (sense == InstinctConditionSense.See)
+                    {
+                        float x = d.conditionRange.x;
+                        float y = d.conditionRange.y;
+                        d.conditionRange = new Vector2(
+                            x < 0f ? 0f : (x > minColor ? minColor : x),
+                            y < maxColor ? maxColor : (y > 1f ? 1f : y));
+                    }
+                    else if (sense == InstinctConditionSense.Hear)
+                    {
+                        float x = d.conditionRange.x;
+                        float y = d.conditionRange.y;
+                        d.conditionRange = new Vector2(
+                            x < minPitch ? minPitch : (x > maxPitch ? maxPitch : x),
+                            y < minPitch ? minPitch : (y > maxPitch ? maxPitch : y));
+                    }
+                    if (d.action == InstinctAction.Glow && !canGlow)
+                    {
+                        d.action = InstinctAction.Cry;
+                    }
+                    kept++;
+                }
+
+                if (kept != inst.Length)
+                {
+                    InstinctDefinition[] filtered = new InstinctDefinition[kept];
+                    int w = 0;
+                    for (int i = 0; i < inst.Length; i++)
+                    {
+                        InstinctDefinition d = inst[i];
+                        InstinctConditionSense sense = d.conditionSense;
+                        if ((sense == InstinctConditionSense.See && !canSee) ||
+                            (sense == InstinctConditionSense.Hear && !canHear))
+                        {
+                            continue;
+                        }
+                        filtered[w++] = d;
+                    }
+                    animal.instincts = filtered;
+                }
+            }
+
+            if (!calc.canSee)
+            {
+                Vector2 full = new Vector2(0f, 1f);
+                animal.invertFruitDietColorRange = false;
+                animal.fruitDietHueRange = full;
+                animal.invertSoftPlantTissueDietColorRange = false;
+                animal.softPlantTissueDietHueRange = full;
+                animal.invertWholeAnimalDietColorRange = false;
+                animal.wholeAnimalDietHueRange = full;
+            }
+            else
+            {
+                float minColor = calc.colorSeeingMinLimit;
+                float maxColor = calc.colorSeeingMaxLimit;
+                Vector2 f = animal.fruitDietHueRange;
+                animal.fruitDietHueRange = new Vector2(Mathf.Clamp(f.x, 0f, minColor), Mathf.Clamp(f.y, maxColor, 1f));
+                Vector2 s = animal.softPlantTissueDietHueRange;
+                animal.softPlantTissueDietHueRange = new Vector2(Mathf.Clamp(s.x, 0f, minColor), Mathf.Clamp(s.y, maxColor, 1f));
+                Vector2 w = animal.wholeAnimalDietHueRange;
+                animal.wholeAnimalDietHueRange = new Vector2(Mathf.Clamp(w.x, 0f, minColor), Mathf.Clamp(w.y, maxColor, 1f));
+            }
+        }
+
         private static bool ProcessNewAnimalDefinitionFast(TimeLine tl, LivingAnimal animal, LivingAnimal parent, CellLocationType locationType, bool newDefinitionIndex)
         {
             if (_sharedCalcA == null) _sharedCalcA = new AnimalStatsCalculator(tl.importer, tl.gravity);
@@ -5538,7 +5991,7 @@ namespace SaplingRustBridge.Patches
             CalculateAnimalStatsFast(_sharedCalcA, animal.definition, primaryIsYoung);
             ApplyStatsToLivingAnimal(animal, _sharedCalcA);
 
-            tl.ChangeInstinctsAndDietToMatchSensingRangesAndPossibleActions(animal.definition, _sharedCalcA);
+            ChangeInstinctsAndDietFast(animal.definition, _sharedCalcA);
 
             ResetAnimalStatsCalculator(_sharedCalcB, tl.importer, tl.gravity);
             CalculateAnimalStatsFast(_sharedCalcB, animal.definition, !primaryIsYoung);
@@ -5599,6 +6052,3029 @@ namespace SaplingRustBridge.Patches
                 }
                 return true;
             }
+            return false;
+        }
+
+        // =========================================================================
+        // 24. Cached Shape Graph + Fast OrganismObjectFileImporter & OrganismDefinition
+        //     Eliminates ~300-500 boxed Boo Hashtable/RuntimeServices lookups per
+        //     mutation inside GetAvailableShapeIndicesForOrganism & Create*WithShapeIndex
+        //     (OrganismDefinition.cs:72-204, OrganismObjectFileImporter.cs:3402-4142)
+        // =========================================================================
+        private struct ShapeGraphEntry
+        {
+            public int Index;
+            public int Parent;
+            public bool BottomOnly;
+            public bool CanGlideOrFly;
+            public bool CanWalk;
+        }
+
+        private sealed class BodyPartShapeGraph
+        {
+            public ShapeGraphEntry[] Entries;
+            public Dictionary<int, int> ParentByShape;
+            public Dictionary<int, ShapeGraphEntry> EntryByShape;
+            public int[] RootIndices;
+        }
+
+        private static readonly Dictionary<string, BodyPartShapeGraph> _shapeGraphCache = new Dictionary<string, BodyPartShapeGraph>(16, StringComparer.Ordinal);
+        private static readonly List<int> _availAllScratch = new List<int>(64);
+        private static readonly List<int> _availFlyScratch = new List<int>(32);
+        private static readonly List<int> _availWalkScratch = new List<int>(32);
+        private static int[] _availCurParentsScratch = new int[32];
+        private static readonly int[] _kneeOnlyResult = new int[1] { 8 };
+
+        private static readonly Dictionary<int, LeafDefinition> _precreatedLeaves = new Dictionary<int, LeafDefinition>(64);
+        private static readonly Dictionary<int, PollinationOrganDefinition> _precreatedPollenOrgans = new Dictionary<int, PollinationOrganDefinition>(64);
+        private static readonly Dictionary<int, PlantAccessoireDefinition> _precreatedPlantAccessoires = new Dictionary<int, PlantAccessoireDefinition>(32);
+        private static readonly Dictionary<int, SeedDefinition> _precreatedSeeds = new Dictionary<int, SeedDefinition>(64);
+
+        private static BodyPartShapeGraph GetOrBuildShapeGraph(OrganismObjectFileImporter importer, string bodyPartName)
+        {
+            if (!importer.importFinished) importer.ImportAllFiles();
+            EnsureImporterCache(importer);
+
+            BodyPartShapeGraph graph;
+            if (_shapeGraphCache.TryGetValue(bodyPartName, out graph)) return graph;
+
+            graph = new BodyPartShapeGraph();
+            Dictionary<int, int> parentDict = importer.parentIndexPerBodyPartType != null
+                ? (importer.parentIndexPerBodyPartType[bodyPartName] as Dictionary<int, int>)
+                : null;
+            graph.ParentByShape = parentDict;
+
+            Dictionary<int, string> shapeDict = importer.shapeNamesPerBodyPartName != null
+                ? (importer.shapeNamesPerBodyPartName[bodyPartName] as Dictionary<int, string>)
+                : null;
+
+            if (shapeDict == null || shapeDict.Count == 0)
+            {
+                graph.Entries = new ShapeGraphEntry[0];
+                graph.EntryByShape = new Dictionary<int, ShapeGraphEntry>(0);
+                graph.RootIndices = _emptyIntArray;
+                _shapeGraphCache[bodyPartName] = graph;
+                return graph;
+            }
+
+            ShapeGraphEntry[] entries = new ShapeGraphEntry[shapeDict.Count];
+            Dictionary<int, ShapeGraphEntry> byShape = new Dictionary<int, ShapeGraphEntry>(shapeDict.Count);
+            List<int> roots = new List<int>(16);
+            HashSet<int> bottomOnlySet = importer.bottomOnlyLimbIndices;
+            Hashtable glideTable = importer.canGlideOrFlyPerShapeIndex;
+            Hashtable walkTable = importer.canWalkPerShapeIndex;
+
+            int idx = 0;
+            foreach (KeyValuePair<int, string> kv in shapeDict)
+            {
+                int key = kv.Key;
+                int parent = -1;
+                if (parentDict != null)
+                {
+                    int pVal;
+                    if (parentDict.TryGetValue(key, out pVal)) parent = pVal;
+                }
+                bool bottomOnly = bottomOnlySet != null && bottomOnlySet.Contains(key);
+                bool canGlide = false;
+                if (glideTable != null)
+                {
+                    object gv = glideTable[key];
+                    if (gv is bool && (bool)gv) canGlide = true;
+                }
+                bool canWalk = false;
+                if (walkTable != null)
+                {
+                    object wv = walkTable[key];
+                    if (wv is bool && (bool)wv) canWalk = true;
+                }
+
+                ShapeGraphEntry e = new ShapeGraphEntry
+                {
+                    Index = key,
+                    Parent = parent,
+                    BottomOnly = bottomOnly,
+                    CanGlideOrFly = canGlide,
+                    CanWalk = canWalk
+                };
+                entries[idx++] = e;
+                byShape[key] = e;
+                if (parent == -1) roots.Add(key);
+            }
+
+            graph.Entries = entries;
+            graph.EntryByShape = byShape;
+            graph.RootIndices = roots.ToArray();
+            _shapeGraphCache[bodyPartName] = graph;
+            return graph;
+        }
+
+        private static bool AddUniqueInt(List<int> list, int val)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i] == val) return false;
+            }
+            list.Add(val);
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.ImportParentIndex))]
+        [HarmonyPrefix]
+        public static bool OrganismObjectFileImporter_ImportParentIndex_Prefix(
+            OrganismObjectFileImporter __instance,
+            string bodyPartType,
+            int shapeIndex,
+            ref int __result)
+        {
+            if (!Enabled || __instance == null || bodyPartType == null) return true;
+            BodyPartShapeGraph graph = GetOrBuildShapeGraph(__instance, bodyPartType);
+            int p;
+            __result = (graph.ParentByShape != null && graph.ParentByShape.TryGetValue(shapeIndex, out p)) ? p : -1;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(OrganismDefinition), nameof(OrganismDefinition.GetAllRootShapeIndices))]
+        [HarmonyPrefix]
+        public static bool OrganismDefinition_GetAllRootShapeIndices_Prefix(
+            string bodyPartName,
+            OrganismObjectFileImporter organismObjectFileImporter,
+            ref int[] __result)
+        {
+            if (!Enabled || organismObjectFileImporter == null || bodyPartName == null) return true;
+            __result = GetOrBuildShapeGraph(organismObjectFileImporter, bodyPartName).RootIndices;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(OrganismDefinition), nameof(OrganismDefinition.GetAvailableShapeIndicesForOrganism),
+            new Type[] { typeof(int[]), typeof(string), typeof(OrganismObjectFileImporter), typeof(bool), typeof(bool), typeof(bool), typeof(bool) })]
+        [HarmonyPrefix]
+        public static bool OrganismDefinition_GetAvailableShapeIndicesForOrganism_Prefix(
+            int[] currentShapeIndices,
+            string bodyPartName,
+            OrganismObjectFileImporter organismObjectFileImporter,
+            bool includePrimitiveForm,
+            bool shouldWalk,
+            bool shouldBeKnee,
+            bool bottomOnlyLimbsAllowed,
+            ref int[] __result)
+        {
+            if (!Enabled || organismObjectFileImporter == null || bodyPartName == null || currentShapeIndices == null) return true;
+
+            BodyPartShapeGraph graph = GetOrBuildShapeGraph(organismObjectFileImporter, bodyPartName);
+            ShapeGraphEntry[] entries = graph.Entries;
+            Dictionary<int, int> parentDict = graph.ParentByShape;
+
+            int curLen = currentShapeIndices.Length;
+            if (curLen > _availCurParentsScratch.Length)
+            {
+                _availCurParentsScratch = new int[curLen * 2];
+            }
+            for (int i = 0; i < curLen; i++)
+            {
+                int p = -1;
+                if (parentDict != null)
+                {
+                    int pv;
+                    if (parentDict.TryGetValue(currentShapeIndices[i], out pv)) p = pv;
+                }
+                _availCurParentsScratch[i] = p;
+            }
+
+            bool preferFly = (bodyPartName == "Limb" && !(UnityEngine.Random.value <= 0.25f));
+            _availAllScratch.Clear();
+            _availFlyScratch.Clear();
+            _availWalkScratch.Clear();
+
+            for (int eIdx = 0; eIdx < entries.Length; eIdx++)
+            {
+                ShapeGraphEntry e = entries[eIdx];
+                if (!bottomOnlyLimbsAllowed && e.BottomOnly) continue;
+
+                int key = e.Index;
+                int num = e.Parent;
+                if (num == -1)
+                {
+                    if (includePrimitiveForm && AddUniqueInt(_availAllScratch, key))
+                    {
+                        if (shouldBeKnee && key == 8)
+                        {
+                            __result = _kneeOnlyResult;
+                            return false;
+                        }
+                        if (preferFly && e.CanGlideOrFly) _availFlyScratch.Add(key);
+                        if (shouldWalk && e.CanWalk) _availWalkScratch.Add(key);
+                    }
+                    continue;
+                }
+
+                for (int i = 0; i < curLen; i++)
+                {
+                    int num2 = currentShapeIndices[i];
+                    int num3 = _availCurParentsScratch[i];
+                    if ((key == num2 || num == num2 || num == num3) && AddUniqueInt(_availAllScratch, key))
+                    {
+                        if (shouldBeKnee && key == 8)
+                        {
+                            __result = _kneeOnlyResult;
+                            return false;
+                        }
+                        if (preferFly && e.CanGlideOrFly) _availFlyScratch.Add(key);
+                        if (shouldWalk && e.CanWalk) _availWalkScratch.Add(key);
+                    }
+                    if (key == num2 && num != -1)
+                    {
+                        ShapeGraphEntry pe;
+                        bool hasPe = graph.EntryByShape.TryGetValue(num, out pe);
+                        bool pBottomOnly = hasPe ? pe.BottomOnly : (organismObjectFileImporter.bottomOnlyLimbIndices != null && organismObjectFileImporter.bottomOnlyLimbIndices.Contains(num));
+                        if ((bottomOnlyLimbsAllowed || !pBottomOnly) && AddUniqueInt(_availAllScratch, num))
+                        {
+                            if (preferFly && hasPe && pe.CanGlideOrFly) _availFlyScratch.Add(num);
+                            if (shouldWalk && hasPe && pe.CanWalk) _availWalkScratch.Add(num);
+                        }
+                    }
+                }
+            }
+
+            if (shouldWalk && _availWalkScratch.Count > 0)
+            {
+                __result = _availWalkScratch.ToArray();
+            }
+            else if (preferFly && _availFlyScratch.Count > 0)
+            {
+                __result = _availFlyScratch.ToArray();
+            }
+            else
+            {
+                __result = _availAllScratch.ToArray();
+            }
+            return false;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreateLimbWithShapeIndex))]
+        [HarmonyPrefix]
+        public static bool CreateLimbWithShapeIndex_Prefix(OrganismObjectFileImporter __instance, int index, ref LimbDefinition __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            LimbDefinition tmpl;
+            if (__instance.precreatedLimbs != null && __instance.precreatedLimbs.TryGetValue(index, out tmpl) && tmpl != null)
+            {
+                __result = (LimbDefinition)_memberwiseClone(tmpl);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreateMouthWithShapeIndex))]
+        [HarmonyPrefix]
+        public static bool CreateMouthWithShapeIndex_Prefix(OrganismObjectFileImporter __instance, int index, ref MouthDefinition __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            MouthDefinition tmpl;
+            if (__instance.precreatedMouths != null && __instance.precreatedMouths.TryGetValue(index, out tmpl) && tmpl != null)
+            {
+                __result = (MouthDefinition)_memberwiseClone(tmpl);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreateEarWithShapeIndex))]
+        [HarmonyPrefix]
+        public static bool CreateEarWithShapeIndex_Prefix(OrganismObjectFileImporter __instance, int index, ref EarDefinition __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            EarDefinition tmpl;
+            if (__instance.precreatedEars != null && __instance.precreatedEars.TryGetValue(index, out tmpl) && tmpl != null)
+            {
+                __result = (EarDefinition)_memberwiseClone(tmpl);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreateEyeWithShapeIndex))]
+        [HarmonyPrefix]
+        public static bool CreateEyeWithShapeIndex_Prefix(OrganismObjectFileImporter __instance, int index, ref EyeDefinition __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            EyeDefinition tmpl;
+            if (__instance.precreatedEyes != null && __instance.precreatedEyes.TryGetValue(index, out tmpl) && tmpl != null)
+            {
+                __result = (EyeDefinition)_memberwiseClone(tmpl);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreateAnimalAccessoireWithShapeIndex))]
+        [HarmonyPrefix]
+        public static bool CreateAnimalAccessoireWithShapeIndex_Prefix(OrganismObjectFileImporter __instance, int index, ref AnimalAccessoireDefinition __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            AnimalAccessoireDefinition tmpl;
+            if (__instance.precreatedAnimalAccessoires != null && __instance.precreatedAnimalAccessoires.TryGetValue(index, out tmpl) && tmpl != null)
+            {
+                __result = (AnimalAccessoireDefinition)_memberwiseClone(tmpl);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreateLeafWithShapeIndex))]
+        [HarmonyPrefix]
+        public static bool CreateLeafWithShapeIndex_Prefix(OrganismObjectFileImporter __instance, int index, ref LeafDefinition __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            EnsureImporterCache(__instance);
+            LeafDefinition tmpl;
+            if (_precreatedLeaves.TryGetValue(index, out tmpl))
+            {
+                __result = (LeafDefinition)_memberwiseClone(tmpl);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreateLeafWithShapeIndex))]
+        [HarmonyPostfix]
+        public static void CreateLeafWithShapeIndex_Postfix(OrganismObjectFileImporter __instance, int index, LeafDefinition __result)
+        {
+            if (!Enabled || __instance == null || __result == null || _memberwiseClone == null) return;
+            EnsureImporterCache(__instance);
+            if (!_precreatedLeaves.ContainsKey(index)) _precreatedLeaves[index] = (LeafDefinition)_memberwiseClone(__result);
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreatePollinationOrganWithShapeIndex))]
+        [HarmonyPrefix]
+        public static bool CreatePollinationOrganWithShapeIndex_Prefix(OrganismObjectFileImporter __instance, int index, ref PollinationOrganDefinition __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            EnsureImporterCache(__instance);
+            PollinationOrganDefinition tmpl;
+            if (_precreatedPollenOrgans.TryGetValue(index, out tmpl))
+            {
+                __result = (PollinationOrganDefinition)_memberwiseClone(tmpl);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreatePollinationOrganWithShapeIndex))]
+        [HarmonyPostfix]
+        public static void CreatePollinationOrganWithShapeIndex_Postfix(OrganismObjectFileImporter __instance, int index, PollinationOrganDefinition __result)
+        {
+            if (!Enabled || __instance == null || __result == null || _memberwiseClone == null) return;
+            EnsureImporterCache(__instance);
+            if (!_precreatedPollenOrgans.ContainsKey(index)) _precreatedPollenOrgans[index] = (PollinationOrganDefinition)_memberwiseClone(__result);
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreatePlantAccessoireWithShapeIndex))]
+        [HarmonyPrefix]
+        public static bool CreatePlantAccessoireWithShapeIndex_Prefix(OrganismObjectFileImporter __instance, int index, ref PlantAccessoireDefinition __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            EnsureImporterCache(__instance);
+            PlantAccessoireDefinition tmpl;
+            if (_precreatedPlantAccessoires.TryGetValue(index, out tmpl))
+            {
+                __result = (PlantAccessoireDefinition)_memberwiseClone(tmpl);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreatePlantAccessoireWithShapeIndex))]
+        [HarmonyPostfix]
+        public static void CreatePlantAccessoireWithShapeIndex_Postfix(OrganismObjectFileImporter __instance, int index, PlantAccessoireDefinition __result)
+        {
+            if (!Enabled || __instance == null || __result == null || _memberwiseClone == null) return;
+            EnsureImporterCache(__instance);
+            if (!_precreatedPlantAccessoires.ContainsKey(index)) _precreatedPlantAccessoires[index] = (PlantAccessoireDefinition)_memberwiseClone(__result);
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreateSeedWithShapeIndex))]
+        [HarmonyPrefix]
+        public static bool CreateSeedWithShapeIndex_Prefix(OrganismObjectFileImporter __instance, int index, ref SeedDefinition __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            EnsureImporterCache(__instance);
+            SeedDefinition tmpl;
+            if (_precreatedSeeds.TryGetValue(index, out tmpl))
+            {
+                __result = (SeedDefinition)_memberwiseClone(tmpl);
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectFileImporter), nameof(OrganismObjectFileImporter.CreateSeedWithShapeIndex))]
+        [HarmonyPostfix]
+        public static void CreateSeedWithShapeIndex_Postfix(OrganismObjectFileImporter __instance, int index, SeedDefinition __result)
+        {
+            if (!Enabled || __instance == null || __result == null || _memberwiseClone == null) return;
+            EnsureImporterCache(__instance);
+            if (!_precreatedSeeds.ContainsKey(index)) _precreatedSeeds[index] = (SeedDefinition)_memberwiseClone(__result);
+        }
+
+        // =========================================================================
+        // 25. Zero-Waste AnimalDefinition Body-Part Queries + AnimalMutator Hot Path
+        //     Eliminates ~500-1,000 wasted AnimalLocation/Enum.GetValues allocations
+        //     per mutation and removes the dead "discs on the side" debug scan loops.
+        // =========================================================================
+        private static readonly List<int> _shapeIdxScratch = new List<int>(16);
+        private static readonly List<BodyPartDefinition> _allBodyPartsScratch = new List<BodyPartDefinition>(16);
+        private static readonly int[] _upgradeTypesAll = new int[5] { 4, 5, 6, 7, 10 };
+        private static readonly int[] _upgradeTypesWalk = new int[2] { 4, 5 };
+
+        [HarmonyPatch(typeof(AnimalDefinition), nameof(AnimalDefinition.GetAllLocationsOfChildrenWithType))]
+        [HarmonyPrefix]
+        public static bool AnimalDefinition_GetAllLocationsOfChildrenWithType_Prefix(
+            AnimalDefinition __instance,
+            int typeIndex,
+            bool youngVersion,
+            ref List<AnimalLocation> __result)
+        {
+            if (!Enabled || __instance == null || __instance.torso == null) return true;
+
+            List<AnimalLocation> list = new List<AnimalLocation>(4);
+            TorsoPartDefinition[] torso = __instance.torso;
+            bool useMorph = youngVersion || __instance.MorphNeedsToBeUsed();
+            Dictionary<BodyPartDiffLocation, BodyPartDiff> morphDiffs = useMorph ? __instance.GetMorph(youngVersion).bodyPartDiffs : null;
+            bool hasDiffs = morphDiffs != null && morphDiffs.Count > 0;
+
+            for (int i = 0; i < torso.Length; i++)
+            {
+                Dictionary<TorsoPartDetailedLocation, BodyPartDefinition> kids = torso[i].children;
+                if (kids == null || kids.Count == 0) continue;
+                foreach (KeyValuePair<TorsoPartDetailedLocation, BodyPartDefinition> kv in kids)
+                {
+                    if (hasDiffs)
+                    {
+                        BodyPartDiffLocation dKey = new BodyPartDiffLocation { torsoPart = i, side = kv.Key.side, offset = kv.Key.locationOffset };
+                        if (morphDiffs.ContainsKey(dKey)) continue;
+                    }
+                    BodyPartDefinition bp = kv.Value;
+                    if (bp != null && bp.bodyPartTypeIndex == typeIndex)
+                    {
+                        AnimalLocation loc = new AnimalLocation(new int[1] { i }, new TorsoPartSide[1] { kv.Key.side });
+                        loc.offset = kv.Key.locationOffset;
+                        list.Add(loc);
+                    }
+                }
+            }
+
+            if (hasDiffs)
+            {
+                foreach (KeyValuePair<BodyPartDiffLocation, BodyPartDiff> dkv in morphDiffs)
+                {
+                    int tIdx = dkv.Key.torsoPart;
+                    if (tIdx >= 0 && tIdx < torso.Length &&
+                        dkv.Value.type == BodyPartDiffType.OtherBodyPart &&
+                        dkv.Value.otherBodyPartTypeIndex == typeIndex)
+                    {
+                        AnimalLocation loc = new AnimalLocation(new int[1] { tIdx }, new TorsoPartSide[1] { dkv.Key.side });
+                        loc.offset = dkv.Key.offset;
+                        list.Add(loc);
+                    }
+                }
+            }
+
+            __result = list;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(AnimalDefinition), nameof(AnimalDefinition.GetShapeIndicesForBodyPartOfType))]
+        [HarmonyPrefix]
+        public static bool AnimalDefinition_GetShapeIndicesForBodyPartOfType_Prefix(
+            AnimalDefinition __instance,
+            int typeIndex,
+            object youngVersion,
+            ref int[] __result)
+        {
+            if (!Enabled || __instance == null || __instance.torso == null) return true;
+
+            bool young = (youngVersion is bool) ? (bool)youngVersion : (youngVersion != null && Convert.ToBoolean(youngVersion));
+            _shapeIdxScratch.Clear();
+            TorsoPartDefinition[] torso = __instance.torso;
+            bool useMorph = young || __instance.MorphNeedsToBeUsed();
+            Dictionary<BodyPartDiffLocation, BodyPartDiff> morphDiffs = useMorph ? __instance.GetMorph(young).bodyPartDiffs : null;
+            bool hasDiffs = morphDiffs != null && morphDiffs.Count > 0;
+
+            for (int i = 0; i < torso.Length; i++)
+            {
+                Dictionary<TorsoPartDetailedLocation, BodyPartDefinition> kids = torso[i].children;
+                if (kids == null || kids.Count == 0) continue;
+                foreach (KeyValuePair<TorsoPartDetailedLocation, BodyPartDefinition> kv in kids)
+                {
+                    if (hasDiffs)
+                    {
+                        BodyPartDiffLocation dKey = new BodyPartDiffLocation { torsoPart = i, side = kv.Key.side, offset = kv.Key.locationOffset };
+                        if (morphDiffs.ContainsKey(dKey)) continue;
+                    }
+                    BodyPartDefinition bp = kv.Value;
+                    if (bp != null && bp.bodyPartTypeIndex == typeIndex)
+                    {
+                        _shapeIdxScratch.Add(bp.shapeIndex);
+                    }
+                }
+            }
+
+            if (hasDiffs)
+            {
+                foreach (KeyValuePair<BodyPartDiffLocation, BodyPartDiff> dkv in morphDiffs)
+                {
+                    int tIdx = dkv.Key.torsoPart;
+                    if (tIdx >= 0 && tIdx < torso.Length &&
+                        dkv.Value.type == BodyPartDiffType.OtherBodyPart &&
+                        dkv.Value.otherBodyPartTypeIndex == typeIndex)
+                    {
+                        _shapeIdxScratch.Add(dkv.Value.otherBodyPartShapeIndex);
+                    }
+                }
+            }
+
+            __result = (_shapeIdxScratch.Count == 0) ? _emptyIntArray : _shapeIdxScratch.ToArray();
+            return false;
+        }
+
+        [HarmonyPatch(typeof(AnimalDefinition), nameof(AnimalDefinition.GetAllBodyParts), new Type[] { typeof(bool) })]
+        [HarmonyPrefix]
+        public static bool AnimalDefinition_GetAllBodyParts_Prefix(
+            AnimalDefinition __instance,
+            bool scalableOnly,
+            ref BodyPartDefinition[] __result)
+        {
+            if (!Enabled || __instance == null || __instance.torso == null) return true;
+
+            _allBodyPartsScratch.Clear();
+            TorsoPartDefinition[] torso = __instance.torso;
+            for (int i = 0; i < torso.Length; i++)
+            {
+                Dictionary<TorsoPartDetailedLocation, BodyPartDefinition> kids = torso[i].children;
+                if (kids == null || kids.Count == 0) continue;
+                foreach (KeyValuePair<TorsoPartDetailedLocation, BodyPartDefinition> kv in kids)
+                {
+                    BodyPartDefinition bp = kv.Value;
+                    if (bp != null && (!scalableOnly || bp.bodyPartTypeIndex == 7 || bp.bodyPartTypeIndex == 10))
+                    {
+                        _allBodyPartsScratch.Add(bp);
+                    }
+                }
+            }
+            __result = _allBodyPartsScratch.ToArray();
+            return false;
+        }
+
+        [HarmonyPatch(typeof(AnimalMutator), nameof(AnimalMutator.SmallColorChange))]
+        [HarmonyPrefix]
+        public static bool AnimalMutator_SmallColorChange_Prefix(AnimalDefinition animal)
+        {
+            if (!Enabled || animal == null) return true;
+            SmallColorChangeFast(animal);
+            return false;
+        }
+
+        private static void SmallColorChangeFast(AnimalDefinition animal)
+        {
+            const float step = 0.05f;
+            animal.colorHue = Mathf.Clamp(animal.colorHue + (UnityEngine.Random.Range(0, 2) == 0 ? step : -step), 0f, 1f);
+            animal.colorBrightness = Mathf.Clamp(animal.colorBrightness + (UnityEngine.Random.Range(0, 2) == 0 ? step : -step), 0f, 1f);
+            animal.secondaryColorHue = Mathf.Clamp(animal.secondaryColorHue + (UnityEngine.Random.Range(0, 2) == 0 ? step : -step), 0f, 1f);
+            animal.secondaryColorBrightness = Mathf.Clamp(animal.secondaryColorBrightness + (UnityEngine.Random.Range(0, 2) == 0 ? step : -step), 0f, 1f);
+            AnimalMorph morph = animal.GetMorph(true);
+            morph.colorHue = animal.colorHue;
+            morph.colorBrightness = animal.colorBrightness;
+            morph.secondaryColorHue = animal.secondaryColorHue;
+            morph.secondaryColorBrightness = animal.secondaryColorBrightness;
+            animal.SetMorph(morph, true);
+        }
+
+        [HarmonyPatch(typeof(AnimalMutator), nameof(AnimalMutator.MutateAnimalDefinition))]
+        [HarmonyPrefix]
+        public static bool AnimalMutator_MutateAnimalDefinition_Prefix(
+            AnimalMutator __instance,
+            AnimalDefinition animal,
+            DetailedFoodType[] detailedFoodTypes,
+            bool encourageWalkingLimb,
+            bool encourageKnee)
+        {
+            if (!Enabled || __instance == null || animal == null) return true;
+
+            __instance.detailedFoodTypes = detailedFoodTypes;
+            animal.cachedMinifiedDescription = null;
+            if (__instance.debugBehaviorOnly)
+            {
+                __instance.mutationOptions = new AnimalMutationType[13]
+                {
+                    AnimalMutationType.GainInstinct, AnimalMutationType.LoseInstinct, AnimalMutationType.ChangeInstinct,
+                    AnimalMutationType.ReorderInstincts, AnimalMutationType.ChangeDiet, AnimalMutationType.NestModification,
+                    AnimalMutationType.AddSex, AnimalMutationType.RemoveSex, AnimalMutationType.RemoveLarvaStage,
+                    AnimalMutationType.RemoveAdultStage, AnimalMutationType.AddHormone, AnimalMutationType.RemoveHormone,
+                    AnimalMutationType.ChangeHormone
+                };
+            }
+            if (__instance.debugTorsoChangesOnly)
+            {
+                __instance.mutationOptions = new AnimalMutationType[4]
+                {
+                    AnimalMutationType.TorsoAddition, AnimalMutationType.TorsoDuplication,
+                    AnimalMutationType.ChildCopy, AnimalMutationType.TorsoModification
+                };
+            }
+
+            AnimalMutationType mt = ((!encourageWalkingLimb || !(UnityEngine.Random.value < __instance.chanceToEncourageWalkingLimbs)) && !encourageKnee && !__instance.encourageMouthDiversity)
+                ? __instance.mutationOptions[UnityEngine.Random.Range(0, __instance.mutationOptions.Length)]
+                : AnimalMutationType.UpgradeChildren;
+
+            __instance.visualSalienceOfLastChange = __instance.visualSaliencePerAnimalMutationType[mt];
+            __instance.lastChangeIncreasedSize = false;
+            __instance.lastChangeDecreasedSize = false;
+            SmallColorChangeFast(animal);
+
+            switch (mt)
+            {
+                case AnimalMutationType.ChildCopy: __instance.CopyChild(animal); break;
+                case AnimalMutationType.ChildAddition: __instance.AddChild(animal); break;
+                case AnimalMutationType.ChildDeletion: __instance.DeleteChild(animal); break;
+                case AnimalMutationType.UpgradeChildren: UpgradeChildrenFast(__instance, animal, encourageWalkingLimb, encourageKnee); break;
+                case AnimalMutationType.ScaleChild: __instance.ScaleChild(animal); break;
+                case AnimalMutationType.TorsoModification: __instance.ModifyTorso(animal); break;
+                case AnimalMutationType.TorsoDeletion: __instance.DeleteTorso(animal); break;
+                case AnimalMutationType.TorsoAddition: __instance.AddTorso(animal); break;
+                case AnimalMutationType.TorsoDuplication: __instance.DuplicateTorso(animal); break;
+                case AnimalMutationType.Color: __instance.ChangeColor(animal); break;
+                case AnimalMutationType.SkinType: __instance.ChangeSkinType(animal); break;
+                case AnimalMutationType.SkinPattern: __instance.ChangeSkinPattern(animal); break;
+                case AnimalMutationType.BodySize: __instance.ChangeBodySize(animal); break;
+                case AnimalMutationType.EmbryoTimeInsideMother: __instance.ChangeEmbryoTimeInSideMother(animal); break;
+                case AnimalMutationType.GainInstinct:
+                    if (animal.instincts.Length >= 5) __instance.LoseInstinct(animal);
+                    else __instance.GainInstinct(animal);
+                    break;
+                case AnimalMutationType.LoseInstinct:
+                    if (animal.instincts.Length == 0) __instance.GainInstinct(animal);
+                    else __instance.LoseInstinct(animal);
+                    break;
+                case AnimalMutationType.ChangeInstinct:
+                    if (animal.instincts.Length == 0) __instance.GainInstinct(animal);
+                    else __instance.ChangeInstinct(animal);
+                    break;
+                case AnimalMutationType.ReorderInstincts:
+                    if (animal.instincts.Length < 2) __instance.GainInstinct(animal);
+                    else __instance.ReorderInstincts(animal);
+                    break;
+                case AnimalMutationType.ChangeDiet: __instance.ChangeDiet(animal); break;
+                case AnimalMutationType.NestModification: __instance.MutateNestingBehavior(animal); break;
+                case AnimalMutationType.HibernationThresholdModification: __instance.MutateHibernationThreshold(animal); break;
+                case AnimalMutationType.EggTemperatureThresholdModification: __instance.MutateEggTemperatureThreshold(animal); break;
+                case AnimalMutationType.EggTypeModification: __instance.MutateEggType(animal); break;
+                case AnimalMutationType.ChangePoisonTraits: __instance.ChangePoisonTraits(animal); break;
+                case AnimalMutationType.AddSex: __instance.AddSex(animal); break;
+                case AnimalMutationType.RemoveSex: __instance.RemoveSex(animal); break;
+                case AnimalMutationType.RemoveLarvaStage: __instance.RemoveLarvaStage(animal); break;
+                case AnimalMutationType.RemoveAdultStage: __instance.RemoveAdultStage(animal); break;
+                case AnimalMutationType.ChangeMatingTraits: __instance.ChangeMatingTraits(animal); break;
+                case AnimalMutationType.ChangeOffspringSexBracket: __instance.ChangeOffspringSexBracket(animal); break;
+                case AnimalMutationType.ChangeSleepPattern: __instance.ChangeSleepPattern(animal); break;
+                case AnimalMutationType.AddHormone: __instance.AddHormone(animal); break;
+                case AnimalMutationType.RemoveHormone: __instance.RemoveHormone(animal); break;
+                case AnimalMutationType.ChangeHormone: __instance.ChangeHormone(animal); break;
+            }
+            return false;
+        }
+
+        // Note: MonoMod/HarmonyX cannot patch Boo's AnimalMutator.UpgradeChildren directly
+        // (IL Compile Error), so MutateAnimalDefinition_Prefix calls this helper directly.
+        private static void UpgradeChildrenFast(
+            AnimalMutator __instance,
+            AnimalDefinition animal,
+            bool encourageWalkingLimb,
+            bool encourageKnee)
+        {
+            if (__instance == null || animal == null) return;
+
+            int typeIdx;
+            if (encourageKnee)
+            {
+                typeIdx = 4;
+            }
+            else if (encourageWalkingLimb && UnityEngine.Random.value < __instance.chanceToEncourageWalkingLimbs)
+            {
+                typeIdx = _upgradeTypesWalk[UnityEngine.Random.Range(0, _upgradeTypesWalk.Length)];
+            }
+            else
+            {
+                typeIdx = _upgradeTypesAll[UnityEngine.Random.Range(0, _upgradeTypesAll.Length)];
+            }
+
+            List<AnimalLocation> locs = animal.GetAllLocationsOfChildrenWithType(typeIdx, false);
+            int locCount = locs.Count;
+            if (locCount == 0) return;
+
+            int pick = UnityEngine.Random.Range(0, locCount);
+            BodyPartDefinition pickedBp = animal.GetBodyPartOnLocation(locs[pick], true);
+            if (pickedBp == null) return;
+            int targetShape = pickedBp.shapeIndex;
+
+            BodyPartDefinition upgradeGoal = null;
+            bool useWalkAlt = false;
+            int keepUpgradeOrdinal = 0;
+            BodyPartDefinition walkAlt = null;
+            bool allowFront = true;
+            bool allowBack = true;
+            bool allowSide = true;
+            bool allowTop = true;
+            bool onlyOnBottom = false;
+            bool mostlyMeat = false;
+
+            switch (typeIdx)
+            {
+                case 4:
+                {
+                    upgradeGoal = __instance.CreateLimbThatCouldEmergeOnAnimal(animal, encourageWalkingLimb, encourageKnee, false);
+                    LimbDefinition limb = upgradeGoal as LimbDefinition;
+                    if (limb == null) return;
+                    if (!limb.canWalk && (limb.canClimb || limb.canGlide || limb.canFly))
+                    {
+                        int matchCount = 0;
+                        for (int i = 0; i < locCount; i++)
+                        {
+                            BodyPartDefinition bp0 = animal.GetBodyPartOnLocation(locs[i], false);
+                            if (bp0 != null && bp0.shapeIndex == targetShape) matchCount++;
+                        }
+                        if (matchCount > 1)
+                        {
+                            walkAlt = __instance.organismObjectFileImporter.CreateWalkingAlternativeLimb(limb.shapeIndex);
+                            if (walkAlt != null)
+                            {
+                                useWalkAlt = true;
+                                keepUpgradeOrdinal = UnityEngine.Random.Range(0, matchCount);
+                            }
+                        }
+                    }
+                    if (__instance.organismObjectFileImporter.ImportSeparateModelForTopAndFrontBodyPartShape(limb.shapeName))
+                    {
+                        int r = UnityEngine.Random.Range(0, 3);
+                        if (r == 0) { allowTop = false; allowFront = false; }
+                        else if (r == 1) { allowTop = false; allowSide = false; }
+                        else { allowFront = false; allowSide = false; }
+                    }
+                    else
+                    {
+                        allowTop = false;
+                        allowFront = false;
+                    }
+                    onlyOnBottom = limb.onlyOnBottom;
+                    break;
+                }
+                case 5:
+                {
+                    upgradeGoal = __instance.CreateMouthThatCouldEmergeOnAnimal(animal);
+                    MouthDefinition mouth = upgradeGoal as MouthDefinition;
+                    if (mouth == null) return;
+                    mostlyMeat = mouth.getsMostEnergyFromMeat;
+                    break;
+                }
+                case 6:
+                    upgradeGoal = __instance.CreateEarThatCouldEmergeOnAnimal(animal);
+                    allowFront = false;
+                    allowBack = false;
+                    break;
+                case 7:
+                    upgradeGoal = __instance.CreateEyeThatCouldEmergeOnAnimal(animal);
+                    allowFront = false;
+                    allowBack = false;
+                    break;
+                case 10:
+                    upgradeGoal = __instance.CreateAccessoireThatCouldEmergeOnAnimal(animal);
+                    break;
+            }
+            if (upgradeGoal == null) return;
+
+            int matchOrdinal = 0;
+            for (int i = 0; i < locCount; i++)
+            {
+                AnimalLocation loc = locs[i];
+                TorsoPartSide dir = loc.directions[0];
+                if ((!allowFront && dir == TorsoPartSide.Front) ||
+                    (!allowBack && dir == TorsoPartSide.Back) ||
+                    (!allowSide && dir == TorsoPartSide.Side) ||
+                    (!allowTop && dir == TorsoPartSide.Top))
+                {
+                    continue;
+                }
+
+                BodyPartDefinition bp = animal.GetBodyPartOnLocation(loc, true);
+                if (bp != null && bp.bodyPartTypeIndex == typeIdx && bp.shapeIndex == targetShape)
+                {
+                    if (loc.offset != TorsoPartLocationOffset.None &&
+                        __instance.organismObjectFileImporter.ImportMergeWithTorsoForBodyPartShape(upgradeGoal.shapeName, dir))
+                    {
+                        animal.RemoveChildOnLocation(loc, false);
+                        loc.offset = TorsoPartLocationOffset.None;
+                        animal.ClearSide(loc.indices[0], dir);
+                        animal.AddChildOnLocation((IClonable)bp, loc, false);
+                        bp = animal.GetBodyPartOnLocation(loc, true);
+                    }
+                    if (!onlyOnBottom && loc.directions[0] == TorsoPartSide.Bottom)
+                    {
+                        animal.RemoveChildOnLocation(loc, false);
+                        loc.directions[0] = TorsoPartSide.Side;
+                        animal.ClearSide(loc.indices[0], TorsoPartSide.Side);
+                        animal.AddChildOnLocation((IClonable)bp, loc, false);
+                        bp = animal.GetBodyPartOnLocation(loc, true);
+                    }
+                    else if (onlyOnBottom && loc.directions[0] != TorsoPartSide.Bottom)
+                    {
+                        animal.RemoveChildOnLocation(loc, false);
+                        loc.directions[0] = TorsoPartSide.Bottom;
+                        animal.ClearSide(loc.indices[0], TorsoPartSide.Bottom);
+                        animal.AddChildOnLocation((IClonable)bp, loc, false);
+                        bp = animal.GetBodyPartOnLocation(loc, true);
+                    }
+
+                    if (bp != null)
+                    {
+                        if (!useWalkAlt || keepUpgradeOrdinal == matchOrdinal)
+                            __instance.UpgradeBodyPart(bp, upgradeGoal);
+                        else
+                            __instance.UpgradeBodyPart(bp, walkAlt);
+                    }
+                    matchOrdinal++;
+                }
+            }
+
+            if (mostlyMeat)
+            {
+                InstinctDefinition[] insts = animal.instincts;
+                bool hasFoodInst = false;
+                for (int j = 0; j < insts.Length; j++)
+                {
+                    if (insts[j].conditionObject == InstinctConditionObject.Food)
+                    {
+                        hasFoodInst = true;
+                        break;
+                    }
+                }
+                if (!hasFoodInst)
+                {
+                    InstinctDefinition[] grown = new InstinctDefinition[insts.Length + 1];
+                    Array.Copy(insts, grown, insts.Length);
+                    grown[insts.Length] = new InstinctDefinition(InstinctConditionSense.See, InstinctConditionObject.Food, 0f, InstinctAction.GoTowards);
+                    animal.instincts = grown;
+                }
+            }
+        }
+
+        // =========================================================================
+        // 26. Fast LivingPlant.Clone() + Zero-Boo PlantStatsCalculator.Calculate()
+        //     + Fast PlantDefinition / BranchPartDefinition / BranchDefinition Clone
+        //     Eliminates 12+ allocations per picked seed (new PlantStatsCalculator)
+        //     and Boo UnityRuntimeServices reflection in SaplingEmerges & PlantSeed.
+        // =========================================================================
+        [HarmonyPatch(typeof(LivingPlant), nameof(LivingPlant.Clone))]
+        [HarmonyPrefix]
+        public static bool LivingPlant_Clone_Prefix(LivingPlant __instance, ref LivingPlant __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+
+            LivingPlant dst = (LivingPlant)_memberwiseClone(__instance);
+            dst.organismType = OrganismType.Plant;
+            dst.lifeFormIndex = -1;
+            dst.lifeFormIndexOfParent = -1;
+            dst.definitionIndexOfParent = 0;
+            dst.visualSalienceOfDifferenceToParent = 0f;
+            dst.definitionIndexOfOtherParent = 0;
+            dst.age = 0;
+            dst.young = true;
+            dst.health = __instance.maximumAge;
+            dst.maximumHealth = __instance.maximumAge;
+            dst.lookingInDirection = default(WindDirection);
+            dst.stepSound = null;
+            dst.dying = false;
+            dst.absoluteMaximumAge = 1000;
+            dst.manuallyAdded = false;
+            dst.fertilized = false;
+            dst.mutatedLatestOffspring = false;
+            dst.dormant = false;
+            dst.logString = string.Empty;
+            dst.debugCounted = 0;
+            dst.ancestorSpeciesIndices = null;
+            dst.infectedByParasite = null;
+            dst.parasiteDamage = 0f;
+
+            dst.nrOfSeedsDropped = 0;
+            dst.minimumAgeBeforeNextSeed = 0;
+            dst.indicesOfSeedsThatAreReady = new List<int>();
+            dst.indicesOfFruitsThatAreAlmostReady = new List<int>();
+            dst.plantStatsCalculator = _sharedPlantFillCalc;
+            dst.fertilizedByPlant = null;
+            dst.animalPollinated = false;
+            dst.fertilizedByPlantThatHasFlowers = false;
+            dst.burning = false;
+            dst.manuallyIgnited = false;
+            dst.germinationTriggerEventHasHappened = false;
+            dst.plantDefinitionForChild = null;
+            dst.nutrientsOkay = false;
+            dst.createdByAnimalPollination = false;
+            dst.lostLeaves = false;
+            dst.lostFlowers = false;
+            dst.hasBeenDormant = false;
+            dst.energySavedPerSeed = null;
+
+            // Match vanilla LivingPlant.Clone side-effect on parent without re-allocating.
+            int nrOfSeeds = __instance.nrOfSeeds;
+            if (__instance.energySavedPerSeed != null && __instance.energySavedPerSeed.Length == nrOfSeeds)
+            {
+                Array.Clear(__instance.energySavedPerSeed, 0, nrOfSeeds);
+            }
+            else
+            {
+                __instance.energySavedPerSeed = new float[nrOfSeeds];
+            }
+
+            __result = dst;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(LivingPlant), nameof(LivingPlant.FillStats), new Type[] { typeof(bool) })]
+        [HarmonyPrefix]
+        public static void LivingPlant_FillStats_Prefix(LivingPlant __instance)
+        {
+            if (Enabled && __instance != null && __instance.plantStatsCalculator == null)
+            {
+                __instance.plantStatsCalculator = _sharedPlantFillCalc;
+            }
+        }
+
+        [HarmonyPatch(typeof(PlantStatsCalculator), nameof(PlantStatsCalculator.Calculate))]
+        [HarmonyPrefix]
+        public static bool PlantStatsCalculator_Calculate_Prefix(PlantStatsCalculator __instance, PlantDefinition plant)
+        {
+            if (!Enabled || __instance == null || plant == null) return true;
+            CalculatePlantStatsFast(__instance, plant);
+            return false;
+        }
+
+        private static void CalculatePlantStatsFast(PlantStatsCalculator c, PlantDefinition plant)
+        {
+            // Reset accumulator fields so reused PlantStatsCalculator instances behave identically to fresh ones.
+            c.maximumHealth = 10;
+            c.healthDeterioratesAtAge = 9f;
+            c.healthDeteriorationRatePerDayAtOldAge = 8f;
+            c.ageToGrowOld = 4;
+            c.maximumOceanDepth = 0.1f;
+            c.numberOfBranches = 0;
+            c.nrOfPollen = 0;
+            c.pollenMovementDistance = 0;
+            c.usesWindPollination = false;
+            c.usesAnimalPollination = false;
+            c.leavesDoDamageIfBeingEaten = 0f;
+            c.accessoiresDoDamageIfBeingEaten = 0f;
+            c.doesDamageIfBeingEaten = 0f;
+            c.damageIfOutsideMoistureRange = 0f;
+            c.damageIfOutsideTemperatureRange = 0f;
+            c.damageIfWindIsTooStrong = 0f;
+            c.minimumMoistureThisOrganismRequires = 0f;
+            c.longestSeedMovementDistance = 0;
+            c.chanceOfCatchingAnimal = 0f;
+            c.fruitShape = default(FruitShape);
+
+            if (c.shapeIndicesOfWindPollinationOrgans == null) c.shapeIndicesOfWindPollinationOrgans = new List<int>();
+            else c.shapeIndicesOfWindPollinationOrgans.Clear();
+            if (c.shapeIndicesOfAnimalPollinationOrgans == null) c.shapeIndicesOfAnimalPollinationOrgans = new List<int>();
+            else c.shapeIndicesOfAnimalPollinationOrgans.Clear();
+            if (c.seeds == null) c.seeds = new List<SeedDefinition>();
+            else c.seeds.Clear();
+
+            c.leafAbscissionBelowTemperature = plant.leafAbscissionBelowTemperature;
+            c.leafAbscissionAboveTemperature = plant.leafAbscissionAboveTemperature;
+            c.flowerAbscissionBelowTemperature = plant.flowerAbscissionBelowTemperature;
+            c.flowerAbscissionAboveTemperature = plant.flowerAbscissionAboveTemperature;
+
+            float sizeNum;
+            float ageFactor = 0f;
+            if (plant.plantSize == PlantSize.Grass)
+            {
+                c.maximumOceanDepth = 0.25f;
+                sizeNum = 0.5f;
+            }
+            else
+            {
+                sizeNum = PlantStats.PlantSizeToNumber(plant.plantSize) - 9f;
+                switch (plant.plantSize)
+                {
+                    case PlantSize.ExtraSmall: ageFactor = 0.6f; break;
+                    case PlantSize.Small: ageFactor = 1f; break;
+                    case PlantSize.Medium: ageFactor = 3f; break;
+                    case PlantSize.Large: ageFactor = 7f; break;
+                }
+            }
+            c.large = PlantStats.PlantSizeToNumber(plant.plantSize) > 11f;
+            c.bark = plant.bark;
+            c.bioluminescentFlowers = plant.bioluminescentFlowers;
+
+            c.sunLightCollectedByLeavesDuringDayTime = 0f;
+            c.sunLightCollectedByLeavesAtTwilight = 0f;
+            c.sunLightCollectedByLeavesAtNight = 0f;
+            c.sunLightCollectedByStemDuringDayTime = 0f;
+            c.sunLightCollectedByStemAtTwilight = 0f;
+            c.sunLightCollectedByStemAtNight = 0f;
+            c.sunLightCollectedPerDayDuringDayTime = 0f;
+            c.sunLightCollectedPerDayAtTwilight = 0f;
+            c.sunLightCollectedPerDayAtNight = 0f;
+            c.waterCollectedPerDay = 0f;
+            c.sunLightUsedPerDayDuringDayTime = 0f;
+            c.sunLightUsedPerDayAtTwilight = 0f;
+            c.sunLightUsedPerDayAtNight = 0f;
+            c.waterUsedPerDayDuringDayTime = 0f;
+            c.waterUsedPerDayAtTwilight = 0f;
+            c.waterUsedPerDayAtNight = 0f;
+            c.sunLightNotUsedPerDayDuringDayTime = 0f;
+            c.sunLightNotUsedPerDayAtTwilight = 0f;
+            c.sunLightNotUsedPerDayAtNight = 0f;
+            c.waterNotUsedPerDayDuringDayTime = 0f;
+            c.waterNotUsedPerDayAtTwilight = 0f;
+            c.waterNotUsedPerDayAtNight = 0f;
+            c.energyCreatedPerDayDuringDayTime = 0f;
+            c.energyCreatedPerDayAtTwilight = 0f;
+            c.energyCreatedPerDayAtNight = 0f;
+            c.energyUsedPerDay = 0f;
+            c.energyProfitPerDayDuringDayTime = 0f;
+            c.energyProfitPerDayAtTwilight = 0f;
+            c.energyProfitPerDayAtNight = 0f;
+            c.maximumAge = 0;
+            c.expectedAmountOfSeeds = 0;
+            c.damagePerDay = 0f;
+            c.damageByDrought = false;
+            c.damageByLowTemperature = false;
+            c.damageByHighTemperature = false;
+            c.damageByWind = false;
+            c.hasNectar = false;
+            c.glowing = false;
+            c.sittableLocations = 0;
+            c.minimumTemperatureThisOrganismCanHandle = -100f;
+            c.maximumTemperatureThisOrganismCanHandle = 100f;
+            c.maximumWindStrengthThisPlantCanHandle = 100f;
+            c.maximumMoistureThisOrganismCanHandle = 100f;
+
+            c.energyNeededForFruitProduction = (plant.plantSize == PlantSize.Grass) ? 5f : (10f + ageFactor * 20f);
+            c.almostReadyThreshold = c.percentageReadyIsAlmostReady * c.energyNeededForFruitProduction;
+            c.lowestEdibleBodyPartHeight = -1f;
+            c.stemIndexOfLowestBodyPart = -1;
+            c.stemIndexOfLowestLeaf = -1;
+            c.stemIndexOfLowestSeed = -1;
+            c.stemIndexOfLowestFruit = -1;
+            c.stemIndexOfLowestNut = -1;
+            c.nrOfOvules = 0;
+            c.nrOfSeeds = 0;
+            c.nrOfLeaves = 0;
+            c.nrOfStamina = 0;
+            c.nrOfStigmata = 0;
+            c.seedRequiresFire = false;
+            c.fruitCanBeEatenDuringFlight = false;
+            c.aquaticSeedDetected = false;
+            c.libraryProfile = default(LibraryProfile);
+
+            BranchPartDefinition[] stem = plant.stem;
+            if (stem != null)
+            {
+                c.currentStemPartIndex = 1;
+                bool isGrass = plant.plantSize == PlantSize.Grass;
+                bool stemPhotosynth = isGrass || plant.barkType == BarkType.None || plant.barkType == BarkType.Proto;
+                float stemFactor = (plant.barkType == BarkType.Proto) ? 0.5f : (isGrass ? 2f : 1f);
+
+                for (int i = 0; i < stem.Length; i++)
+                {
+                    IClonable[] children = stem[i].children;
+                    for (int j = 0; j < children.Length; j++)
+                    {
+                        IClonable ch = children[j];
+                        if (ch == null) continue;
+                        BodyPartDefinition bp = ch as BodyPartDefinition;
+                        if (bp == null)
+                        {
+                            BranchDefinition br = ch as BranchDefinition;
+                            if (br != null) ProcessBranchFast(c, br);
+                            continue;
+                        }
+                        if (c.stemIndexOfLowestBodyPart == -1 || c.stemIndexOfLowestBodyPart > c.currentStemPartIndex)
+                            c.stemIndexOfLowestBodyPart = c.currentStemPartIndex;
+
+                        switch (bp.bodyPartTypeIndex)
+                        {
+                            case 2:
+                                ProcessSeedFast(c, (SeedDefinition)bp);
+                                if (c.lowestEdibleBodyPartHeight == -1f) c.lowestEdibleBodyPartHeight = c.currentStemPartIndex;
+                                break;
+                            case 3:
+                                if (!isGrass)
+                                {
+                                    ProcessLeafFast(c, (LeafDefinition)bp);
+                                    if (c.lowestEdibleBodyPartHeight == -1f) c.lowestEdibleBodyPartHeight = c.currentStemPartIndex;
+                                }
+                                break;
+                            case 8:
+                                ProcessPollenOrganFast(c, (PollinationOrganDefinition)bp);
+                                if (c.lowestEdibleBodyPartHeight == -1f) c.lowestEdibleBodyPartHeight = c.currentStemPartIndex;
+                                break;
+                            case 9:
+                                ProcessPlantAccFast(c, (PlantAccessoireDefinition)bp);
+                                break;
+                        }
+                    }
+
+                    if (stemPhotosynth)
+                    {
+                        float d = c.amountOfSunlightABranchPartCollectsPerDayDuringDayTime * c.sunLightAvailable * stemFactor;
+                        float tw = c.amountOfSunlightABranchPartCollectsPerDayAtTwilight * c.sunLightAvailable * stemFactor;
+                        float ni = c.amountOfSunlightABranchPartCollectsPerDayAtNight * c.sunLightAvailable * stemFactor;
+                        c.sunLightCollectedByStemDuringDayTime += d;
+                        c.sunLightCollectedByStemAtTwilight += tw;
+                        c.sunLightCollectedByStemAtNight += ni;
+                        c.sunLightCollectedPerDayDuringDayTime += d;
+                        c.sunLightCollectedPerDayAtTwilight += tw;
+                        c.sunLightCollectedPerDayAtNight += ni;
+                    }
+                    if (c.currentStemPartIndex > 1)
+                    {
+                        c.energyUsedPerDay += c.amountOfEnergyABranchPartUsesPerDay * (float)c.currentStemPartIndex;
+                    }
+                    c.currentStemPartIndex++;
+                }
+
+                int count = c.seeds.Count;
+                if (count == 0)
+                {
+                    c.movementDistancePerSeed = _emptyIntArray;
+                    c.chanceOfStickingToAnimalPerSeed = _emptyFloatArray;
+                    c.extraEnergyForAnimalsPerSeed = _emptyFloatArray;
+                    c.floatsInWaterPerSeed = _emptyBoolArray;
+                    c.sinksInWaterPerSeed = _emptyBoolArray;
+                    c.harderToEatPerSeed = _emptyBoolArray;
+                    c.survivesBeingEatenPerSeed = _emptyBoolArray;
+                    c.requiresFirePerSeed = _emptyBoolArray;
+                }
+                else
+                {
+                    int[] moveDist = new int[count];
+                    float[] stick = new float[count];
+                    float[] extraE = new float[count];
+                    bool[] floats = new bool[count];
+                    bool[] sinks = new bool[count];
+                    bool[] harder = new bool[count];
+                    bool[] survives = new bool[count];
+                    bool[] reqFire = new bool[count];
+                    bool strongWind = !(c.windStrength < 0.5f);
+                    for (int k = 0; k < count; k++)
+                    {
+                        SeedDefinition sd = c.seeds[k];
+                        moveDist[k] = (strongWind && sd.distanceWithStrongWind > sd.distanceWithoutWind) ? sd.distanceWithStrongWind : sd.distanceWithoutWind;
+                        stick[k] = sd.chanceOfStickingToAnimal;
+                        extraE[k] = sd.extraEnergyForAnimals;
+                        floats[k] = sd.floatsInWater;
+                        sinks[k] = sd.sinksInWater;
+                        harder[k] = sd.harderToEat;
+                        survives[k] = sd.survivesBeingEaten;
+                        reqFire[k] = sd.requiresFire;
+                    }
+                    c.movementDistancePerSeed = moveDist;
+                    c.chanceOfStickingToAnimalPerSeed = stick;
+                    c.extraEnergyForAnimalsPerSeed = extraE;
+                    c.floatsInWaterPerSeed = floats;
+                    c.sinksInWaterPerSeed = sinks;
+                    c.harderToEatPerSeed = harder;
+                    c.survivesBeingEatenPerSeed = survives;
+                    c.requiresFirePerSeed = reqFire;
+                }
+            }
+
+            if (c.useEnvironmentTemperature)
+            {
+                float temp = PlantStats.ProportionToTemperature(c.environmentTemperature);
+                if (!(temp <= c.maximumTemperatureThisOrganismCanHandle))
+                {
+                    c.damagePerDay += c.damageIfOutsideTemperatureRange;
+                    c.damageByHighTemperature = true;
+                }
+                else if (!(temp >= c.minimumTemperatureThisOrganismCanHandle))
+                {
+                    c.damagePerDay += c.damageIfOutsideTemperatureRange;
+                    c.damageByLowTemperature = true;
+                }
+            }
+            if (c.useWindStrength && !(c.windStrength <= c.maximumWindStrengthThisPlantCanHandle / 5f))
+            {
+                c.damagePerDay += c.damageIfWindIsTooStrong;
+                c.damageByWind = true;
+            }
+            if (c.useMoisture)
+            {
+                c.damageByDrought = c.shallowGroundWater < c.minimumMoistureThisOrganismRequires;
+                c.damageByMoisture = c.shallowGroundWater > c.maximumMoistureThisOrganismCanHandle;
+                if (c.damageByDrought || c.damageByMoisture) c.damagePerDay += c.damageIfOutsideMoistureRange;
+            }
+
+            c.waterExtractionCapacity = c.maximumWaterAvailableInCell;
+            if (c.useGroundWater)
+            {
+                c.waterAvailable = c.maximumWaterAvailableInCell;
+                c.waterCollectedPerDay = !(c.waterAvailable <= c.waterExtractionCapacity) ? c.waterExtractionCapacity : c.waterAvailable;
+            }
+            else
+            {
+                c.waterCollectedPerDay = c.waterExtractionCapacity;
+            }
+
+            c.energyUsedPerDay += c.energyARootUsesPerDay;
+
+            if (!(c.waterCollectedPerDay <= c.sunLightCollectedPerDayDuringDayTime))
+            {
+                c.energyCreatedPerDayDuringDayTime = c.sunLightCollectedPerDayDuringDayTime;
+                c.sunLightUsedPerDayDuringDayTime = c.sunLightCollectedPerDayDuringDayTime;
+                c.waterUsedPerDayDuringDayTime = c.sunLightCollectedPerDayDuringDayTime;
+                c.sunLightNotUsedPerDayDuringDayTime = 0f;
+                c.waterNotUsedPerDayDuringDayTime = c.waterCollectedPerDay - c.waterUsedPerDayDuringDayTime;
+            }
+            else
+            {
+                c.energyCreatedPerDayDuringDayTime = c.waterCollectedPerDay;
+                c.sunLightUsedPerDayDuringDayTime = c.waterCollectedPerDay;
+                c.waterUsedPerDayDuringDayTime = c.waterCollectedPerDay;
+                c.sunLightNotUsedPerDayDuringDayTime = c.sunLightCollectedPerDayDuringDayTime - c.sunLightUsedPerDayDuringDayTime;
+                c.waterNotUsedPerDayDuringDayTime = 0f;
+            }
+            if (!(c.waterCollectedPerDay <= c.sunLightCollectedPerDayAtTwilight))
+            {
+                c.energyCreatedPerDayAtTwilight = c.sunLightCollectedPerDayAtTwilight;
+                c.sunLightUsedPerDayAtTwilight = c.sunLightCollectedPerDayAtTwilight;
+                c.waterUsedPerDayAtTwilight = c.sunLightCollectedPerDayAtTwilight;
+                c.sunLightNotUsedPerDayAtTwilight = 0f;
+                c.waterNotUsedPerDayAtTwilight = c.waterCollectedPerDay - c.waterUsedPerDayAtTwilight;
+            }
+            else
+            {
+                c.energyCreatedPerDayAtTwilight = c.waterCollectedPerDay;
+                c.sunLightUsedPerDayAtTwilight = c.waterCollectedPerDay;
+                c.waterUsedPerDayAtTwilight = c.waterCollectedPerDay;
+                c.sunLightNotUsedPerDayAtTwilight = c.sunLightCollectedPerDayAtTwilight - c.sunLightUsedPerDayAtTwilight;
+                c.waterNotUsedPerDayAtTwilight = 0f;
+            }
+            if (!(c.waterCollectedPerDay <= c.sunLightCollectedPerDayAtNight))
+            {
+                c.energyCreatedPerDayAtNight = c.sunLightCollectedPerDayAtNight;
+                c.sunLightUsedPerDayAtNight = c.sunLightCollectedPerDayAtNight;
+                c.waterUsedPerDayAtNight = c.sunLightCollectedPerDayAtNight;
+                c.sunLightNotUsedPerDayAtNight = 0f;
+                c.waterNotUsedPerDayAtNight = c.waterCollectedPerDay - c.waterUsedPerDayAtNight;
+            }
+            else
+            {
+                c.energyCreatedPerDayAtNight = c.waterCollectedPerDay;
+                c.sunLightUsedPerDayAtNight = c.waterCollectedPerDay;
+                c.waterUsedPerDayAtNight = c.waterCollectedPerDay;
+                c.sunLightNotUsedPerDayAtNight = c.sunLightCollectedPerDayAtNight - c.sunLightUsedPerDayAtNight;
+                c.waterNotUsedPerDayAtNight = 0f;
+            }
+
+            c.energyUsedPerDay = sizeNum * c.energyUsedPerDay;
+            if (plant.plantSize == PlantSize.Grass || plant.barkType == BarkType.Proto || plant.barkType == BarkType.FireResistant)
+                c.energyUsedPerDay += 3f;
+
+            c.energyProfitPerDayDuringDayTime = c.energyCreatedPerDayDuringDayTime - c.energyUsedPerDay;
+            c.energyProfitPerDayAtTwilight = c.energyCreatedPerDayAtTwilight - c.energyUsedPerDay;
+            c.energyProfitPerDayAtNight = c.energyCreatedPerDayAtNight - c.energyUsedPerDay;
+            if (!(c.energyProfitPerDayDuringDayTime >= 0f)) c.energyProfitPerDayDuringDayTime = 0f;
+            if (!(c.energyProfitPerDayAtTwilight >= 0f)) c.energyProfitPerDayAtTwilight = 0f;
+            if (!(c.energyProfitPerDayAtNight >= 0f)) c.energyProfitPerDayAtNight = 0f;
+
+            if (plant.plantSize == PlantSize.Grass)
+            {
+                c.lowestEdibleBodyPartHeight = 0f;
+            }
+            else
+            {
+                c.lowestEdibleBodyPartHeight += sizeNum - 1f;
+                if (c.lowestEdibleBodyPartHeight == 1f && plant.stem != null && plant.stem.Length == 1)
+                    c.lowestEdibleBodyPartHeightRelative = 0f;
+                else if (c.lowestEdibleBodyPartHeight != -1f)
+                    c.lowestEdibleBodyPartHeightRelative = (c.lowestEdibleBodyPartHeight - 1f) / 9f;
+                else
+                    c.lowestEdibleBodyPartHeightRelative = -1f;
+            }
+
+            c.maximumAge = (int)(10f + 50f * ageFactor);
+            c.maximumHealth = (int)(10f * sizeNum);
+            c.healthDeterioratesAtAge = 0.9f * (float)c.maximumAge;
+            float dailyNet = c.energyProfitPerDayDuringDayTime + c.energyProfitPerDayAtTwilight * 2f + c.energyProfitPerDayAtNight;
+            c.expectedAmountOfSeeds = (int)Mathf.Floor((dailyNet * ((float)c.maximumAge / 4f)) / c.energyNeededForFruitProduction);
+            c.damageByFire = c.maximumHealth / 5;
+            if (c.expectedAmountOfSeeds > c.nrOfSeeds) c.expectedAmountOfSeeds = c.nrOfSeeds;
+
+            if (plant.fruitCurved) c.fruitShape = FruitShape.Curved;
+            else if (plant.fruitLength == 1) c.fruitShape = FruitShape.Round;
+            else if (plant.fruitLength == 2) c.fruitShape = (plant.part0Thick || plant.part1Thick) ? FruitShape.Round : FruitShape.Long;
+            else if (plant.fruitLength == 3) c.fruitShape = plant.part1Thick ? FruitShape.Round : FruitShape.Long;
+
+            c.doesDamageIfBeingEaten = c.leavesDoDamageIfBeingEaten + c.accessoiresDoDamageIfBeingEaten;
+            bool fireRes = plant.plantSize != PlantSize.Grass && plant.barkType == BarkType.FireResistant &&
+                (c.stemIndexOfLowestBodyPart == -1 ||
+                 (plant.plantSize == PlantSize.Medium && c.stemIndexOfLowestBodyPart > 4) ||
+                 (plant.plantSize == PlantSize.Large && c.stemIndexOfLowestBodyPart > 3));
+            c.fireResistant = fireRes;
+            if (!c.aquaticSeedDetected) c.maximumOceanDepth = 0f;
+
+            c.UpdateStatsForRootType(plant.rootType);
+            if (plant.plantSize == PlantSize.Grass && plant.stem != null)
+            {
+                float t = ((float)plant.stem.Length - 3f) / 4f;
+                c.minimumTemperatureThisOrganismCanHandle = Mathf.Round(Mathf.Lerp(-10f, 10f, t));
+                c.maximumTemperatureThisOrganismCanHandle = Mathf.Round(Mathf.Lerp(20f, 40f, t));
+            }
+            c.colorAllowed = PlantStats.CheckWhetherColorIsAllowed(plant.colorHue, plant.colorBrightness, c.allowedColors);
+        }
+
+        private static void ProcessBranchFast(PlantStatsCalculator c, BranchDefinition branch)
+        {
+            c.numberOfBranches++;
+            int partNum = 1;
+            bool flag = false;
+            List<BranchPartDefinition> parts = branch.parts;
+            if (parts == null) return;
+            for (int pIdx = 0; pIdx < parts.Count; pIdx++)
+            {
+                BranchPartDefinition bpDef = parts[pIdx];
+                IClonable[] children = bpDef.children;
+                for (int i = 0; i < children.Length; i++)
+                {
+                    IClonable ch = children[i];
+                    if (ch == null) continue;
+                    BodyPartDefinition bp = ch as BodyPartDefinition;
+                    if (bp == null) continue;
+                    switch (bp.bodyPartTypeIndex)
+                    {
+                        case 2:
+                            ProcessSeedFast(c, (SeedDefinition)bp);
+                            if (c.lowestEdibleBodyPartHeight == -1f) c.lowestEdibleBodyPartHeight = c.currentStemPartIndex;
+                            break;
+                        case 3:
+                            ProcessLeafFast(c, (LeafDefinition)bp);
+                            if (c.lowestEdibleBodyPartHeight == -1f) c.lowestEdibleBodyPartHeight = c.currentStemPartIndex;
+                            break;
+                        case 8:
+                            ProcessPollenOrganFast(c, (PollinationOrganDefinition)bp);
+                            if (c.lowestEdibleBodyPartHeight == -1f) c.lowestEdibleBodyPartHeight = c.currentStemPartIndex;
+                            break;
+                    }
+                }
+                if (c.large && partNum > 1 && !(bpDef.displacement.x >= 0.75f))
+                {
+                    if (flag) { c.sittableLocations++; flag = false; }
+                    else flag = true;
+                }
+                else
+                {
+                    flag = false;
+                }
+                c.energyUsedPerDay += c.amountOfEnergyABranchPartUsesPerDay * (float)partNum * 0.25f;
+                partNum++;
+            }
+        }
+
+        private static void ProcessSeedFast(PlantStatsCalculator c, SeedDefinition seed)
+        {
+            c.nrOfSeeds++;
+            if (seed.distanceWithStrongWind > c.longestSeedMovementDistance) c.longestSeedMovementDistance = seed.distanceWithStrongWind;
+            if (seed.distanceWithoutWind > c.longestSeedMovementDistance) c.longestSeedMovementDistance = seed.distanceWithoutWind;
+            if (seed.harderToEat)
+            {
+                if (c.stemIndexOfLowestNut == -1 || c.stemIndexOfLowestNut > c.currentStemPartIndex) c.stemIndexOfLowestNut = c.currentStemPartIndex;
+            }
+            else if (!(seed.extraEnergyForAnimals <= 3f))
+            {
+                if (c.stemIndexOfLowestFruit == -1 || c.stemIndexOfLowestFruit > c.currentStemPartIndex) c.stemIndexOfLowestFruit = c.currentStemPartIndex;
+            }
+            else if (c.stemIndexOfLowestSeed == -1 || c.stemIndexOfLowestSeed > c.currentStemPartIndex)
+            {
+                c.stemIndexOfLowestSeed = c.currentStemPartIndex;
+            }
+            if (seed.requiresFire) c.seedRequiresFire = true;
+            if (seed.canBeEatenDuringFlight) c.fruitCanBeEatenDuringFlight = true;
+            if (seed.sinksInWater || seed.floatsInWater) c.aquaticSeedDetected = true;
+            c.seeds.Add(seed);
+            c.libraryProfile.parameter0 = seed.shapeIndex;
+        }
+
+        private static void ProcessLeafFast(PlantStatsCalculator c, LeafDefinition leaf)
+        {
+            float daySun = c.amountOfSunlightALeafCollectsPerDay * PlantStats.ProcessRangeStatistic(leaf.sunLightCaughtDuringDayTime, leaf.scale);
+            float twiSun = c.amountOfSunlightALeafCollectsPerDay * PlantStats.ProcessRangeStatistic(leaf.sunLightCaughtAtTwilight, leaf.scale);
+            c.sunLightCollectedByLeavesDuringDayTime += daySun;
+            c.sunLightCollectedPerDayDuringDayTime += daySun * c.sunLightAvailable;
+            c.sunLightCollectedByLeavesAtTwilight += twiSun;
+            c.sunLightCollectedPerDayAtTwilight += twiSun * c.sunLightAvailable;
+            c.nrOfLeaves++;
+
+            float maxMoist = 0.5f + 0.5f * leaf.moistureResistance;
+            if (!(maxMoist >= c.maximumMoistureThisOrganismCanHandle)) c.maximumMoistureThisOrganismCanHandle = maxMoist;
+            float minMoist = 0.5f - 0.5f * leaf.droughtResistance;
+            if (!(minMoist <= c.minimumMoistureThisOrganismRequires)) c.minimumMoistureThisOrganismRequires = minMoist;
+            float windRes = PlantStats.ProcessRangeStatistic(leaf.windResistance, leaf.scale);
+            if (!(windRes >= c.maximumWindStrengthThisPlantCanHandle)) c.maximumWindStrengthThisPlantCanHandle = windRes;
+
+            float mh = (float)c.maximumHealth;
+            c.damageIfWindIsTooStrong += c.relativeDamageDoneByLeafThatCannotHandleTheWindStrength * mh;
+            if (!(leaf.maximumTemperature >= PlantStats.ProportionToTemperature(c.leafAbscissionAboveTemperature)) && !(leaf.maximumTemperature >= c.maximumTemperatureThisOrganismCanHandle))
+                c.maximumTemperatureThisOrganismCanHandle = leaf.maximumTemperature;
+            if (!(leaf.minimumTemperature <= PlantStats.ProportionToTemperature(c.leafAbscissionBelowTemperature)) && !(leaf.minimumTemperature <= c.minimumTemperatureThisOrganismCanHandle))
+                c.minimumTemperatureThisOrganismCanHandle = leaf.minimumTemperature;
+            c.damageIfOutsideMoistureRange += c.relativeDamageDoneByLeafOutsideMoistureRange * mh;
+            c.damageIfOutsideTemperatureRange += c.relativeDamageDoneByLeafOutsideTemperatureRange * mh;
+            if (!(leaf.attack <= c.leavesDoDamageIfBeingEaten)) c.leavesDoDamageIfBeingEaten = leaf.attack;
+            if (c.stemIndexOfLowestLeaf == -1 || c.stemIndexOfLowestLeaf < c.currentStemPartIndex) c.stemIndexOfLowestLeaf = c.currentStemPartIndex;
+            c.libraryProfile.parameter0 = leaf.shapeIndex;
+        }
+
+        private static void ProcessPollenOrganFast(PlantStatsCalculator c, PollinationOrganDefinition po)
+        {
+            c.nrOfPollen += po.nrOfPollen;
+            if (po.pollenMovementDistance > c.pollenMovementDistance) c.pollenMovementDistance = po.pollenMovementDistance;
+            if (po.usesWindPollination)
+            {
+                c.usesWindPollination = true;
+                c.shapeIndicesOfWindPollinationOrgans.Add(po.shapeIndex);
+            }
+            if (po.usesAnimalPollination)
+            {
+                c.usesAnimalPollination = true;
+                c.shapeIndicesOfAnimalPollinationOrgans.Add(po.shapeIndex);
+                c.hasNectar = true;
+            }
+            if (!(po.maximumTemperature >= PlantStats.ProportionToTemperature(c.flowerAbscissionAboveTemperature)) && !(po.maximumTemperature >= c.maximumTemperatureThisOrganismCanHandle))
+                c.maximumTemperatureThisOrganismCanHandle = po.maximumTemperature;
+            if (!(po.minimumTemperature <= PlantStats.ProportionToTemperature(c.flowerAbscissionBelowTemperature)) && !(po.minimumTemperature <= c.minimumTemperatureThisOrganismCanHandle))
+                c.minimumTemperatureThisOrganismCanHandle = po.minimumTemperature;
+            c.damageIfOutsideTemperatureRange += c.relativeDamageDoneByPollinationOrganOutsideTemperatureRange * (float)c.maximumHealth;
+            if (c.bioluminescentFlowers && po.glowing)
+            {
+                c.glowing = true;
+                c.energyUsedPerDay += c.extraEnergyUseForBioluminescentFlower;
+            }
+            if (!(po.chanceOfCatchingAnimal <= c.chanceOfCatchingAnimal)) c.chanceOfCatchingAnimal = po.chanceOfCatchingAnimal;
+        }
+
+        private static void ProcessPlantAccFast(PlantStatsCalculator c, PlantAccessoireDefinition acc)
+        {
+            if (acc.glowing)
+            {
+                c.glowing = true;
+                c.energyUsedPerDay += c.extraEnergyUseForBioluminescentFruit;
+            }
+            if (!(acc.attack <= c.accessoiresDoDamageIfBeingEaten)) c.accessoiresDoDamageIfBeingEaten = acc.attack;
+        }
+
+        private static BranchPartDefinition CloneBranchPartFast(BranchPartDefinition src)
+        {
+            BranchPartDefinition dst = new BranchPartDefinition(src.height, src.displacement, src.diameter);
+            IClonable[] srcCh = src.children;
+            IClonable[] dstCh = dst.children;
+            for (int i = 0; i < 4; i++)
+            {
+                IClonable ch = srcCh[i];
+                if (ch == null) continue;
+                BranchDefinition br = ch as BranchDefinition;
+                if (br != null) dstCh[i] = CloneBranchFast(br);
+                else if (_memberwiseClone != null && ch is BodyPartDefinition) dstCh[i] = (IClonable)_memberwiseClone(ch);
+                else dstCh[i] = (IClonable)ch.Clone();
+            }
+            return dst;
+        }
+
+        private static BranchDefinition CloneBranchFast(BranchDefinition src)
+        {
+            BranchDefinition dst = new BranchDefinition();
+            List<BranchPartDefinition> srcParts = src.parts;
+            if (srcParts != null && srcParts.Count > 0)
+            {
+                List<BranchPartDefinition> dstParts = new List<BranchPartDefinition>(srcParts.Count);
+                for (int i = 0; i < srcParts.Count; i++) dstParts.Add(CloneBranchPartFast(srcParts[i]));
+                dst.parts = dstParts;
+            }
+            return dst;
+        }
+
+        [HarmonyPatch(typeof(BranchPartDefinition), nameof(BranchPartDefinition.Clone))]
+        [HarmonyPrefix]
+        public static bool BranchPartDefinition_Clone_Prefix(BranchPartDefinition __instance, ref object __result)
+        {
+            if (!Enabled || __instance == null) return true;
+            __result = CloneBranchPartFast(__instance);
+            return false;
+        }
+
+        [HarmonyPatch(typeof(BranchDefinition), nameof(BranchDefinition.Clone))]
+        [HarmonyPrefix]
+        public static bool BranchDefinition_Clone_Prefix(BranchDefinition __instance, ref object __result)
+        {
+            if (!Enabled || __instance == null) return true;
+            __result = CloneBranchFast(__instance);
+            return false;
+        }
+
+        [HarmonyPatch(typeof(PlantDefinition), nameof(PlantDefinition.Clone))]
+        [HarmonyPrefix]
+        public static bool PlantDefinition_Clone_Prefix(PlantDefinition __instance, ref object __result)
+        {
+            if (!Enabled || __instance == null || _memberwiseClone == null) return true;
+            PlantDefinition dst = (PlantDefinition)_memberwiseClone(__instance);
+            dst.cachedBranches = null;
+            dst.cachedBodyParts = null;
+            dst.cachedShapeNames = null;
+            if (__instance.stem != null)
+            {
+                int len = __instance.stem.Length;
+                BranchPartDefinition[] arr = new BranchPartDefinition[len];
+                for (int i = 0; i < len; i++) arr[i] = CloneBranchPartFast(__instance.stem[i]);
+                dst.stem = arr;
+            }
+            __result = dst;
+            return false;
+        }
+
+        // =========================================================================
+        // 27. Deduplicate grassAdministration & fungusAdministration (O(N) Time-Jump Leak Fix)
+        //     Vanilla RemoveGrassFromCell / fungus removal never removes pending entries from
+        //     grassAdministration / fungusAdministration. Whenever a grazed cell regrows grass
+        //     within 5 days, AddGrassToCell spawns another eternal 5-day loop for the same cell.
+        //     Over 10,000+ days, every grazed grass cell accumulates hundreds of duplicate timers
+        //     that each allocate int[8] and re-schedule every 5 days forever, slowing LiveADay
+        //     linearly with dayIndex and triggering constant Gen-2 GC pauses.
+        // =========================================================================
+        private static readonly AccessTools.FieldRef<TemporaryObjectAdministration, Dictionary<int, List<int>>> AdminExpireCellsRef =
+            AccessTools.FieldRefAccess<TemporaryObjectAdministration, Dictionary<int, List<int>>>("expireInCellsPerDay");
+        private static readonly AccessTools.FieldRef<TemporaryObjectAdministration, Dictionary<int, List<int>>> AdminExpireAreasRef =
+            AccessTools.FieldRefAccess<TemporaryObjectAdministration, Dictionary<int, List<int>>>("expireInAreasPerDay");
+        private static readonly AccessTools.FieldRef<TemporaryObjectAdministration, Dictionary<int, List<int>>> AdminExpireIndexRef =
+            AccessTools.FieldRefAccess<TemporaryObjectAdministration, Dictionary<int, List<int>>>("expireWithIndexPerDay");
+        private static readonly AccessTools.FieldRef<TemporaryObjectAdministration, bool> AdminKeepIndexRef =
+            AccessTools.FieldRefAccess<TemporaryObjectAdministration, bool>("keepTrackOfIndex");
+
+        private static TimeLine _adminTrackedTl;
+        private static TemporaryObjectAdministration _adminGrassRef;
+        private static TemporaryObjectAdministration _adminFungusRef;
+        private static int _adminLastDay = int.MinValue;
+        private static int[][] _grassSchedUntil;
+        private static int[][] _fungusSchedUntil;
+        private static int[][] _adminSeenStamp;
+        private static int _adminStampCounter;
+
+        private static long _admGrassKept;
+        private static long _admGrassPruned;
+        private static long _admGrassAddSkipped;
+        private static long _admFungusKept;
+        private static long _admFungusPruned;
+        private static long _admEggCount;
+        private static long _admSeedCount;
+        private static long _admNestCount;
+        private static long _admCarrionCount;
+
+        public static string ConsumeAdminBreakdown()
+        {
+            long total = _admGrassKept + _admGrassPruned + _admFungusKept + _admFungusPruned + _admEggCount + _admSeedCount + _admNestCount + _admCarrionCount;
+            if (total == 0) return null;
+            string line = string.Format(
+                "[PROF] admin grass={0}(pruned={1},addSkip={2}) egg={3} seed={4} fungus={5}(pruned={6}) nest={7} carrion={8}",
+                _admGrassKept, _admGrassPruned, _admGrassAddSkipped,
+                _admEggCount, _admSeedCount,
+                _admFungusKept, _admFungusPruned,
+                _admNestCount, _admCarrionCount);
+            _admGrassKept = _admGrassPruned = _admGrassAddSkipped = 0;
+            _admFungusKept = _admFungusPruned = 0;
+            _admEggCount = _admSeedCount = _admNestCount = _admCarrionCount = 0;
+            return line;
+        }
+
+        private static void EnsureAdminArrays(WorldArea[] areas, bool resetValues)
+        {
+            if (areas == null) return;
+            int nAreas = areas.Length;
+            bool realloc = _grassSchedUntil == null || _grassSchedUntil.Length != nAreas;
+            if (!realloc)
+            {
+                for (int i = 0; i < nAreas; i++)
+                {
+                    int nCells = (areas[i] != null && areas[i].cells != null) ? areas[i].cells.Length : 0;
+                    if (_grassSchedUntil[i] == null || _grassSchedUntil[i].Length != nCells)
+                    {
+                        realloc = true;
+                        break;
+                    }
+                }
+            }
+            if (realloc)
+            {
+                _grassSchedUntil = new int[nAreas][];
+                _fungusSchedUntil = new int[nAreas][];
+                _adminSeenStamp = new int[nAreas][];
+                for (int i = 0; i < nAreas; i++)
+                {
+                    int nCells = (areas[i] != null && areas[i].cells != null) ? areas[i].cells.Length : 0;
+                    _grassSchedUntil[i] = new int[nCells];
+                    _fungusSchedUntil[i] = new int[nCells];
+                    _adminSeenStamp[i] = new int[nCells];
+                    for (int c = 0; c < nCells; c++)
+                    {
+                        _grassSchedUntil[i][c] = -1;
+                        _fungusSchedUntil[i][c] = -1;
+                    }
+                }
+                _adminStampCounter = 0;
+            }
+            else if (resetValues)
+            {
+                for (int i = 0; i < nAreas; i++)
+                {
+                    int[] g = _grassSchedUntil[i];
+                    int[] f = _fungusSchedUntil[i];
+                    for (int c = 0; c < g.Length; c++)
+                    {
+                        g[c] = -1;
+                        f[c] = -1;
+                    }
+                }
+            }
+        }
+
+        private static int NextAdminStamp()
+        {
+            _adminStampCounter++;
+            if (_adminStampCounter == int.MaxValue)
+            {
+                if (_adminSeenStamp != null)
+                {
+                    for (int i = 0; i < _adminSeenStamp.Length; i++)
+                    {
+                        if (_adminSeenStamp[i] != null) Array.Clear(_adminSeenStamp[i], 0, _adminSeenStamp[i].Length);
+                    }
+                }
+                _adminStampCounter = 1;
+            }
+            return _adminStampCounter;
+        }
+
+        private static void DeduplicateAdminDay(
+            TemporaryObjectAdministration admin,
+            WorldArea[] areas,
+            int day,
+            int[][] schedUntil,
+            bool isGrass,
+            ref long keptCounter,
+            ref long prunedCounter)
+        {
+            if (admin == null || areas == null || schedUntil == null) return;
+            int stamp = NextAdminStamp();
+
+            if (admin.eventBased)
+            {
+                Dictionary<int, List<AdministrationEvent>> expDict = admin.expirationEventsPerDay;
+                List<AdministrationEvent> list;
+                if (expDict == null || !expDict.TryGetValue(day, out list) || list == null || list.Count == 0) return;
+
+                int n = list.Count;
+                int w = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    AdministrationEvent ev = list[i];
+                    int a = ev.area;
+                    int c = ev.cell;
+                    if (a < 0 || a >= areas.Length) continue;
+                    WorldArea wa = areas[a];
+                    if (wa == null || wa.cells == null || c < 0 || c >= wa.cells.Length) continue;
+                    WorldCell cell = wa.cells[c];
+                    if (cell == null) continue;
+                    if (isGrass)
+                    {
+                        if (cell.grassHeight <= 0 || cell.grassDefinitionIndex == -1) continue;
+                    }
+                    else
+                    {
+                        if (cell.fungus == null) continue;
+                    }
+                    if (schedUntil[a][c] > day) continue;
+                    if (_adminSeenStamp[a][c] == stamp) continue;
+                    _adminSeenStamp[a][c] = stamp;
+                    if (w != i) list[w] = ev;
+                    w++;
+                }
+                if (w < n) list.RemoveRange(w, n - w);
+                keptCounter += w;
+                prunedCounter += (n - w);
+            }
+            else
+            {
+                Dictionary<int, List<int>> expCellsDict = AdminExpireCellsRef(admin);
+                Dictionary<int, List<int>> expAreasDict = AdminExpireAreasRef(admin);
+                List<int> cellsList;
+                List<int> areasList;
+                if (expCellsDict == null || expAreasDict == null ||
+                    !expCellsDict.TryGetValue(day, out cellsList) || cellsList == null || cellsList.Count == 0 ||
+                    !expAreasDict.TryGetValue(day, out areasList) || areasList == null)
+                {
+                    return;
+                }
+                bool keepIdx = AdminKeepIndexRef(admin);
+                List<int> idxList = null;
+                if (keepIdx)
+                {
+                    Dictionary<int, List<int>> expIdxDict = AdminExpireIndexRef(admin);
+                    if (expIdxDict != null) expIdxDict.TryGetValue(day, out idxList);
+                }
+
+                int n = Math.Min(cellsList.Count, areasList.Count);
+                int w = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    int a = areasList[i];
+                    int c = cellsList[i];
+                    if (a < 0 || a >= areas.Length) continue;
+                    WorldArea wa = areas[a];
+                    if (wa == null || wa.cells == null || c < 0 || c >= wa.cells.Length) continue;
+                    WorldCell cell = wa.cells[c];
+                    if (cell == null) continue;
+                    if (isGrass)
+                    {
+                        if (cell.grassHeight <= 0 || cell.grassDefinitionIndex == -1) continue;
+                    }
+                    else
+                    {
+                        if (cell.fungus == null) continue;
+                    }
+                    if (schedUntil[a][c] > day) continue;
+                    if (_adminSeenStamp[a][c] == stamp) continue;
+                    _adminSeenStamp[a][c] = stamp;
+                    if (w != i)
+                    {
+                        areasList[w] = a;
+                        cellsList[w] = c;
+                        if (idxList != null && i < idxList.Count) idxList[w] = idxList[i];
+                    }
+                    w++;
+                }
+                if (w < cellsList.Count) cellsList.RemoveRange(w, cellsList.Count - w);
+                if (w < areasList.Count) areasList.RemoveRange(w, areasList.Count - w);
+                if (idxList != null && w < idxList.Count) idxList.RemoveRange(w, idxList.Count - w);
+                keptCounter += w;
+                prunedCounter += (n - w);
+            }
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.LiveADay))]
+        [HarmonyPrefix]
+        public static void TimeLine_LiveADay_DeduplicateAdmins_Prefix(TimeLine __instance)
+        {
+            if (!Enabled || __instance == null || __instance.today == null || __instance.today.areas == null) return;
+
+            int day = __instance.dayIndex;
+            bool reset = !object.ReferenceEquals(__instance, _adminTrackedTl) || day < _adminLastDay;
+            _adminTrackedTl = __instance;
+            _adminGrassRef = __instance.grassAdministration;
+            _adminFungusRef = __instance.fungusAdministration;
+            _adminLastDay = day;
+
+            WorldArea[] areas = __instance.today.areas;
+            EnsureAdminArrays(areas, reset);
+
+            DeduplicateAdminDay(_adminGrassRef, areas, day, _grassSchedUntil, true, ref _admGrassKept, ref _admGrassPruned);
+            DeduplicateAdminDay(_adminFungusRef, areas, day, _fungusSchedUntil, false, ref _admFungusKept, ref _admFungusPruned);
+
+            if (__instance.eggAdministration != null && __instance.eggAdministration.HasExpirationDay(day))
+                _admEggCount += __instance.eggAdministration.GetNumberOfExpirationCellsForDay(day);
+            if (__instance.seedAdministration != null && __instance.seedAdministration.HasExpirationDay(day))
+                _admSeedCount += __instance.seedAdministration.GetNumberOfExpirationCellsForDay(day);
+            if (__instance.nestAdministration != null && __instance.nestAdministration.HasExpirationDay(day))
+                _admNestCount += __instance.nestAdministration.GetNumberOfExpirationCellsForDay(day);
+            if (__instance.freshCarrionAdministration != null && __instance.freshCarrionAdministration.HasExpirationDay(day))
+                _admCarrionCount += __instance.freshCarrionAdministration.GetNumberOfExpirationCellsForDay(day);
+            if (__instance.oldCarrionAdministration != null && __instance.oldCarrionAdministration.HasExpirationDay(day))
+                _admCarrionCount += __instance.oldCarrionAdministration.GetNumberOfExpirationCellsForDay(day);
+
+            // Vanilla only calls PruneExtinctDefinitionIndices() in WorldController (never during
+            // TimeJumpController jumps), allowing millions of dead definitionIndex entries to pile up
+            // in PopulationBasedClassifier across long Superjumps. Prune every 1,000 days during jumps.
+            if (TimeJumpPatches.IsTimeJumpActive && day > 0 && (day % 1000 == 10))
+            {
+                __instance.PruneExtinctDefinitionIndices();
+            }
+        }
+
+        [HarmonyPatch(typeof(TemporaryObjectAdministration), nameof(TemporaryObjectAdministration.Add))]
+        [HarmonyPrefix]
+        public static bool TemporaryObjectAdministration_Add_Prefix(
+            TemporaryObjectAdministration __instance,
+            int areaIndex,
+            int cellIndex,
+            int objectIndex,
+            int creationDay,
+            int expirationDay)
+        {
+            if (!Enabled || __instance == null) return true;
+            if (object.ReferenceEquals(__instance, _adminGrassRef))
+            {
+                if (_grassSchedUntil != null && areaIndex >= 0 && areaIndex < _grassSchedUntil.Length)
+                {
+                    int[] arr = _grassSchedUntil[areaIndex];
+                    if (arr != null && cellIndex >= 0 && cellIndex < arr.Length)
+                    {
+                        if (arr[cellIndex] > creationDay)
+                        {
+                            _admGrassAddSkipped++;
+                            return false;
+                        }
+                        arr[cellIndex] = expirationDay;
+                    }
+                }
+            }
+            else if (object.ReferenceEquals(__instance, _adminFungusRef))
+            {
+                if (_fungusSchedUntil != null && areaIndex >= 0 && areaIndex < _fungusSchedUntil.Length)
+                {
+                    int[] arr = _fungusSchedUntil[areaIndex];
+                    if (arr != null && cellIndex >= 0 && cellIndex < arr.Length)
+                    {
+                        if (arr[cellIndex] > creationDay)
+                        {
+                            return false;
+                        }
+                        arr[cellIndex] = expirationDay;
+                    }
+                }
+            }
+            return true;
+        }
+
+        // =========================================================================
+        // 28. Copy-on-Write LivingAnimal sentinels + Zero-Alloc GetEmptyCellNearCell +
+        //     Fast SpeciesInteractionTracker + Zero-Boo PruneExtinctDefinitionIndices
+        // =========================================================================
+        [HarmonyPatch(typeof(LivingAnimal), nameof(LivingAnimal.CheckAttachedPollen))]
+        [HarmonyPrefix]
+        public static bool LivingAnimal_CheckAttachedPollen_Prefix(LivingAnimal __instance, ref PlantDefinition __result)
+        {
+            if (__instance != null && (__instance.attachedPollen == null || object.ReferenceEquals(__instance.attachedPollen, _emptyPollen) || __instance.attachedPollen.Count == 0))
+            {
+                __result = null;
+                return false;
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(LivingAnimal), nameof(LivingAnimal.AttachPollen))]
+        [HarmonyPrefix]
+        public static void LivingAnimal_AttachPollen_Prefix(LivingAnimal __instance)
+        {
+            if (__instance != null && (__instance.attachedPollen == null || object.ReferenceEquals(__instance.attachedPollen, _emptyPollen)))
+            {
+                __instance.attachedPollen = new Hashtable();
+            }
+        }
+
+        [HarmonyPatch(typeof(LivingAnimal), nameof(LivingAnimal.CarrySeed))]
+        [HarmonyPrefix]
+        public static void LivingAnimal_CarrySeed_Prefix(LivingAnimal __instance)
+        {
+            if (__instance == null) return;
+            if (__instance.seedsCarryingAround == null || object.ReferenceEquals(__instance.seedsCarryingAround, _emptySeeds))
+                __instance.seedsCarryingAround = new List<LivingPlant>();
+            if (__instance.changedGenesForSeedsCarryingAround == null || object.ReferenceEquals(__instance.changedGenesForSeedsCarryingAround, _emptySeedBools))
+                __instance.changedGenesForSeedsCarryingAround = new List<bool>();
+        }
+
+        [HarmonyPatch(typeof(LivingAnimal), nameof(LivingAnimal.CarryFungalSpore))]
+        [HarmonyPrefix]
+        public static void LivingAnimal_CarryFungalSpore_Prefix(LivingAnimal __instance)
+        {
+            if (__instance == null) return;
+            if (__instance.fungalSporesCarryingAround == null || object.ReferenceEquals(__instance.fungalSporesCarryingAround, _emptySpores))
+                __instance.fungalSporesCarryingAround = new List<LivingFungus>();
+            if (__instance.changedGenesForFungalSporesCarryingAround == null || object.ReferenceEquals(__instance.changedGenesForFungalSporesCarryingAround, _emptySporeBools))
+                __instance.changedGenesForFungalSporesCarryingAround = new List<bool>();
+        }
+
+        [HarmonyPatch(typeof(LivingAnimal), nameof(LivingAnimal.ChangeSex))]
+        [HarmonyPrefix]
+        public static void LivingAnimal_ChangeSex_Prefix(LivingAnimal __instance, int newSex)
+        {
+            if (__instance != null && __instance.definition != null && __instance.definition.currentSex != newSex)
+            {
+                __instance.definition = ShallowCopyAnimalDefinition(__instance.definition, false);
+            }
+        }
+
+        [HarmonyPatch(typeof(SpeciesInteractionTracker), nameof(SpeciesInteractionTracker.TrackSpeciesInteraction))]
+        [HarmonyPrefix]
+        public static bool SpeciesInteractionTracker_TrackSpeciesInteraction_Prefix(
+            SpeciesInteractionTracker __instance,
+            int speciesId,
+            int otherSpeciesId,
+            DetailedFoodType foodType)
+        {
+            if (!Enabled || __instance == null || __instance.recentInteractionsPerSpecies == null) return true;
+            Queue<SpeciesInteraction> q;
+            if (!__instance.recentInteractionsPerSpecies.TryGetValue(speciesId, out q))
+            {
+                q = new Queue<SpeciesInteraction>(52);
+                __instance.recentInteractionsPerSpecies[speciesId] = q;
+            }
+            q.Enqueue(new SpeciesInteraction(otherSpeciesId, foodType));
+            if (q.Count > 50)
+            {
+                q.Dequeue();
+            }
+            return false;
+        }
+
+        private static readonly AccessTools.FieldRef<PopulationBasedClassifier, Dictionary<int, List<int>>> ClassifierDefsPerSpeciesRef =
+            AccessTools.FieldRefAccess<PopulationBasedClassifier, Dictionary<int, List<int>>>("definitionsPerSpecies");
+        private static readonly List<int> _pruneRemoveScratch = new List<int>(4096);
+
+        private static void PruneClassifierFast(PopulationBasedClassifier clf, HashSet<int> liveDefs, out int beforeCount, out int afterCount)
+        {
+            if (clf == null || clf.speciesPerDefinition == null)
+            {
+                beforeCount = 0;
+                afterCount = 0;
+                return;
+            }
+            Dictionary<int, int> spd = clf.speciesPerDefinition;
+            Dictionary<int, int> nrc = clf.nrOfClassificationsPerDefinition;
+            beforeCount = spd.Count;
+            _pruneRemoveScratch.Clear();
+            foreach (int key in spd.Keys)
+            {
+                if (!liveDefs.Contains(key)) _pruneRemoveScratch.Add(key);
+            }
+            for (int i = 0; i < _pruneRemoveScratch.Count; i++)
+            {
+                int k = _pruneRemoveScratch[i];
+                spd.Remove(k);
+                if (nrc != null) nrc.Remove(k);
+            }
+            if (_pruneRemoveScratch.Count > 0)
+            {
+                Dictionary<int, List<int>> dps = ClassifierDefsPerSpeciesRef(clf);
+                if (dps != null)
+                {
+                    foreach (KeyValuePair<int, List<int>> kv in dps)
+                    {
+                        List<int> list = kv.Value;
+                        if (list == null || list.Count <= 1) continue;
+                        // Keep list[0] (main definition for species); compact dead subspecies entries.
+                        int w = 1;
+                        int n = list.Count;
+                        for (int i = 1; i < n; i++)
+                        {
+                            int d = list[i];
+                            if (liveDefs.Contains(d))
+                            {
+                                if (w != i) list[w] = d;
+                                w++;
+                            }
+                        }
+                        if (w < n) list.RemoveRange(w, n - w);
+                    }
+                }
+            }
+            afterCount = spd.Count;
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.PruneExtinctDefinitionIndices))]
+        [HarmonyPrefix]
+        public static bool TimeLine_PruneExtinctDefinitionIndices_Prefix(TimeLine __instance, ref int[] __result)
+        {
+            if (!Enabled || __instance == null) return true;
+            HashSet<int> live = __instance.ListAllDefinitionIndices();
+            int[] res = new int[10];
+
+            Dictionary<int, int> legacy = __instance.speciesIndexPerDefinitionIndex;
+            if (legacy != null)
+            {
+                res[0] = legacy.Count;
+                _pruneRemoveScratch.Clear();
+                foreach (int key in legacy.Keys)
+                {
+                    if (!live.Contains(key)) _pruneRemoveScratch.Add(key);
+                }
+                for (int i = 0; i < _pruneRemoveScratch.Count; i++) legacy.Remove(_pruneRemoveScratch[i]);
+                res[1] = legacy.Count;
+            }
+
+            PruneClassifierFast(__instance.populationBasedAlgaClassifier, live, out res[2], out res[3]);
+            PruneClassifierFast(__instance.populationBasedPlantClassifier, live, out res[4], out res[5]);
+            PruneClassifierFast(__instance.populationBasedAnimalClassifier, live, out res[6], out res[7]);
+            PruneClassifierFast(__instance.populationBasedFungusClassifier, live, out res[8], out res[9]);
+
+            __result = res;
+            return false;
+        }
+
+        // =========================================================================
+        // 29. Rust Native Vision/Food Ring Scanner + Zero-Alloc GetAllCellsDirectlyAround
+        //     + Cached TemporaryObjectAdministration + Travel Pooling
+        // =========================================================================
+        private const uint VBIT_PLANT = 1u << 0;
+        private const uint VBIT_PLANT_BARK = 1u << 1;
+        private const uint VBIT_PLANT_NECTAR = 1u << 2;
+        private const uint VBIT_PLANT_SEED = 1u << 3;
+        private const uint VBIT_PLANT_NUT = 1u << 4;
+        private const uint VBIT_PLANT_FRUIT = 1u << 5;
+        private const uint VBIT_GRASS = 1u << 6;
+        private const uint VBIT_ALGA = 1u << 7;
+        private const uint VBIT_PLANKTON = 1u << 8;
+        private const uint VBIT_DEEP_SEA = 1u << 9;
+        private const uint VBIT_FUNGUS = 1u << 10;
+        private const uint VBIT_CARRION = 1u << 11;
+        private const uint VBIT_CARRION_OLD = 1u << 12;
+        private const uint VBIT_NEST_ENCLOSED = 1u << 13;
+        private const uint VBIT_ANIMAL_GROUND = 1u << 14;
+        private const uint VBIT_ANIMAL_CANOPY = 1u << 15;
+        private const uint VBIT_ANIMAL_AIR = 1u << 16;
+        private const uint VBIT_ANIMAL_SURFACE = 1u << 17;
+        private const uint VBIT_ANIMAL_WATER = 1u << 18;
+        private const uint VBIT_ANIMAL_DEEP = 1u << 19;
+        private const uint VBIT_HAS_EGG = 1u << 20;
+        private const uint VBIT_STEP_WALK_FROZEN_OK = 1u << 21;
+        private const uint VBIT_GA_HIDING_OR_CAMO = 1u << 22;
+        private const uint VBIT_GA_IS_CHILD = 1u << 23;
+
+        private const int VMODE_FOOD = 1;
+        private const int VMODE_ANIMAL_GROUND = 2;
+        private const int VMODE_COLOR_GROUND = 3;
+        private const int VMODE_PLANT = 4;
+        private const int VMODE_ALGA = 5;
+        private const int VMODE_FIRST_FLAG = 6;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeVisionGrid
+        {
+            public int size_x;
+            public int size_y;
+            public int cell_count;
+            public IntPtr flags;
+
+            public IntPtr plant_hue;
+            public IntPtr plant_bright;
+            public IntPtr plant_fruit_hue;
+            public IntPtr plant_flower_hue;
+            public IntPtr plant_leaf_h;
+            public IntPtr plant_seed_h;
+            public IntPtr plant_nut_h;
+            public IntPtr plant_fruit_h;
+            public IntPtr plant_fruit_shape;
+
+            public IntPtr grass_hue;
+            public IntPtr grass_bright;
+
+            public IntPtr alga_hue;
+            public IntPtr alga_bright;
+
+            public IntPtr carrion_species;
+            public IntPtr egg_species;
+
+            public IntPtr ga_hue;
+            public IntPtr ga_bright;
+            public IntPtr ga_sec_hue;
+            public IntPtr ga_sec_bright;
+            public IntPtr ga_salient_hue;
+            public IntPtr ga_salient_bright;
+            public IntPtr ga_skin_pat;
+            public IntPtr ga_species;
+            public IntPtr ga_size;
+            public IntPtr ga_lf_idx;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeVisionQuery
+        {
+            public int mode;
+            public int center_x;
+            public int center_y;
+            public int start_d;
+            public int start_slot;
+            public int max_d;
+            public byte dir_mask;
+            public byte invert_soft;
+            public byte invert_fruit;
+            public byte invert_whole;
+
+            public byte can_fly_or_climb;
+            public byte carn_is_child;
+            public byte prudent;
+            public byte _pad0;
+
+            public uint food_type_mask;
+            public uint direct_food_flags;
+            public uint exclude_fruit_shapes_mask;
+            public uint exclude_skin_pats_mask;
+            public uint inst_skin_pat_mask;
+            public uint flag_req_mask;
+            public uint flag_req_expected;
+
+            public float eat_height_x10;
+            public int carn_species;
+            public int carn_dict_species;
+            public int carn_size;
+            public int parent_lf_idx;
+
+            public float r1_x, r1_y, r2_x, r2_y, r3_x, r3_y, r4_x, r4_y;
+            public float w1_x, w1_y, w2_x, w2_y, w3_x, w3_y, w4_x, w4_y;
+        }
+
+        [DllImport("sapling_rust", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int sapling_vision_search(
+            ref NativeVisionGrid grid,
+            ref NativeVisionQuery query,
+            out int outNextD,
+            out int outNextSlot);
+
+        private static bool _rustVisionAvailable = true;
+        private static bool _rustVisionProbed = false;
+        private static WorldArea _visionActiveArea;
+        private static int _visionCap;
+        private static NativeVisionGrid _visionGrid;
+        private static GCHandle[] _visionHandles;
+
+        private static uint[] _vFlags;
+        private static float[] _vPlantHue, _vPlantBright, _vPlantFruitHue, _vPlantFlowerHue;
+        private static float[] _vPlantLeafH, _vPlantSeedH, _vPlantNutH, _vPlantFruitH;
+        private static byte[] _vPlantFruitShape;
+        private static float[] _vGrassHue, _vGrassBright;
+        private static float[] _vAlgaHue, _vAlgaBright;
+        private static int[] _vCarrionSpecies, _vEggSpecies;
+        private static float[] _vGaHue, _vGaBright, _vGaSecHue, _vGaSecBright, _vGaSalientHue, _vGaSalientBright;
+        private static byte[] _vGaSkinPat;
+        private static int[] _vGaSpecies, _vGaSize, _vGaLfIdx;
+
+        private static void EnsureVisionBuffers(int cellCount)
+        {
+            if (_visionCap >= cellCount && _vFlags != null) return;
+
+            if (_visionHandles != null)
+            {
+                for (int i = 0; i < _visionHandles.Length; i++)
+                {
+                    if (_visionHandles[i].IsAllocated) _visionHandles[i].Free();
+                }
+            }
+
+            _visionCap = cellCount;
+            _vFlags = new uint[cellCount];
+            _vPlantHue = new float[cellCount];
+            _vPlantBright = new float[cellCount];
+            _vPlantFruitHue = new float[cellCount];
+            _vPlantFlowerHue = new float[cellCount];
+            _vPlantLeafH = new float[cellCount];
+            _vPlantSeedH = new float[cellCount];
+            _vPlantNutH = new float[cellCount];
+            _vPlantFruitH = new float[cellCount];
+            _vPlantFruitShape = new byte[cellCount];
+            _vGrassHue = new float[cellCount];
+            _vGrassBright = new float[cellCount];
+            _vAlgaHue = new float[cellCount];
+            _vAlgaBright = new float[cellCount];
+            _vCarrionSpecies = new int[cellCount];
+            _vEggSpecies = new int[cellCount];
+            _vGaHue = new float[cellCount];
+            _vGaBright = new float[cellCount];
+            _vGaSecHue = new float[cellCount];
+            _vGaSecBright = new float[cellCount];
+            _vGaSalientHue = new float[cellCount];
+            _vGaSalientBright = new float[cellCount];
+            _vGaSkinPat = new byte[cellCount];
+            _vGaSpecies = new int[cellCount];
+            _vGaSize = new int[cellCount];
+            _vGaLfIdx = new int[cellCount];
+
+            object[] arrs = new object[]
+            {
+                _vFlags,
+                _vPlantHue, _vPlantBright, _vPlantFruitHue, _vPlantFlowerHue,
+                _vPlantLeafH, _vPlantSeedH, _vPlantNutH, _vPlantFruitH, _vPlantFruitShape,
+                _vGrassHue, _vGrassBright,
+                _vAlgaHue, _vAlgaBright,
+                _vCarrionSpecies, _vEggSpecies,
+                _vGaHue, _vGaBright, _vGaSecHue, _vGaSecBright, _vGaSalientHue, _vGaSalientBright,
+                _vGaSkinPat, _vGaSpecies, _vGaSize, _vGaLfIdx
+            };
+            _visionHandles = new GCHandle[arrs.Length];
+            for (int i = 0; i < arrs.Length; i++)
+            {
+                _visionHandles[i] = GCHandle.Alloc(arrs[i], GCHandleType.Pinned);
+            }
+
+            _visionGrid.flags = _visionHandles[0].AddrOfPinnedObject();
+            _visionGrid.plant_hue = _visionHandles[1].AddrOfPinnedObject();
+            _visionGrid.plant_bright = _visionHandles[2].AddrOfPinnedObject();
+            _visionGrid.plant_fruit_hue = _visionHandles[3].AddrOfPinnedObject();
+            _visionGrid.plant_flower_hue = _visionHandles[4].AddrOfPinnedObject();
+            _visionGrid.plant_leaf_h = _visionHandles[5].AddrOfPinnedObject();
+            _visionGrid.plant_seed_h = _visionHandles[6].AddrOfPinnedObject();
+            _visionGrid.plant_nut_h = _visionHandles[7].AddrOfPinnedObject();
+            _visionGrid.plant_fruit_h = _visionHandles[8].AddrOfPinnedObject();
+            _visionGrid.plant_fruit_shape = _visionHandles[9].AddrOfPinnedObject();
+            _visionGrid.grass_hue = _visionHandles[10].AddrOfPinnedObject();
+            _visionGrid.grass_bright = _visionHandles[11].AddrOfPinnedObject();
+            _visionGrid.alga_hue = _visionHandles[12].AddrOfPinnedObject();
+            _visionGrid.alga_bright = _visionHandles[13].AddrOfPinnedObject();
+            _visionGrid.carrion_species = _visionHandles[14].AddrOfPinnedObject();
+            _visionGrid.egg_species = _visionHandles[15].AddrOfPinnedObject();
+            _visionGrid.ga_hue = _visionHandles[16].AddrOfPinnedObject();
+            _visionGrid.ga_bright = _visionHandles[17].AddrOfPinnedObject();
+            _visionGrid.ga_sec_hue = _visionHandles[18].AddrOfPinnedObject();
+            _visionGrid.ga_sec_bright = _visionHandles[19].AddrOfPinnedObject();
+            _visionGrid.ga_salient_hue = _visionHandles[20].AddrOfPinnedObject();
+            _visionGrid.ga_salient_bright = _visionHandles[21].AddrOfPinnedObject();
+            _visionGrid.ga_skin_pat = _visionHandles[22].AddrOfPinnedObject();
+            _visionGrid.ga_species = _visionHandles[23].AddrOfPinnedObject();
+            _visionGrid.ga_size = _visionHandles[24].AddrOfPinnedObject();
+            _visionGrid.ga_lf_idx = _visionHandles[25].AddrOfPinnedObject();
+        }
+
+        private static void WriteVisionCell(TimeLine tl, bool usePop, WorldCell c, int idx)
+        {
+            uint f = ((c.usable || c.frozen) && c.walkable) ? VBIT_STEP_WALK_FROZEN_OK : 0u;
+            if (c.hasDeepSeaSlot) f |= VBIT_DEEP_SEA;
+            if (c.nestType != NestType.None && c.nestEnclosed) f |= VBIT_NEST_ENCLOSED;
+
+            if (c.grassHeight > 0)
+            {
+                f |= VBIT_GRASS;
+                _vGrassHue[idx] = c.grassHue;
+                _vGrassBright[idx] = c.grassBrightness;
+            }
+
+            LivingPlant lp = c.plant;
+            if (lp != null)
+            {
+                PlantDefinition pdef = lp.definition;
+                f |= VBIT_PLANT;
+                if (pdef.barkType != BarkType.None) f |= VBIT_PLANT_BARK;
+                if (lp.hasNectar) f |= VBIT_PLANT_NECTAR;
+                _vPlantHue[idx] = pdef._colorHue;
+                _vPlantBright[idx] = pdef._colorBrightness;
+                _vPlantFruitHue[idx] = pdef.fruitHue;
+                _vPlantFlowerHue[idx] = pdef.flowerHue;
+                _vPlantLeafH[idx] = GetRealFoodHeightFast(pdef, lp.lowestLeafHeight);
+                if (lp.lowestSeedHeight != -1f)
+                {
+                    f |= VBIT_PLANT_SEED;
+                    _vPlantSeedH[idx] = GetRealFoodHeightFast(pdef, lp.lowestSeedHeight);
+                }
+                if (lp.lowestNutHeight != -1f)
+                {
+                    f |= VBIT_PLANT_NUT;
+                    _vPlantNutH[idx] = GetRealFoodHeightFast(pdef, lp.lowestNutHeight);
+                }
+                if (lp.lowestFruitHeight != -1f)
+                {
+                    f |= VBIT_PLANT_FRUIT;
+                    _vPlantFruitH[idx] = GetRealFoodHeightFast(pdef, lp.lowestFruitHeight);
+                    _vPlantFruitShape[idx] = (byte)lp.fruitShape;
+                }
+            }
+
+            LivingAlga alga = c.alga;
+            LivingAlga plankton = c.plankton;
+            if (alga != null)
+            {
+                f |= VBIT_ALGA;
+                _vAlgaHue[idx] = alga.definition.colorHue;
+                _vAlgaBright[idx] = alga.definition.colorBrightness;
+            }
+            if (plankton != null)
+            {
+                f |= VBIT_PLANKTON;
+                if (alga == null)
+                {
+                    _vAlgaHue[idx] = plankton.definition.colorHue;
+                    _vAlgaBright[idx] = plankton.definition.colorBrightness;
+                }
+            }
+
+            if (c.fungus != null) f |= VBIT_FUNGUS;
+
+            if (c.carrionSize != -1)
+            {
+                f |= VBIT_CARRION;
+                if (c.carrionOld) f |= VBIT_CARRION_OLD;
+                _vCarrionSpecies[idx] = c.carrionSpeciesIndex;
+            }
+
+            LivingAnimal[] eggs = c.eggs;
+            if (eggs != null)
+            {
+                int eggFound = 0;
+                int singleSp = -1;
+                for (int e = 0; e < eggs.Length; e++)
+                {
+                    LivingAnimal eg = eggs[e];
+                    if (eg == null) continue;
+                    eggFound++;
+                    if (eggFound == 1)
+                    {
+                        int dIdx = eg.definition.definitionIndex;
+                        if (usePop)
+                        {
+                            singleSp = tl.populationBasedAnimalClassifier.LookUp(dIdx);
+                        }
+                        else
+                        {
+                            int v;
+                            singleSp = tl.speciesIndexPerDefinitionIndex.TryGetValue(dIdx, out v) ? v : -1;
+                        }
+                    }
+                    else
+                    {
+                        singleSp = -2;
+                        break;
+                    }
+                }
+                if (eggFound > 0)
+                {
+                    f |= VBIT_HAS_EGG;
+                    _vEggSpecies[idx] = singleSp;
+                }
+            }
+
+            LivingAnimal ga = c.animal;
+            if (ga != null)
+            {
+                f |= VBIT_ANIMAL_GROUND;
+                if (ga.hidingInShell || !(ga.camouflaged <= 0.75f)) f |= VBIT_GA_HIDING_OR_CAMO;
+                if (ga.isChild) f |= VBIT_GA_IS_CHILD;
+                AnimalDefinition def = ga.definition;
+                if (def.currentSex > 0 && def.sexes != null && def.currentSex <= def.sexes.Length)
+                {
+                    int mi = def.currentSex - 1;
+                    _vGaHue[idx] = def.sexes[mi].colorHue;
+                    _vGaBright[idx] = def.sexes[mi].colorBrightness;
+                    _vGaSecHue[idx] = def.sexes[mi].secondaryColorHue;
+                    _vGaSecBright[idx] = def.sexes[mi].secondaryColorBrightness;
+                    _vGaSkinPat[idx] = (byte)def.sexes[mi].skinPattern;
+                    _vGaSize[idx] = def.sexes[mi].bodySize;
+                }
+                else
+                {
+                    _vGaHue[idx] = def._colorHue;
+                    _vGaBright[idx] = def._colorBrightness;
+                    _vGaSecHue[idx] = def._secondaryColorHue;
+                    _vGaSecBright[idx] = def._secondaryColorBrightness;
+                    _vGaSkinPat[idx] = (byte)def._skinPattern;
+                    _vGaSize[idx] = def._bodySize;
+                }
+                _vGaSalientHue[idx] = ga.mostSalientColor;
+                _vGaSalientBright[idx] = ga.colorBrightness;
+                _vGaLfIdx[idx] = ga.lifeFormIndex;
+                int gDefIdx = def.definitionIndex;
+                if (usePop)
+                {
+                    _vGaSpecies[idx] = tl.populationBasedAnimalClassifier.LookUp(gDefIdx);
+                }
+                else
+                {
+                    int v;
+                    _vGaSpecies[idx] = tl.speciesIndexPerDefinitionIndex.TryGetValue(gDefIdx, out v) ? v : -1;
+                }
+            }
+
+            if (c.animalInTree != null) f |= VBIT_ANIMAL_CANOPY;
+            if (c.animalInTheAir != null) f |= VBIT_ANIMAL_AIR;
+            if (c.animalAtWaterSurface != null) f |= VBIT_ANIMAL_SURFACE;
+            if (c.animalUnderWater != null) f |= VBIT_ANIMAL_WATER;
+            if (c.animalInDeepSea != null) f |= VBIT_ANIMAL_DEEP;
+
+            _vFlags[idx] = f;
+        }
+
+        private static void BeginVisionArea(TimeLine tl, WorldArea area, int sizeXInt, int sizeYInt)
+        {
+            WorldCell[] cells = area.cells;
+            int n = cells.Length;
+            EnsureVisionBuffers(n);
+
+            if (!_rustVisionProbed)
+            {
+                _rustVisionProbed = true;
+                try
+                {
+                    _visionGrid.size_x = sizeXInt;
+                    _visionGrid.size_y = sizeYInt;
+                    _visionGrid.cell_count = n;
+                    NativeVisionQuery probe = default(NativeVisionQuery);
+                    probe.mode = 0;
+                    int nd, ns;
+                    sapling_vision_search(ref _visionGrid, ref probe, out nd, out ns);
+                    Plugin.LogInfo("[RUST-VISION] Native sapling_vision_search active!");
+                }
+                catch (Exception ex)
+                {
+                    _rustVisionAvailable = false;
+                    Plugin.LogWarn("[RUST-VISION] Unavailable (" + ex.GetType().Name + "), falling back to managed scanner.");
+                    return;
+                }
+            }
+
+            if (!_rustVisionAvailable) return;
+
+            _visionGrid.size_x = sizeXInt;
+            _visionGrid.size_y = sizeYInt;
+            _visionGrid.cell_count = n;
+            bool usePop = tl.usePopulationBasedClassification;
+
+            for (int i = 0; i < n; i++)
+            {
+                WriteVisionCell(tl, usePop, cells[i], i);
+            }
+            _visionActiveArea = area;
+        }
+
+        private static void EndVisionArea()
+        {
+            _visionActiveArea = null;
+        }
+
+        private static void SyncVisionCellActive(TimeLine tl, WorldArea area, int cellIdx)
+        {
+            if (!object.ReferenceEquals(area, _visionActiveArea)) return;
+            WorldCell[] cells = area.cells;
+            if ((uint)cellIdx >= (uint)cells.Length) return;
+            WriteVisionCell(tl, tl.usePopulationBasedClassification, cells[cellIdx], cellIdx);
+        }
+
+        private static uint LayerAnimalBit(CellLocationType loc)
+        {
+            switch (loc)
+            {
+                case CellLocationType.Ground: return VBIT_ANIMAL_GROUND;
+                case CellLocationType.Canopy: return VBIT_ANIMAL_CANOPY;
+                case CellLocationType.Air: return VBIT_ANIMAL_AIR;
+                case CellLocationType.WaterSurface: return VBIT_ANIMAL_SURFACE;
+                case CellLocationType.UnderWater: return VBIT_ANIMAL_WATER;
+                case CellLocationType.DeepSea: return VBIT_ANIMAL_DEEP;
+                default: return 0u;
+            }
+        }
+
+        private static int SearchNearbyRust(
+            TimeLine tl,
+            InstinctDefinition instinct,
+            LivingAnimal animal,
+            WorldArea worldArea,
+            int areaIndex,
+            int cellIndex,
+            CellLocationType locationType,
+            float x,
+            float y,
+            SpeciesDefinition ownSpecies,
+            float unwarpedPlaceInDayNightCycle,
+            bool isSee,
+            bool isHear,
+            InstinctConditionObject cond,
+            int cursor)
+        {
+            int sizeYInt = _visionGrid.size_y;
+            int centerX = cellIndex / sizeYInt;
+            int centerY = cellIndex % sizeYInt;
+            byte mask = isSee ? GetVisibleDirectionsMask(animal) : (byte)0x0F;
+            int startD = (int)x;
+            int maxD = (int)Math.Floor((double)y);
+
+            NativeVisionQuery q = default(NativeVisionQuery);
+            q.center_x = centerX;
+            q.center_y = centerY;
+            q.start_d = startD;
+            q.start_slot = 0;
+            q.max_d = maxD;
+            q.dir_mask = mask;
+
+            int nextD, nextSlot;
+
+            if (isSee)
+            {
+                if (cond == InstinctConditionObject.ALight)
+                {
+                    // Exact match: only cursor cell can trigger ALight.
+                    if (cursor < 0 || cursor >= _visionGrid.cell_count) return -1;
+                    // Verify cursor is inside one of the bands d = startD..maxD with dir_mask.
+                    q.mode = VMODE_FIRST_FLAG;
+                    q.flag_req_mask = 0u;
+                    q.flag_req_expected = 0u;
+                    // ALight is rare (only when player hovers mouse); use standard managed check via band.
+                    int[] buf = _bandScratch[_bandDepth++];
+                    try
+                    {
+                        for (int d = Math.Max(1, startD); d <= Math.Min(20, maxD); d++)
+                        {
+                            int w = BandPatches.FillBandCompact(_visionGrid.size_x, sizeYInt, centerX, centerY, d, mask, buf);
+                            for (int i = 0; i < w; i++) if (buf[i] == cursor) return cursor;
+                        }
+                    }
+                    finally { _bandDepth--; }
+                    return -1;
+                }
+
+                if (cond == InstinctConditionObject.Food)
+                {
+                    DetailedFoodType[] foods = animal.orderedDetailedFoodTypes;
+                    uint fMask = 0u;
+                    uint dFlags = 0u;
+                    for (int i = 0; i < foods.Length; i++)
+                    {
+                        DetailedFoodType ft = foods[i];
+                        fMask |= 1u << (int)ft;
+                        switch (ft)
+                        {
+                            case DetailedFoodType.Plankton: dFlags |= VBIT_PLANKTON; break;
+                            case DetailedFoodType.SoftPlantTissue: dFlags |= VBIT_ALGA | VBIT_PLANT; break;
+                            case DetailedFoodType.Sap: dFlags |= VBIT_PLANT; break;
+                            case DetailedFoodType.Bark: dFlags |= VBIT_PLANT_BARK; break;
+                            case DetailedFoodType.Nectar: dFlags |= VBIT_PLANT_NECTAR; break;
+                            case DetailedFoodType.Seed: dFlags |= VBIT_PLANT_SEED; break;
+                            case DetailedFoodType.Nut: dFlags |= VBIT_PLANT_NUT; break;
+                            case DetailedFoodType.Fruit: dFlags |= VBIT_PLANT_FRUIT; break;
+                            case DetailedFoodType.FreshMeat:
+                            case DetailedFoodType.OldMeat: dFlags |= VBIT_CARRION; break;
+                            case DetailedFoodType.Fungus: dFlags |= VBIT_FUNGUS; break;
+                            case DetailedFoodType.Grass: dFlags |= VBIT_GRASS; break;
+                            case DetailedFoodType.MarineSnow: dFlags |= VBIT_PLANKTON; break;
+                        }
+                    }
+
+                    AnimalDefinition def = animal.definition;
+                    bool um = def.currentSex > 0 && def.sexes != null && def.currentSex <= def.sexes.Length;
+                    int mi = um ? (def.currentSex - 1) : 0;
+
+                    Vector2 sHue = um ? def.sexes[mi].softPlantTissueDietHueRange : def._softPlantTissueDietHueRange;
+                    Vector2 sBr = um ? def.sexes[mi].softPlantTissueDietBrightnessRange : def._softPlantTissueDietBrightnessRange;
+                    Vector2 fHue = um ? def.sexes[mi].fruitDietHueRange : def._fruitDietHueRange;
+                    q.mode = VMODE_FOOD;
+                    q.food_type_mask = fMask;
+                    q.direct_food_flags = dFlags;
+                    q.invert_soft = (byte)((um ? def.sexes[mi].invertSoftPlantTissueDietColorRange : def._invertSoftPlantTissueDietColorRange) ? 1 : 0);
+                    q.invert_fruit = (byte)((um ? def.sexes[mi].invertFruitDietColorRange : def._invertFruitDietColorRange) ? 1 : 0);
+                    q.can_fly_or_climb = (byte)((animal.canFly || animal.canClimb) ? 1 : 0);
+                    q.eat_height_x10 = animal.canEatAtHeight * 10f;
+                    q.r1_x = sHue.x; q.r1_y = sHue.y;
+                    q.r2_x = sBr.x; q.r2_y = sBr.y;
+                    q.r3_x = fHue.x; q.r3_y = fHue.y;
+
+                    if ((fMask & (1u << (int)DetailedFoodType.Fruit)) != 0)
+                    {
+                        HashSet<FruitShape> ef = um ? def.sexes[mi].excludeFruitShapesFromDiet : def._excludeFruitShapesFromDiet;
+                        if (ef != null && ef.Count > 0)
+                        {
+                            uint efMask = 0u;
+                            foreach (FruitShape fs in ef) efMask |= 1u << (int)fs;
+                            q.exclude_fruit_shapes_mask = efMask;
+                        }
+                    }
+
+                    bool needsSpecies = (fMask & ((1u << (int)DetailedFoodType.WholeAnimal) | (1u << (int)DetailedFoodType.FreshMeat) | (1u << (int)DetailedFoodType.OldMeat) | (1u << (int)DetailedFoodType.Blood))) != 0;
+                    int carnSp = -1;
+                    if (needsSpecies)
+                    {
+                        carnSp = tl.usePopulationBasedClassification
+                            ? tl.populationBasedAnimalClassifier.LookUp(def.definitionIndex)
+                            : (tl.speciesIndexPerDefinitionIndex.TryGetValue(def.definitionIndex, out carnSp) ? carnSp : -1);
+                    }
+                    int carnDictSp = -1;
+                    if ((fMask & (1u << (int)DetailedFoodType.Egg)) != 0)
+                    {
+                        int v;
+                        if (tl.speciesIndexPerDefinitionIndex.TryGetValue(def.definitionIndex, out v)) carnDictSp = v;
+                    }
+                    q.carn_species = carnSp;
+                    q.carn_dict_species = carnDictSp;
+
+                    if ((fMask & ((1u << (int)DetailedFoodType.WholeAnimal) | (1u << (int)DetailedFoodType.Blood) | (1u << (int)DetailedFoodType.Egg) | (1u << (int)DetailedFoodType.Milk))) != 0)
+                    {
+                        q.carn_is_child = (byte)(animal.isChild ? 1 : 0);
+                        q.prudent = (byte)(animal.prudentPredation ? 1 : 0);
+                        q.carn_size = um ? def.sexes[mi].bodySize : def._bodySize;
+                        q.parent_lf_idx = animal.lifeFormIndexOfParent;
+                        Vector2 w1 = um ? def.sexes[mi].wholeAnimalDietHueRange : def._wholeAnimalDietHueRange;
+                        Vector2 w2 = um ? def.sexes[mi].wholeAnimalDietBrightnessRange : def._wholeAnimalDietBrightnessRange;
+                        Vector2 w3 = um ? def.sexes[mi].wholeAnimalDietSecondaryHueRange : def._wholeAnimalDietSecondaryHueRange;
+                        Vector2 w4 = um ? def.sexes[mi].wholeAnimalDietSecondaryBrightnessRange : def._wholeAnimalDietSecondaryBrightnessRange;
+                        q.w1_x = w1.x; q.w1_y = w1.y;
+                        q.w2_x = w2.x; q.w2_y = w2.y;
+                        q.w3_x = w3.x; q.w3_y = w3.y;
+                        q.w4_x = w4.x; q.w4_y = w4.y;
+                        q.invert_whole = (byte)((um ? def.sexes[mi].invertWholeAnimalDietColorRange : def._invertWholeAnimalDietColorRange) ? 1 : 0);
+                        HashSet<SkinPattern> ep = um ? def.sexes[mi].wholeAnimalDietExcludeSkinPatterns : def._wholeAnimalDietExcludeSkinPatterns;
+                        if (ep != null && ep.Count > 0)
+                        {
+                            uint epMask = 0u;
+                            foreach (SkinPattern sp in ep) epMask |= 1u << (int)sp;
+                            q.exclude_skin_pats_mask = epMask;
+                        }
+                    }
+
+                    WorldCell[] cells = worldArea.cells;
+                    while (true)
+                    {
+                        int hit = sapling_vision_search(ref _visionGrid, ref q, out nextD, out nextSlot);
+                        if (hit >= -1) return hit;
+                        // Rare fallback cell (prudentPredation or multi-egg): verify in C# and resume if false.
+                        int candCell = -(hit + 2);
+                        if (CellContainsFoodFast(tl, worldArea, cells, areaIndex, candCell, CellLocationType.Ground, animal) != -1)
+                        {
+                            return candCell;
+                        }
+                        q.start_d = nextD;
+                        q.start_slot = nextSlot;
+                    }
+                }
+
+                if (cond == InstinctConditionObject.AnAnimal && locationType == CellLocationType.Ground)
+                {
+                    uint pMask = 0u;
+                    bool[] choices = instinct.conditionChoices;
+                    if (choices != null)
+                    {
+                        int cLen = choices.Length < 32 ? choices.Length : 32;
+                        for (int i = 0; i < cLen; i++) if (choices[i]) pMask |= 1u << i;
+                    }
+                    if (pMask == 0u) return -1;
+                    q.mode = VMODE_ANIMAL_GROUND;
+                    q.inst_skin_pat_mask = pMask;
+                    q.r1_x = instinct.conditionRange.x; q.r1_y = instinct.conditionRange.y;
+                    q.r2_x = instinct.conditionAdditionalRange.x; q.r2_y = instinct.conditionAdditionalRange.y;
+                    q.r3_x = instinct.conditionAdditionalRange2.x; q.r3_y = instinct.conditionAdditionalRange2.y;
+                    q.r4_x = instinct.conditionAdditionalRange3.x; q.r4_y = instinct.conditionAdditionalRange3.y;
+                    return sapling_vision_search(ref _visionGrid, ref q, out nextD, out nextSlot);
+                }
+
+                if (cond == InstinctConditionObject.AColor && locationType == CellLocationType.Ground)
+                {
+                    q.mode = VMODE_COLOR_GROUND;
+                    q.r1_x = instinct.conditionRange.x; q.r1_y = instinct.conditionRange.y;
+                    q.r2_x = instinct.conditionAdditionalRange.x; q.r2_y = instinct.conditionAdditionalRange.y;
+                    return sapling_vision_search(ref _visionGrid, ref q, out nextD, out nextSlot);
+                }
+
+                if (cond == InstinctConditionObject.APlant)
+                {
+                    q.mode = VMODE_PLANT;
+                    q.r1_x = instinct.conditionRange.x; q.r1_y = instinct.conditionRange.y;
+                    q.r2_x = instinct.conditionAdditionalRange.x; q.r2_y = instinct.conditionAdditionalRange.y;
+                    q.r3_x = instinct.conditionAdditionalRange2.x; q.r3_y = instinct.conditionAdditionalRange2.y;
+                    return sapling_vision_search(ref _visionGrid, ref q, out nextD, out nextSlot);
+                }
+
+                if (cond == InstinctConditionObject.AnAlga)
+                {
+                    q.mode = VMODE_ALGA;
+                    q.r1_x = instinct.conditionRange.x; q.r1_y = instinct.conditionRange.y;
+                    q.r2_x = instinct.conditionAdditionalRange.x; q.r2_y = instinct.conditionAdditionalRange.y;
+                    return sapling_vision_search(ref _visionGrid, ref q, out nextD, out nextSlot);
+                }
+
+                // Remaining See modes (non-Ground AnAnimal/AColor, APotentialMate, fallback):
+                // Use Rust L1-cache flag filter to skip the ~98% empty/enclosed cells.
+                // Fast reject: a mate search can only succeed if the SEARCHER is ready for
+                // internal fertilization as one of the two sexes. Without this, children,
+                // pregnant females and cooldown animals scan the full 20-ring cone and reject
+                // every candidate in CheckCellVisualFast.
+                if (cond == InstinctConditionObject.APotentialMate
+                    && !animal.ReadyForInternalFertilization(false)
+                    && !animal.ReadyForInternalFertilization(true))
+                {
+                    return -1;
+                }
+                uint layerBit = LayerAnimalBit(locationType);
+                if (layerBit == 0u) return -1;
+                q.mode = VMODE_FIRST_FLAG;
+                q.flag_req_mask = layerBit | VBIT_NEST_ENCLOSED;
+                q.flag_req_expected = layerBit;
+                WorldCell[] wCells = worldArea.cells;
+                while (true)
+                {
+                    int hit = sapling_vision_search(ref _visionGrid, ref q, out nextD, out nextSlot);
+                    if (hit < 0) return -1;
+                    if (CheckCellVisualFast(tl, worldArea, wCells, areaIndex, hit, animal, instinct, cond, cursor, unwarpedPlaceInDayNightCycle, locationType, ownSpecies))
+                    {
+                        return hit;
+                    }
+                    q.start_d = nextD;
+                    q.start_slot = nextSlot;
+                }
+            }
+
+            if (isHear)
+            {
+                // Matches retail SearchNearbyCellsForInstinctTrigger: Hear only checks step sounds
+                // for rings d = (floor(y) + 1) .. floor(y + 4) where !flag becomes true.
+                int hearStart = (int)Math.Floor((double)y) + 1;
+                if (hearStart < startD + 1) hearStart = startD + 1;
+                int hearMax = (int)Math.Floor((double)(y + 4f));
+                if (hearStart > hearMax || hearStart > 20) return -1;
+                uint layerBit = LayerAnimalBit(locationType);
+                if (layerBit == 0u) return -1;
+
+                q.mode = VMODE_FIRST_FLAG;
+                q.start_d = hearStart;
+                q.max_d = hearMax;
+                q.flag_req_mask = layerBit;
+                q.flag_req_expected = layerBit;
+
+                float minPitch = instinct.conditionRange.x;
+                float maxPitch = instinct.conditionRange.y;
+                WorldCell[] wCells = worldArea.cells;
+                while (true)
+                {
+                    int hit = sapling_vision_search(ref _visionGrid, ref q, out nextD, out nextSlot);
+                    if (hit < 0) return -1;
+                    LivingAnimal animInCell = GetAnimalInCellFast(wCells[hit], locationType);
+                    if (animInCell != null)
+                    {
+                        SoundDefinition stepSound = animInCell.stepSound;
+                        if (stepSound != null && (float)nextD - stepSound.loudness <= y)
+                        {
+                            float[] pitches = stepSound.pitches;
+                            for (int p = 0; p < pitches.Length; p++)
+                            {
+                                float pitch = pitches[p];
+                                if (pitch > minPitch && pitch < maxPitch) return hit;
+                            }
+                        }
+                    }
+                    q.start_d = nextD;
+                    q.start_slot = nextSlot;
+                }
+            }
+
+            return -1;
+        }
+
+        // Direct steepness stepping helpers (bypass Harmony trampolines inside ManageTravelsFast).
+        private static int StepSteepDirect(WorldArea area, WorldCell[] cells, int index, WindDirection direction, float maxSteepness)
+        {
+            float sx = area.size.x;
+            float sy = area.size.y;
+            int sizeXInt = (int)sx;
+            int sizeYInt = (int)sy;
+            if (sizeYInt <= 0 || sizeXInt <= 0 || (float)sizeXInt != sx || (float)sizeYInt != sy)
+            {
+                return area.StepFromCellWithIndexInDirectionWithMaxSteepness(index, direction, maxSteepness);
+            }
+            int maxCell = sizeXInt * sizeYInt - 1;
+            switch (direction)
+            {
+                case WindDirection.East:
+                case WindDirection.West:
+                case WindDirection.North:
+                case WindDirection.South:
+                    return StepSteepCardinalFast(cells, sizeXInt, sizeYInt, maxCell, index, direction, maxSteepness);
+                case WindDirection.NorthWest:
+                {
+                    int n = StepSteepCardinalFast(cells, sizeXInt, sizeYInt, maxCell, index, WindDirection.North, maxSteepness);
+                    return (n != -1) ? StepSteepCardinalFast(cells, sizeXInt, sizeYInt, maxCell, n, WindDirection.West, maxSteepness) : -1;
+                }
+                case WindDirection.NorthEast:
+                {
+                    int n = StepSteepCardinalFast(cells, sizeXInt, sizeYInt, maxCell, index, WindDirection.North, maxSteepness);
+                    return (n != -1) ? StepSteepCardinalFast(cells, sizeXInt, sizeYInt, maxCell, n, WindDirection.East, maxSteepness) : -1;
+                }
+                case WindDirection.SouthWest:
+                {
+                    int n = StepSteepCardinalFast(cells, sizeXInt, sizeYInt, maxCell, index, WindDirection.South, maxSteepness);
+                    return (n != -1) ? StepSteepCardinalFast(cells, sizeXInt, sizeYInt, maxCell, n, WindDirection.West, maxSteepness) : -1;
+                }
+                case WindDirection.SouthEast:
+                {
+                    int n = StepSteepCardinalFast(cells, sizeXInt, sizeYInt, maxCell, index, WindDirection.South, maxSteepness);
+                    return (n != -1) ? StepSteepCardinalFast(cells, sizeXInt, sizeYInt, maxCell, n, WindDirection.East, maxSteepness) : -1;
+                }
+                default:
+                    return 0;
+            }
+        }
+
+        private static int MoveSingleStepSteepDirect(WorldArea area, WorldCell[] cells, int currentCellIndex, int goalCellIndex, float maxSteepness)
+        {
+            int len = cells.Length;
+            if (currentCellIndex == -1 || currentCellIndex >= len || goalCellIndex == -1 || goalCellIndex >= len || currentCellIndex == goalCellIndex)
+            {
+                return -1;
+            }
+            float sx = area.size.x;
+            float sy = area.size.y;
+            int sizeXInt = (int)sx;
+            int sizeYInt = (int)sy;
+            if (sizeYInt <= 0 || sizeXInt <= 0 || (float)sizeXInt != sx || (float)sizeYInt != sy)
+            {
+                return area.MoveSingleStepInDirectionOfCellWithMaxSteepness(currentCellIndex, goalCellIndex, maxSteepness);
+            }
+            int cx = currentCellIndex / sizeYInt;
+            int cy = currentCellIndex % sizeYInt;
+            int gx = goalCellIndex / sizeYInt;
+            int gy = goalCellIndex % sizeYInt;
+            int dx = gx - cx;
+            int dy = gy - cy;
+            int adx = (dx < 0) ? -dx : dx;
+            int ady = (dy < 0) ? -dy : dy;
+            if (adx > ady) cx += (dx > 0) ? 1 : -1;
+            else cy += (dy > 0) ? 1 : -1;
+            if (cx < 0) cx = 0;
+            else if (cx > sizeYInt - 1) cx = sizeYInt - 1;
+            if (cy < 0) cy = 0;
+            else if (cy > sizeXInt - 1) cy = sizeXInt - 1;
+            int next = cx * sizeYInt + cy;
+            return ((uint)next < (uint)len && cells[next].CalculateNormalizedSteepness() <= maxSteepness) ? next : -1;
+        }
+
+        // Travel object pool for active Time Jumps (eliminates ~400k+ short-lived Travel allocs/5s).
+        private static Travel RentTravel(
+            LivingAnimal animal,
+            ModeOfTransport modeOfTransport,
+            int sourceCellIndex,
+            int goalCellIndex,
+            CellLocationType sourceLocationType,
+            CellLocationType goalLocationType,
+            int distance)
+        {
+            if (_travelPool.Count == 0)
+            {
+                return new Travel(animal, modeOfTransport, sourceCellIndex, goalCellIndex, sourceLocationType, goalLocationType, distance);
+            }
+            Travel t = _travelPool.Pop();
+            t.animal = animal;
+            t.modeOfTransport = modeOfTransport;
+            switch (modeOfTransport)
+            {
+                case ModeOfTransport.SwimAtSurface: t.stepSize = distance + 1; break;
+                case ModeOfTransport.SwimUnderWater: t.stepSize = Mathf.Ceil(animal.swimmingSpeed); break;
+                default: t.stepSize = animal.speed; break;
+            }
+            t.sourceCellIndex = sourceCellIndex;
+            t.goalCellIndex = goalCellIndex;
+            t.sourceLocationType = sourceLocationType;
+            t.goalLocationType = goalLocationType;
+            t.intermediateCellIndices = _emptyIntList;
+            t.progress = 0f;
+            t.currentDuration = 0;
+            t.direction = Travel.FigureOutTravelDirectionFromCellIndices(sourceCellIndex, goalCellIndex);
+            t.distance = distance;
+            t.containsDive = false;
+            t.diveToCellWithIndex = -1;
+            t.diveToFoodTypeWithIndex = -1;
+            t.diveToEggWithIndex = -1;
+            t.finished = false;
+            t.succeeded = false;
+            return t;
+        }
+
+        private static void ReturnTravel(Travel t)
+        {
+            if (t == null || _travelPool.Count >= 4096) return;
+            t.animal = null;
+            t.intermediateCellIndices = null;
+            _travelPool.Push(t);
+        }
+
+        // Zero-alloc WorldArea.GetAllCellsDirectlyAround (eliminates ~286k int[8] allocs/5s in grassAdministration).
+        // Audited all 4 callers in Assembly-CSharp (TimeLine.cs:713, 1694, 4573, 5638): none nest or retain the array.
+        [HarmonyPatch(typeof(WorldArea), nameof(WorldArea.GetAllCellsDirectlyAround))]
+        [HarmonyPrefix]
+        public static bool WorldArea_GetAllCellsDirectlyAround_Prefix(WorldArea __instance, int cellIndex, ref int[] __result)
+        {
+            if (!Enabled || __instance == null) return true;
+            float sx = __instance.size.x;
+            float sy = __instance.size.y;
+            int sizeXInt = (int)sx;
+            int sizeYInt = (int)sy;
+            if (sizeXInt <= 0 || sizeYInt <= 0 || (float)sizeXInt != sx || (float)sizeYInt != sy) return true;
+
+            int vx = cellIndex / sizeYInt;
+            int vy = cellIndex % sizeYInt;
+            int maxX = sizeXInt - 1;
+            int maxY = sizeYInt - 1;
+
+            _aroundScratch[0] = (vx > 0) ? ((vx - 1) * sizeYInt + vy) : -1;
+            _aroundScratch[1] = (vx < maxX) ? ((vx + 1) * sizeYInt + vy) : -1;
+            _aroundScratch[2] = (vy > 0) ? (vx * sizeYInt + (vy - 1)) : -1;
+            _aroundScratch[3] = (vy < maxY) ? (vx * sizeYInt + (vy + 1)) : -1;
+            _aroundScratch[4] = (vx > 0 && vy > 0) ? ((vx - 1) * sizeYInt + (vy - 1)) : -1;
+            _aroundScratch[5] = (vx < maxX && vy < maxY) ? ((vx + 1) * sizeYInt + (vy + 1)) : -1;
+            _aroundScratch[6] = (vx > 0 && vy < maxY) ? ((vx - 1) * sizeYInt + (vy + 1)) : -1;
+            _aroundScratch[7] = (vx < maxX && vy > 0) ? ((vx + 1) * sizeYInt + (vy - 1)) : -1;
+
+            __result = _aroundScratch;
+            return false;
+        }
+
+        // 1-entry cache for TemporaryObjectAdministration daily expiration lookups.
+        // Eliminates ~3.2M Dictionary.ContainsKey + indexer lookups per 5s across grass/seed/egg/carrion/fungus loops.
+        private static TemporaryObjectAdministration _expCacheAdmin;
+        private static int _expCacheDay = int.MinValue;
+        private static bool _expCacheFound;
+        private static bool _expCacheEventBased;
+        private static List<AdministrationEvent> _expCacheEvList;
+        private static List<int> _expCacheAreas;
+        private static List<int> _expCacheCells;
+        private static List<int> _expCacheIndices;
+
+        private static void PopulateExpCache(TemporaryObjectAdministration admin, int day)
+        {
+            _expCacheAdmin = admin;
+            _expCacheDay = day;
+            _expCacheEventBased = admin.eventBased;
+            if (_expCacheEventBased)
+            {
+                _expCacheFound = admin.expirationEventsPerDay != null && admin.expirationEventsPerDay.TryGetValue(day, out _expCacheEvList) && _expCacheEvList != null;
+                _expCacheAreas = null;
+                _expCacheCells = null;
+                _expCacheIndices = null;
+            }
+            else
+            {
+                Dictionary<int, List<int>> cDict = AdminExpireCellsRef(admin);
+                Dictionary<int, List<int>> aDict = AdminExpireAreasRef(admin);
+                _expCacheFound = cDict != null && aDict != null && cDict.TryGetValue(day, out _expCacheCells) && _expCacheCells != null && aDict.TryGetValue(day, out _expCacheAreas) && _expCacheAreas != null;
+                _expCacheEvList = null;
+                _expCacheIndices = null;
+                if (_expCacheFound && AdminKeepIndexRef(admin))
+                {
+                    Dictionary<int, List<int>> iDict = AdminExpireIndexRef(admin);
+                    if (iDict != null) iDict.TryGetValue(day, out _expCacheIndices);
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(TemporaryObjectAdministration), nameof(TemporaryObjectAdministration.RemoveDay))]
+        [HarmonyPrefix]
+        public static void TemporaryObjectAdministration_RemoveDay_InvalidateCache(TemporaryObjectAdministration __instance)
+        {
+            if (object.ReferenceEquals(__instance, _expCacheAdmin))
+            {
+                _expCacheAdmin = null;
+                _expCacheDay = int.MinValue;
+            }
+        }
+
+        [HarmonyPatch(typeof(TemporaryObjectAdministration), nameof(TemporaryObjectAdministration.Add))]
+        [HarmonyPostfix]
+        public static void TemporaryObjectAdministration_Add_InvalidateCache(TemporaryObjectAdministration __instance, int expirationDay)
+        {
+            if (object.ReferenceEquals(__instance, _expCacheAdmin) && expirationDay == _expCacheDay && !_expCacheFound)
+            {
+                _expCacheAdmin = null;
+                _expCacheDay = int.MinValue;
+            }
+        }
+
+        [HarmonyPatch(typeof(TemporaryObjectAdministration), nameof(TemporaryObjectAdministration.GetNumberOfExpirationCellsForDay))]
+        [HarmonyPrefix]
+        public static bool TemporaryObjectAdministration_GetNumExpCells_Prefix(TemporaryObjectAdministration __instance, int day, ref int __result)
+        {
+            if (!Enabled || __instance == null) return true;
+            if (!object.ReferenceEquals(__instance, _expCacheAdmin) || _expCacheDay != day) PopulateExpCache(__instance, day);
+            if (!_expCacheFound) { __result = 0; return false; }
+            __result = _expCacheEventBased ? _expCacheEvList.Count : _expCacheCells.Count;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(TemporaryObjectAdministration), nameof(TemporaryObjectAdministration.GetExpirationAreaForDay))]
+        [HarmonyPrefix]
+        public static bool TemporaryObjectAdministration_GetExpArea_Prefix(TemporaryObjectAdministration __instance, int day, int index, ref int __result)
+        {
+            if (!Enabled || __instance == null) return true;
+            if (!object.ReferenceEquals(__instance, _expCacheAdmin) || _expCacheDay != day) PopulateExpCache(__instance, day);
+            if (!_expCacheFound) { __result = -1; return false; }
+            __result = _expCacheEventBased ? _expCacheEvList[index].area : _expCacheAreas[index];
+            return false;
+        }
+
+        [HarmonyPatch(typeof(TemporaryObjectAdministration), nameof(TemporaryObjectAdministration.GetExpirationCellForDay))]
+        [HarmonyPrefix]
+        public static bool TemporaryObjectAdministration_GetExpCell_Prefix(TemporaryObjectAdministration __instance, int day, int index, ref int __result)
+        {
+            if (!Enabled || __instance == null) return true;
+            if (!object.ReferenceEquals(__instance, _expCacheAdmin) || _expCacheDay != day) PopulateExpCache(__instance, day);
+            if (!_expCacheFound) { __result = -1; return false; }
+            __result = _expCacheEventBased ? _expCacheEvList[index].cell : _expCacheCells[index];
+            return false;
+        }
+
+        [HarmonyPatch(typeof(TemporaryObjectAdministration), nameof(TemporaryObjectAdministration.GetExpireWithIndexForDay))]
+        [HarmonyPrefix]
+        public static bool TemporaryObjectAdministration_GetExpIdx_Prefix(TemporaryObjectAdministration __instance, int day, int index, ref int __result)
+        {
+            if (!Enabled || __instance == null) return true;
+            if (!object.ReferenceEquals(__instance, _expCacheAdmin) || _expCacheDay != day) PopulateExpCache(__instance, day);
+            if (!_expCacheFound) { __result = -1; return false; }
+            if (_expCacheEventBased) { __result = _expCacheEvList[index].index; return false; }
+            __result = (_expCacheIndices != null) ? _expCacheIndices[index] : -1;
             return false;
         }
     }

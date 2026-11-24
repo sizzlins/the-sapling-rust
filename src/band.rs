@@ -21,7 +21,7 @@ pub const MAX_DISTANCE: i32 = 20;
 
 /// `(x, y, pointer)` per distance. `pointer` selects one of up to 16
 /// eight-slot blocks, so the output is `8 * pairs` ints long.
-static BAND: [&[(u8, u8, u8)]; 21] = [
+pub(crate) static BAND: [&[(u8, u8, u8)]; 21] = [
     &[], // 0 - no case; caller gets an empty band
     &[(0, 1, 0)], // 1
     &[(0, 2, 0), (1, 1, 1)], // 2

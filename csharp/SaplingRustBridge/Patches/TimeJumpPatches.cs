@@ -28,12 +28,12 @@ namespace SaplingRustBridge.Patches
         //
         // 2. WorldController's in-world jump runs with the world visible, so a
         //    large budget there is a visibly frozen frame. This one stays small.
-        public static int JumpScreenBudgetMs = 850;
+        public static int JumpScreenBudgetMs = 150;
         public static int InWorldJumpBudgetMs = 12;
 
-        // Days handed to JumpAhead at a time. Purely a cancellation-granularity knob; the time
-        // budget is what actually ends the frame.
-        private const int JumpBatchDays = 25;
+        // Days handed to JumpAhead at a time. 1 keeps cancellation and the frame budget
+        // exact even on dense late-game worlds where 25 days took 1.5-2.1s without yielding.
+        private const int JumpBatchDays = 1;
 
         // Throughput reporting so a jump's days/second can be read straight out of the log.
         private static long _jumpStartTimestamp;
@@ -320,11 +320,16 @@ namespace SaplingRustBridge.Patches
                 // never read until the jump ended. Restoring the reset keeps the
                 // jump byte-for-byte vanilla while still avoiding the
                 // reallocation cost inside the day loop.
-                __instance.areaAndCellIndexOfPlantsRecentlyDiedFromSoftness = new UnityScript.Lang.Array();
-                __instance.areaAndCellIndexOfPlantsRecentlyDiedFromIncorrectGroundWater = new UnityScript.Lang.Array();
-                __instance.areaAndCellIndexOfPlantsRecentlyDamagedByHighTemperature = new UnityScript.Lang.Array();
-                __instance.areaAndCellIndexOfPlantsRecentlyDamagedByLowTemperature = new UnityScript.Lang.Array();
-                __instance.areaAndCellIndexOfPlantsRecentlyDamagedByWind = new UnityScript.Lang.Array();
+                if (__instance.areaAndCellIndexOfPlantsRecentlyDiedFromSoftness == null || __instance.areaAndCellIndexOfPlantsRecentlyDiedFromSoftness.length > 0)
+                    __instance.areaAndCellIndexOfPlantsRecentlyDiedFromSoftness = new UnityScript.Lang.Array();
+                if (__instance.areaAndCellIndexOfPlantsRecentlyDiedFromIncorrectGroundWater == null || __instance.areaAndCellIndexOfPlantsRecentlyDiedFromIncorrectGroundWater.length > 0)
+                    __instance.areaAndCellIndexOfPlantsRecentlyDiedFromIncorrectGroundWater = new UnityScript.Lang.Array();
+                if (__instance.areaAndCellIndexOfPlantsRecentlyDamagedByHighTemperature == null || __instance.areaAndCellIndexOfPlantsRecentlyDamagedByHighTemperature.length > 0)
+                    __instance.areaAndCellIndexOfPlantsRecentlyDamagedByHighTemperature = new UnityScript.Lang.Array();
+                if (__instance.areaAndCellIndexOfPlantsRecentlyDamagedByLowTemperature == null || __instance.areaAndCellIndexOfPlantsRecentlyDamagedByLowTemperature.length > 0)
+                    __instance.areaAndCellIndexOfPlantsRecentlyDamagedByLowTemperature = new UnityScript.Lang.Array();
+                if (__instance.areaAndCellIndexOfPlantsRecentlyDamagedByWind == null || __instance.areaAndCellIndexOfPlantsRecentlyDamagedByWind.length > 0)
+                    __instance.areaAndCellIndexOfPlantsRecentlyDamagedByWind = new UnityScript.Lang.Array();
                 return false;
             }
             return true;

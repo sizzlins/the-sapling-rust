@@ -524,6 +524,212 @@ namespace SaplingRustBridge.Patches
                 placed.isChild = false;
             }
         }
+
+        // 16. Root fix for IndexOutOfRangeException in TimeLine.CountAnimal -> UpdateSpeciesPopulationSizes
+        //     which froze dayIndex on `dayIndex % 100 == 5` and caused repeated ShowToday lag spikes.
+        //
+        //     Root cause: TimeLine.ListAllDefinitionIndices() only scans adult animals/plants/algae/fungi
+        //     on cells and omits eggs[], carried babies, seeds, dormant seeds, spores, and grass. When
+        //     PruneExtinctDefinitionIndices() runs, it deletes their definitionIndex from the classifier;
+        //     once an egg hatches or a carried baby is dropped, LookUp(defIdx) returns -1 and
+        //     CountAnimal crashes on `speciesPopulationSizes[-1]++` before LiveADay can increment dayIndex.
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.ListAllDefinitionIndices))]
+        [HarmonyPostfix]
+        public static void TimeLine_ListAllDefinitionIndices_IncludePending_Postfix(TimeLine __instance, HashSet<int> __result)
+        {
+            if (__instance == null || __result == null || __instance.today == null || __instance.today.areas == null) return;
+            WorldArea[] areas = __instance.today.areas;
+            for (int a = 0; a < areas.Length; a++)
+            {
+                WorldArea area = areas[a];
+                if (area == null || area.cells == null) continue;
+                WorldCell[] cells = area.cells;
+                for (int c = 0; c < cells.Length; c++)
+                {
+                    WorldCell cell = cells[c];
+                    if (cell == null) continue;
+
+                    if (cell.algaSpore != null && cell.algaSpore.definition != null)
+                        __result.Add(cell.algaSpore.definition.definitionIndex);
+                    if (cell.seed != null && cell.seed.definition != null)
+                        __result.Add(cell.seed.definition.definitionIndex);
+                    if (cell.dormantSeed != null && cell.dormantSeed.definition != null)
+                        __result.Add(cell.dormantSeed.definition.definitionIndex);
+                    if (cell.grassHeight > 0 && cell.grassDefinitionIndex != -1)
+                        __result.Add(cell.grassDefinitionIndex);
+                    if (cell.plant != null && cell.plant.fertilized && cell.plant.fertilizedByPlant != null)
+                        __result.Add(cell.plant.fertilizedByPlant.definitionIndex);
+
+                    LivingAnimal[] eggs = cell.eggs;
+                    if (eggs != null)
+                    {
+                        for (int e = 0; e < eggs.Length; e++)
+                        {
+                            LivingAnimal egg = eggs[e];
+                            if (egg != null && egg.definition != null)
+                            {
+                                __result.Add(egg.definition.definitionIndex);
+                                if (egg.infectedByParasite != null && egg.infectedByParasite.definition != null)
+                                    __result.Add(egg.infectedByParasite.definition.definitionIndex);
+                            }
+                        }
+                    }
+
+                    AddPendingAnimalDefs(cell.animal, __result);
+                    AddPendingAnimalDefs(cell.animalInTree, __result);
+                    AddPendingAnimalDefs(cell.animalInTheAir, __result);
+                    AddPendingAnimalDefs(cell.animalAtWaterSurface, __result);
+                    AddPendingAnimalDefs(cell.animalUnderWater, __result);
+                    AddPendingAnimalDefs(cell.animalInDeepSea, __result);
+                }
+            }
+        }
+
+        private static void AddPendingAnimalDefs(LivingAnimal animal, HashSet<int> set)
+        {
+            if (animal == null) return;
+            if (animal.carryingBaby && animal.babyBeingCarried != null && animal.babyBeingCarried.definition != null)
+            {
+                set.Add(animal.babyBeingCarried.definition.definitionIndex);
+                if (animal.babyBeingCarried.infectedByParasite != null && animal.babyBeingCarried.infectedByParasite.definition != null)
+                    set.Add(animal.babyBeingCarried.infectedByParasite.definition.definitionIndex);
+            }
+            if (animal.fertilized && animal.fertilizedByAnimal != null)
+            {
+                set.Add(animal.fertilizedByAnimal.definitionIndex);
+            }
+            if (animal.seedsCarryingAround != null)
+            {
+                for (int i = 0; i < animal.seedsCarryingAround.Count; i++)
+                {
+                    LivingPlant s = animal.seedsCarryingAround[i];
+                    if (s != null && s.definition != null) set.Add(s.definition.definitionIndex);
+                }
+            }
+            if (animal.fungalSporesCarryingAround != null)
+            {
+                for (int i = 0; i < animal.fungalSporesCarryingAround.Count; i++)
+                {
+                    LivingFungus f = animal.fungalSporesCarryingAround[i];
+                    if (f != null && f.definition != null) set.Add(f.definition.definitionIndex);
+                }
+            }
+        }
+
+        // Guard TimeLine.CountAnimal against pruned/unregistered definitionIndex (-1) on existing saves,
+        // and self-heal orphaned animals via their parent definition's species when available.
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.CountAnimal))]
+        [HarmonyPrefix]
+        public static bool TimeLine_CountAnimal_SafeBounds_Prefix(
+            TimeLine __instance,
+            LivingAnimal animal,
+            int[] speciesPopulationSizes,
+            int[] manuallyAddedOrganismsPerSpecies)
+        {
+            if (__instance == null || animal == null || animal.definition == null || speciesPopulationSizes == null)
+            {
+                return false;
+            }
+
+            int defIdx = animal.definition.definitionIndex;
+            int animalSp = -1;
+            if (__instance.usePopulationBasedClassification)
+            {
+                animalSp = __instance.populationBasedAnimalClassifier.LookUp(defIdx);
+                if (animalSp < 0 && animal.definitionIndexOfParent >= 0)
+                {
+                    int parentSp = __instance.populationBasedAnimalClassifier.LookUp(animal.definitionIndexOfParent);
+                    if (parentSp >= 0 && parentSp < speciesPopulationSizes.Length)
+                    {
+                        __instance.populationBasedAnimalClassifier.speciesPerDefinition[defIdx] = parentSp;
+                        animalSp = parentSp;
+                    }
+                }
+            }
+            else if (__instance.speciesIndexPerDefinitionIndex != null)
+            {
+                __instance.speciesIndexPerDefinitionIndex.TryGetValue(defIdx, out animalSp);
+            }
+
+            if (animalSp >= 0 && animalSp < speciesPopulationSizes.Length)
+            {
+                speciesPopulationSizes[animalSp]++;
+                if (animal.manuallyAdded && manuallyAddedOrganismsPerSpecies != null && animalSp < manuallyAddedOrganismsPerSpecies.Length)
+                {
+                    manuallyAddedOrganismsPerSpecies[animalSp]++;
+                }
+            }
+
+            LivingFungus parasite = animal.infectedByParasite;
+            if (parasite != null && parasite.definition != null)
+            {
+                int pDefIdx = parasite.definition.definitionIndex;
+                int pSp = -1;
+                if (__instance.usePopulationBasedClassification)
+                {
+                    pSp = __instance.populationBasedFungusClassifier.LookUp(pDefIdx);
+                }
+                else if (__instance.speciesIndexPerDefinitionIndex != null)
+                {
+                    __instance.speciesIndexPerDefinitionIndex.TryGetValue(pDefIdx, out pSp);
+                }
+                if (pSp >= 0 && pSp < speciesPopulationSizes.Length)
+                {
+                    speciesPopulationSizes[pSp]++;
+                }
+            }
+
+            return false;
+        }
+
+        // Fix vanilla AnimalDefinition.Clone() sex-wipe bug during sexual blending:
+        // AnimalDefinition.Clone() temporarily sets currentSex=0 and never restores it on the returned clone,
+        // so AnimalBlender.BlendAnimals() silently overwrites 100% of cross-variant offspring to sex 0 (e.g. Female),
+        // driving every strictly sexual 2-sex species extinct once mutations occur.
+        [HarmonyPatch(typeof(AnimalBlender), nameof(AnimalBlender.BlendAnimals))]
+        [HarmonyPostfix]
+        public static void AnimalBlender_BlendAnimals_PreserveSex_Postfix(AnimalDefinition animalA, AnimalDefinition __result)
+        {
+            if (animalA != null && __result != null)
+            {
+                __result.currentSex = animalA.currentSex;
+            }
+        }
+
+        // Guard vanilla AnimalArmatureBuilder.AddBoneForTorsoPartSide against KeyNotFoundException
+        // when GetAllChildrenForTorsoPart returns a body part (e.g., on an upright/horizontal morph mismatch
+        // or a side skipped by AnimalMeshBuilder) that has no entry in *InfoPerLocationOnTorso.
+        [HarmonyPatch(typeof(AnimalArmatureBuilder), nameof(AnimalArmatureBuilder.AddBoneForTorsoPartSide))]
+        [HarmonyPrefix]
+        public static bool AnimalArmatureBuilder_AddBoneForTorsoPartSide_Prefix(
+            AnimalArmatureBuilder __instance,
+            AnimalLocation location,
+            TorsoPartLocationOffset offset)
+        {
+            if (__instance == null || __instance.definition == null || location == null ||
+                location.indices == null || location.indices.Length == 0 ||
+                location.directions == null || location.directions.Length == 0)
+            {
+                return false;
+            }
+
+            BodyPartDefinition part = __instance.definition.GetBodyPartOnLocation(location, true, __instance.youngVersion);
+            if (part == null) return false;
+
+            LocationOnAnimalTorso key = new LocationOnAnimalTorso(location.indices[0], location.directions[0], false, offset);
+            if (part is LimbDefinition)
+                return __instance.limbInfoPerLocationOnTorso != null && __instance.limbInfoPerLocationOnTorso.ContainsKey(key);
+            if (part is MouthDefinition)
+                return __instance.mouthInfoPerLocationOnTorso != null && __instance.mouthInfoPerLocationOnTorso.ContainsKey(key);
+            if (part is EarDefinition)
+                return __instance.earInfoPerLocationOnTorso != null && __instance.earInfoPerLocationOnTorso.ContainsKey(key);
+            if (part is EyeDefinition)
+                return __instance.eyeInfoPerLocationOnTorso != null && __instance.eyeInfoPerLocationOnTorso.ContainsKey(key);
+            if (part is AnimalAccessoireDefinition)
+                return __instance.accessoireInfoPerLocationOnTorso != null && __instance.accessoireInfoPerLocationOnTorso.ContainsKey(key);
+
+            return true;
+        }
     }
 }
 

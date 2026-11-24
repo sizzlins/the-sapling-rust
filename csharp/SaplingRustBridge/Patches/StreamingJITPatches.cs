@@ -144,6 +144,112 @@ namespace SaplingRustBridge.Patches
             }
         }
 
+        // Fast private field accessors for PrebuiltOrganismLibrary species blueprint caches
+        // so GetPrebuiltOrganismProfileBased can reuse recycled GameObjects from OrganismObjectPool
+        // keyed by the species blueprint's CopiedOrganism (definitionIndex, sexIndex).
+        private static readonly AccessTools.FieldRef<PrebuiltOrganismLibrary, Dictionary<SpeciesAndSexIndex, GameObject>> SpeciesYoungDictRef =
+            AccessTools.FieldRefAccess<PrebuiltOrganismLibrary, Dictionary<SpeciesAndSexIndex, GameObject>>("gameObjectsYoungVersionForSpeciesIndex");
+        private static readonly AccessTools.FieldRef<PrebuiltOrganismLibrary, Dictionary<SpeciesAndSexIndex, GameObject>> SpeciesOldDictRef =
+            AccessTools.FieldRefAccess<PrebuiltOrganismLibrary, Dictionary<SpeciesAndSexIndex, GameObject>>("gameObjectsOldVersionForSpeciesIndex");
+        private static readonly AccessTools.FieldRef<PrebuiltOrganismLibrary, Dictionary<DefinitionAndSexIndex, GameObject>> DefYoungDictRef =
+            AccessTools.FieldRefAccess<PrebuiltOrganismLibrary, Dictionary<DefinitionAndSexIndex, GameObject>>("gameObjectsYoungVersionForDefinitionIndex");
+        private static readonly AccessTools.FieldRef<PrebuiltOrganismLibrary, Dictionary<DefinitionAndSexIndex, GameObject>> DefOldDictRef =
+            AccessTools.FieldRefAccess<PrebuiltOrganismLibrary, Dictionary<DefinitionAndSexIndex, GameObject>>("gameObjectsOldVersionForDefinitionIndex");
+        private static readonly AccessTools.FieldRef<PrebuiltOrganismLibrary, Dictionary<LibraryProfile, GameObject>> ProfileYoungDictRef =
+            AccessTools.FieldRefAccess<PrebuiltOrganismLibrary, Dictionary<LibraryProfile, GameObject>>("gameObjectsYoungVersionForProfile");
+        private static readonly AccessTools.FieldRef<PrebuiltOrganismLibrary, Dictionary<LibraryProfile, GameObject>> ProfileOldDictRef =
+            AccessTools.FieldRefAccess<PrebuiltOrganismLibrary, Dictionary<LibraryProfile, GameObject>>("gameObjectsOldVersionForProfile");
+
+        // Root fix for 1-2.5s/day ShowAnimalViewsForArea freezes & +1.7 GB native RAM churn:
+        // WorldView.ShowAnimalViewsForArea looks up OrganismObjectPool by the individual mutant's
+        // definitionIndex, which misses 99% of the time because blueprints stamp CopiedOrganism with
+        // species.exampleOrganism.definitionIndex (or the shared profile blueprint's definitionIndex).
+        // Every birth/grow-up then fell through to Object.Instantiate() while thousands of recycled
+        // GameObjects piled up unused in the pool. Pop a recycled copy of the matched blueprint from
+        // OrganismObjectPool before instantiating, and mark ProfileBased so ShowAnimalViewsForArea
+        // applies the exact species color via our cached sharedMaterial RecolorAnimal.
+        [HarmonyPatch(typeof(PrebuiltOrganismLibrary), nameof(PrebuiltOrganismLibrary.GetPrebuiltOrganismProfileBased))]
+        [HarmonyPrefix]
+        public static bool PrebuiltOrganismLibrary_GetPrebuiltOrganismProfileBased_Prefix(
+            PrebuiltOrganismLibrary __instance,
+            int definitionIndex,
+            int sexIndex,
+            int speciesIndex,
+            LibraryProfile profile,
+            bool youngVersion,
+            ref GameObject __result)
+        {
+            WorldView wv = LODPatches.ActiveWorldView;
+            if (__instance == null || wv == null || !object.ReferenceEquals(__instance, wv.prebuiltAnimalLibrary))
+            {
+                return true;
+            }
+            if (__instance.profileParameter0IsCrucial || __instance.profileParameter1IsCrucial ||
+                __instance.profileParameter2IsCrucial || __instance.profileParameter3IsCrucial)
+            {
+                return true;
+            }
+            OrganismObjectPool pool = wv.organismObjectPool;
+            if (pool == null || !pool.enabled) return true;
+
+            GameObject blueprint = null;
+
+            Dictionary<SpeciesAndSexIndex, GameObject> sDict = youngVersion ? SpeciesYoungDictRef(__instance) : SpeciesOldDictRef(__instance);
+            if (sDict != null)
+            {
+                if (!sDict.TryGetValue(new SpeciesAndSexIndex(speciesIndex, sexIndex), out blueprint) || blueprint == null)
+                {
+                    if (sexIndex != 0)
+                    {
+                        sDict.TryGetValue(new SpeciesAndSexIndex(speciesIndex, 0), out blueprint);
+                    }
+                }
+            }
+
+            if (blueprint == null)
+            {
+                Dictionary<DefinitionAndSexIndex, GameObject> dDict = youngVersion ? DefYoungDictRef(__instance) : DefOldDictRef(__instance);
+                if (dDict != null)
+                {
+                    if (!dDict.TryGetValue(new DefinitionAndSexIndex(definitionIndex, sexIndex), out blueprint) || blueprint == null)
+                    {
+                        if (sexIndex != 0)
+                        {
+                            dDict.TryGetValue(new DefinitionAndSexIndex(definitionIndex, 0), out blueprint);
+                        }
+                    }
+                }
+            }
+
+            if (blueprint == null && profile != null)
+            {
+                Dictionary<LibraryProfile, GameObject> pDict = youngVersion ? ProfileYoungDictRef(__instance) : ProfileOldDictRef(__instance);
+                if (pDict != null)
+                {
+                    pDict.TryGetValue(profile, out blueprint);
+                }
+            }
+
+            if (blueprint == null) return true;
+
+            CopiedOrganism co = blueprint.GetComponent<CopiedOrganism>();
+            if (co != null)
+            {
+                GameObject recycled = pool.GetFullSpecificOrganism(co.definitionIndex, co.sexIndex, youngVersion);
+                if (recycled != null)
+                {
+                    // Use ProfileBased so ShowAnimalViewsForArea refreshes species colors (fast & leak-free
+                    // via our cached sharedMaterial RecolorAnimal) even if this pooled copy previously served
+                    // another species sharing the same LibraryProfile.
+                    __instance.lastUsedStorageApproach = StorageApproach.ProfileBased;
+                    SanitizeAnimalInfo(recycled);
+                    __result = recycled;
+                    return false;
+                }
+            }
+            return true;
+        }
+
         [HarmonyPatch(typeof(PrebuiltOrganismLibrary), nameof(PrebuiltOrganismLibrary.GetPrebuiltOrganismProfileBased))]
         [HarmonyPostfix]
         public static void PrebuiltOrganismLibrary_GetPrebuiltOrganismProfileBased_Postfix(
@@ -167,6 +273,30 @@ namespace SaplingRustBridge.Patches
             if (__result != null)
             {
                 SanitizeAnimalInfo(__result);
+            }
+        }
+
+        // Also ensure when a representative species model is cached with non-zero currentSex,
+        // sex 0 points to it too so sex-0 animals don't miss and rebuild forever.
+        [HarmonyPatch(typeof(PrebuiltOrganismLibrary), nameof(PrebuiltOrganismLibrary.CacheOrganismProfileBased))]
+        [HarmonyPostfix]
+        public static void PrebuiltOrganismLibrary_CacheOrganismProfileBased_EnsureSex0(
+            PrebuiltOrganismLibrary __instance,
+            int sexIndex,
+            int speciesIndex,
+            bool youngVersion,
+            GameObject gameObject,
+            bool isRepresentativeForSpecies)
+        {
+            if (__instance == null || !isRepresentativeForSpecies || sexIndex == 0 || gameObject == null) return;
+            Dictionary<SpeciesAndSexIndex, GameObject> dict = youngVersion ? SpeciesYoungDictRef(__instance) : SpeciesOldDictRef(__instance);
+            if (dict != null)
+            {
+                SpeciesAndSexIndex key0 = new SpeciesAndSexIndex(speciesIndex, 0);
+                if (!dict.ContainsKey(key0))
+                {
+                    dict[key0] = gameObject;
+                }
             }
         }
 

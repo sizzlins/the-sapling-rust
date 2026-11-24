@@ -105,9 +105,13 @@ namespace SaplingRustBridge.Patches
             Add(harmony, prefix, postfix, typeof(WorldController), "ShowToday");
 
             // --- the expensive "show every organism" rebuild paths ---
-            Add(harmony, prefix, postfix, typeof(WorldView), "ShowAnimalViewsForArea");            Add(harmony, prefix, postfix, typeof(WorldView), "ShowPlantViewsForArea");
+            Add(harmony, prefix, postfix, typeof(WorldView), "ShowAnimalViewsForArea");
+            Add(harmony, prefix, postfix, typeof(WorldView), "BuildAndCacheAnimal");
+            Add(harmony, prefix, postfix, typeof(WorldView), "ShowPlantViewsForArea");
             Add(harmony, prefix, postfix, typeof(WorldView), "UpdateNests");
             Add(harmony, prefix, postfix, typeof(WorldView), "SetAnimationsToSpeedWithIndex");
+            Add(harmony, prefix, postfix, typeof(PrebuiltOrganismLibrary), "GetPrebuiltOrganismProfileBased");
+            Add(harmony, prefix, postfix, typeof(MaterialFactory), "RecolorAnimal");
 
             // --- per-organism view work ---
             Add(harmony, prefix, postfix, typeof(AnimalView), "UpdateAnimationActivityBasedOnDistanceToCamera");
@@ -124,6 +128,9 @@ namespace SaplingRustBridge.Patches
             Add(harmony, prefix, postfix, typeof(TimeLine), "LetAllFungiInAreaLiveADay");
             Add(harmony, prefix, postfix, typeof(TimeLine), "GetAllSpecies");
             Add(harmony, prefix, postfix, typeof(TimeLine), "UpdateEpoch");
+            Add(harmony, prefix, postfix, typeof(TimeLine), "UpdateSpeciesPopulationSizes");
+            Add(harmony, prefix, postfix, typeof(TimeLine), "BabyGetsBorn");
+            Add(harmony, prefix, postfix, typeof(TimeLine), "AddGrassToCell");
             Add(harmony, prefix, postfix, typeof(WorldState), "Clone");
 
             // --- Steam IPC, which the daily simulation calls through ICallable callbacks ---
@@ -284,6 +291,18 @@ namespace SaplingRustBridge.Patches
             if (animalBreakdown != null)
             {
                 sb.AppendLine(animalBreakdown);
+            }
+
+            string plantBreakdown = FastSimPatches.ConsumePlantBreakdown();
+            if (plantBreakdown != null)
+            {
+                sb.AppendLine(plantBreakdown);
+            }
+
+            string adminBreakdown = FastSimPatches.ConsumeAdminBreakdown();
+            if (adminBreakdown != null)
+            {
+                sb.AppendLine(adminBreakdown);
             }
 
             // Scene census, occasionally. This is what tells us whether the

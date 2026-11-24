@@ -2,3 +2,4 @@
 
 pub mod band;
 pub mod ffi;
+pub mod vision;

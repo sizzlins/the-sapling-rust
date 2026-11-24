@@ -31,9 +31,36 @@ namespace SaplingRustBridge.Patches
             {
                 // Disable pooled organisms instead of leaving them SetActive(true) in the sky,
                 // so pooled Renderers/SkinnedMeshRenderers/Animators leave Unity's active scene.
-                // Also expire unused pooled species after 15 years instead of 300.
+                // Expire unused pooled GameObjects after 60 days while NEVER destroying sharedMesh
+                // (see OrganismObjectPool_AddFullSpecificOrganism_KeepSharedMesh_Prefix below).
                 __instance.organismObjectPool.outOfSightInsteadOfDisabling = false;
-                __instance.organismObjectPool.expireAfterYears = 15;
+                __instance.organismObjectPool.expireAfterYears = 60;
+            }
+        }
+
+        // --- 1b. NEVER DESTROY SHARED MESHES ON POOL EXPIRATION ---
+        // WorldView.CleanUpAnimalGameObject calls AddFullSpecificOrganism(comp, keepSharedMeshAtExpiration: false).
+        // When an organism shares its Mesh with PrebuiltOrganismLibrary and other live animals (especially with
+        // species-level model reuse or manually spawned animals), OrganismObjectPool.EmptyPool calls
+        // Object.DestroyImmediate(component.sharedMesh, allowDestroyingAssets: true), wiping the 3D model
+        // out from under live/selected animals while leaving their BoxCollider clickable.
+        // Keeping sharedMesh intact lets EmptyPool destroy idle GameObjects safely while truly unreferenced
+        // meshes are reclaimed by Unity's asset cleanup.
+        [HarmonyPatch(typeof(OrganismObjectPool), nameof(OrganismObjectPool.AddFullSpecificOrganism))]
+        [HarmonyPrefix]
+        public static void OrganismObjectPool_AddFullSpecificOrganism_KeepSharedMesh_Prefix(ref bool keepSharedMeshAtExpiration)
+        {
+            keepSharedMeshAtExpiration = true;
+        }
+
+        // Also guard EmptyPool directly in case an organism was pooled before this prefix ran.
+        [HarmonyPatch(typeof(OrganismObjectPool), nameof(OrganismObjectPool.EmptyPool), new Type[] { typeof(int), typeof(int), typeof(bool) })]
+        [HarmonyPrefix]
+        public static void OrganismObjectPool_EmptyPool_KeepSharedMesh_Prefix(OrganismObjectPool __instance, int definitionIndex, int sexIndex)
+        {
+            if (__instance != null && __instance.definitionIndicesThatShouldKeepTheirSharedMeshAtExpiration != null)
+            {
+                __instance.definitionIndicesThatShouldKeepTheirSharedMeshAtExpiration.Add(new DefinitionAndSexIndex(definitionIndex, sexIndex));
             }
         }
 
@@ -68,7 +95,7 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // --- 3b. FREE LEAKED ANIMAL HURT-FLASH MATERIALS ---
+        // --- 3b. FREE LEAKED ANIMAL HURT-FLASH MATERIALS & FIX MATERIALFACTORY LEAKS ---
         // WorldView.ShowAnimalViewsForArea allocates `new Material(Shader.Find("Standard"))`
         // every time an animal is hurt, and AnimalFlashingRed.Reset() only destroys the
         // MonoBehaviour without ever destroying redMaterial.
@@ -81,6 +108,191 @@ namespace SaplingRustBridge.Patches
                 UnityEngine.Object.Destroy(__instance.redMaterial);
                 __instance.redMaterial = null;
             }
+        }
+
+        // Root fix for 169,000+ leaked Material assets in MaterialFactory.GetSkinMaterial & RecolorAnimal/RecolorPlant:
+        // 1. Vanilla GetSkinMaterial never checks its cache and allocates TWO `new Material(Shader.Find("Custom/Skin"))`
+        //    objects on every single call (discarding the first immediately!).
+        // 2. Vanilla RecolorAnimal reads `smr.material` (which Unity clones into a leaked Material instance) for debug
+        //    fields and assigns `smr.material = ...` instead of `smr.sharedMaterial = ...`.
+        private struct SkinMatKey : IEquatable<SkinMatKey>
+        {
+            public Color Main;
+            public Color Secondary;
+            public int TextureId;
+            public SkinPattern Pattern;
+
+            public bool Equals(SkinMatKey other)
+            {
+                return Main == other.Main && Secondary == other.Secondary && TextureId == other.TextureId && Pattern == other.Pattern;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is SkinMatKey && Equals((SkinMatKey)obj);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int h = Main.GetHashCode();
+                    h = (h * 397) ^ Secondary.GetHashCode();
+                    h = (h * 397) ^ TextureId;
+                    h = (h * 397) ^ (int)Pattern;
+                    return h;
+                }
+            }
+        }
+
+        private static MaterialFactory _skinCacheOwner;
+        private static readonly System.Collections.Generic.Dictionary<SkinMatKey, Material> _skinMatCache =
+            new System.Collections.Generic.Dictionary<SkinMatKey, Material>(128);
+        private static Shader _cachedSkinShader;
+
+        [HarmonyPatch(typeof(MaterialFactory), nameof(MaterialFactory.GetSkinMaterial))]
+        [HarmonyPrefix]
+        public static bool MaterialFactory_GetSkinMaterial_Prefix(
+            MaterialFactory __instance,
+            Color mainColor,
+            Color secondaryColor,
+            int textureId,
+            Texture texture,
+            SkinPattern pattern,
+            ref Material __result)
+        {
+            if (__instance == null) return true;
+            if (!object.ReferenceEquals(_skinCacheOwner, __instance))
+            {
+                _skinCacheOwner = __instance;
+                _skinMatCache.Clear();
+            }
+
+            SkinMatKey key = new SkinMatKey { Main = mainColor, Secondary = secondaryColor, TextureId = textureId, Pattern = pattern };
+            Material mat;
+            if (_skinMatCache.TryGetValue(key, out mat) && mat != null)
+            {
+                __result = mat;
+                return false;
+            }
+
+            if (_cachedSkinShader == null) _cachedSkinShader = Shader.Find("Custom/Skin");
+            if (_cachedSkinShader == null) return true;
+
+            mat = new Material(_cachedSkinShader);
+            mat.SetColor("_MainColor", mainColor);
+            mat.SetTexture("_TextureData", texture);
+            mat.SetColor("_SecondaryColor", secondaryColor);
+            mat.enableInstancing = true;
+            if (pattern == SkinPattern.LongitudinalFading) mat.SetFloat("_CounterShadingMode", 1f);
+            else if (pattern == SkinPattern.LongitudinalFadingAndBack) mat.SetFloat("_CounterShadingMode", 2f);
+
+            _skinMatCache[key] = mat;
+            __result = mat;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(MaterialFactory), nameof(MaterialFactory.RecolorAnimal))]
+        [HarmonyPrefix]
+        public static bool MaterialFactory_RecolorAnimal_Prefix(
+            MaterialFactory __instance,
+            RecoloringInstructions animalGameObject,
+            float mainHue,
+            float mainBrightness,
+            float secondaryHue,
+            float secondaryBrightness)
+        {
+            if (__instance == null || animalGameObject == null) return false;
+            var renderers = animalGameObject.renderers;
+            var materialTypes = animalGameObject.materialTypes;
+            if (renderers == null || materialTypes == null) return false;
+
+            Color mainColor = SimulationTools.HueAndBrightnessToColor(mainHue, mainBrightness);
+            Color secColor = SimulationTools.HueAndBrightnessToColor(secondaryHue, secondaryBrightness);
+            int count = Math.Min(renderers.Count, materialTypes.Count);
+            for (int i = 0; i < count; i++)
+            {
+                SkinnedMeshRenderer smr = renderers[i];
+                if (smr == null) continue;
+                switch (materialTypes[i])
+                {
+                    case MaterialType.Main:
+                        smr.sharedMaterial = __instance.GetBasicMaterial(mainColor);
+                        break;
+                    case MaterialType.Skin:
+                        smr.sharedMaterial = __instance.GetSkinMaterial(mainColor, secColor, animalGameObject.textureID, animalGameObject.texture, animalGameObject.skinPattern);
+                        break;
+                    case MaterialType.Secondary:
+                        smr.sharedMaterial = __instance.GetBasicMaterial(secColor);
+                        break;
+                    case MaterialType.Luminescent:
+                        smr.sharedMaterial = __instance.GetLuminescentMaterial(mainColor, true);
+                        break;
+                    case MaterialType.Window:
+                        smr.sharedMaterial = __instance.GetWindowMaterial(mainColor);
+                        break;
+                    case MaterialType.Darker:
+                        smr.sharedMaterial = __instance.GetBasicMaterial(SimulationTools.HueAndBrightnessToColor(mainHue, Mathf.Clamp(mainBrightness - 0.2f, 0f, 1f)));
+                        break;
+                    case MaterialType.Brighter:
+                        smr.sharedMaterial = __instance.GetBasicMaterial(SimulationTools.HueAndBrightnessToColor(mainHue, Mathf.Clamp(mainBrightness + 0.3f, 0f, 1f)));
+                        break;
+                }
+            }
+            return false;
+        }
+
+        [HarmonyPatch(typeof(MaterialFactory), nameof(MaterialFactory.RecolorPlant))]
+        [HarmonyPrefix]
+        public static bool MaterialFactory_RecolorPlant_Prefix(
+            MaterialFactory __instance,
+            RecoloringInstructions plantGameObject,
+            float mainHue,
+            float mainBrightness,
+            float flowerHue,
+            float flowerBrightness,
+            float fruitHue,
+            float fruitBrightness)
+        {
+            if (__instance == null || plantGameObject == null) return false;
+            var renderers = plantGameObject.renderers;
+            var materialTypes = plantGameObject.materialTypes;
+            if (renderers == null || materialTypes == null) return false;
+
+            Color cMain = SimulationTools.HueAndBrightnessToColor(mainHue, mainBrightness);
+            Color cFlower = SimulationTools.HueAndBrightnessToColor(flowerHue, flowerBrightness);
+            Color cFruit = SimulationTools.HueAndBrightnessToColor(fruitHue, fruitBrightness);
+            int count = Math.Min(renderers.Count, materialTypes.Count);
+            for (int i = 0; i < count; i++)
+            {
+                SkinnedMeshRenderer smr = renderers[i];
+                if (smr == null) continue;
+                switch (materialTypes[i])
+                {
+                    case MaterialType.Main:
+                        smr.sharedMaterial = __instance.GetBasicMaterial(cMain);
+                        break;
+                    case MaterialType.Fruit:
+                        smr.sharedMaterial = __instance.GetBasicMaterial(cFruit);
+                        break;
+                    case MaterialType.SpecificColor:
+                        smr.sharedMaterial = __instance.GetBasicMaterial(cFlower);
+                        break;
+                    case MaterialType.Window:
+                        smr.sharedMaterial = __instance.GetWindowMaterial(cMain);
+                        break;
+                    case MaterialType.Luminescent:
+                        smr.sharedMaterial = __instance.GetLuminescentMaterial(cFlower, true);
+                        break;
+                    case MaterialType.Darker:
+                        smr.sharedMaterial = __instance.GetBasicMaterial(SimulationTools.HueAndBrightnessToColor(mainHue, Mathf.Clamp(mainBrightness - 0.2f, 0f, 1f)));
+                        break;
+                    case MaterialType.Brighter:
+                        smr.sharedMaterial = __instance.GetBasicMaterial(SimulationTools.HueAndBrightnessToColor(mainHue, Mathf.Clamp(mainBrightness + 0.3f, 0f, 1f)));
+                        break;
+                }
+            }
+            return false;
         }
 
         // --- 4. DEEP MEMORY TRIM (invocable via RCON) ---

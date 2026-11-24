@@ -30,6 +30,25 @@ pub unsafe extern "C" fn sapling_band_fill(
     .unwrap_or(-1)
 }
 
+/// Native L1/L2-cache instinct & food ring scanner over a pinned SoA WorldArea snapshot.
+///
+/// # Safety
+/// `grid` and `query` must point to valid structs whose array pointers remain valid
+/// for the duration of the call. `out_next_d` and `out_next_slot` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn sapling_vision_search(
+    grid: *const crate::vision::VisionGrid,
+    query: *const crate::vision::VisionQuery,
+    out_next_d: *mut i32,
+    out_next_slot: *mut i32,
+) -> i32 {
+    if grid.is_null() || query.is_null() {
+        return -1;
+    }
+    catch_unwind(|| crate::vision::vision_search(&*grid, &*query, out_next_d, out_next_slot))
+        .unwrap_or(-1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

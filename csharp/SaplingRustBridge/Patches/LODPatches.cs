@@ -176,8 +176,18 @@ namespace SaplingRustBridge.Patches
                     bool showRenderers = isFocused || (tier == 0) || (distSqr <= animalShowSqr);
 
                     RendererCache cache = GetRendererCache(animal.gameObject);
-                    bool currentlyHidden = (cache.Skinned.Length > 0 && cache.Skinned[0] != null && !cache.Skinned[0].enabled) ||
-                                           (cache.Meshes.Length > 0 && cache.Meshes[0] != null && !cache.Meshes[0].enabled);
+                    bool currentlyHidden = false;
+                    for (int r = 0; r < cache.Skinned.Length; r++)
+                    {
+                        if (cache.Skinned[r] != null && !cache.Skinned[r].enabled) { currentlyHidden = true; break; }
+                    }
+                    if (!currentlyHidden)
+                    {
+                        for (int m = 0; m < cache.Meshes.Length; m++)
+                        {
+                            if (cache.Meshes[m] != null && !cache.Meshes[m].enabled) { currentlyHidden = true; break; }
+                        }
+                    }
 
                     if (hideRenderers)
                     {
