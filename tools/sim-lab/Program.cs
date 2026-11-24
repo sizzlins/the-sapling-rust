@@ -137,16 +137,11 @@ namespace SimLab
         private static long _cntInstinct;
         private static long _cntInstinctHit;
         private static double _sumInstinctRange;
-        private static readonly Dictionary<string, long> _instinctByCond = new Dictionary<string, long>();
 
         private static void RustSearch_Prefix(float x, float y, bool isSee, InstinctConditionObject cond)
         {
             _cntInstinct++;
             _sumInstinctRange += (y - x);
-            string key = (isSee ? "See:" : "Hear:") + cond;
-            long v;
-            _instinctByCond.TryGetValue(key, out v);
-            _instinctByCond[key] = v + 1;
         }
 
         private static void RustSearch_Postfix(int __result)
@@ -1650,24 +1645,14 @@ namespace SimLab
                 string rosterPath = Path.Combine(outDir, "species-at-load-" + stamp + ".csv");
                 var roster = new StreamWriter(rosterPath);
                 roster.WriteLine("kingdom,index,name,living");
-                var byKingdom = new Dictionary<OrganismType, List<string>>();
                 for (int i = 0; i < gs.allSpecies.Count; i++)
                 {
                     int pop = i < tl.today.numberOfLivingOrganismsPerSpecies.Count ? tl.today.numberOfLivingOrganismsPerSpecies[i] : 0;
                     SpeciesDefinition sp = gs.allSpecies[i];
                     roster.WriteLine($"{sp.speciesType},{i},\"{sp.name}\",{pop}");
-                    if (pop <= 0) continue;
-                    List<string> list;
-                    if (!byKingdom.TryGetValue(sp.speciesType, out list)) { list = new List<string>(); byKingdom[sp.speciesType] = list; }
-                    list.Add(sp.name + " (" + pop + ")");
                 }
                 roster.Close();
                 Log($"Species roster: {rosterPath}");
-                foreach (var kv in byKingdom)
-                {
-                    kv.Value.Sort(StringComparer.OrdinalIgnoreCase);
-                    Log($"  {kv.Key} living species ({kv.Value.Count}): " + string.Join(", ", kv.Value));
-                }
             }
 
             // Detailed animal census (sex/age/pregnancy) at load time
@@ -1770,10 +1755,8 @@ namespace SimLab
                             MethodInfo mp = fsType.GetMethod("ConsumePlantBreakdown", BindingFlags.Static | BindingFlags.Public);
                             if (mp != null) { string s2 = mp.Invoke(null, null) as string; if (!string.IsNullOrEmpty(s2)) Log("    " + s2); }
                             double avgRange = _cntInstinct > 0 ? _sumInstinctRange / _cntInstinct : 0;
-                            var condParts = new List<string>();
-                            foreach (var kv in _instinctByCond) condParts.Add(kv.Key + "=" + kv.Value);
-                            Log($"    instinct: calls={_cntInstinct} hits={_cntInstinctHit} avgDepth={avgRange:F1} | {string.Join(", ", condParts)}");
-                            _cntInstinct = 0; _cntInstinctHit = 0; _sumInstinctRange = 0; _instinctByCond.Clear();
+                            Log($"    instinct: calls={_cntInstinct} hits={_cntInstinctHit} avgDepth={avgRange:F1}");
+                            _cntInstinct = 0; _cntInstinctHit = 0; _sumInstinctRange = 0;
                         }
                         catch { }
                     }
