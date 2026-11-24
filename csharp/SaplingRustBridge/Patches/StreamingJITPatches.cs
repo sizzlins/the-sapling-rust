@@ -160,6 +160,37 @@ namespace SaplingRustBridge.Patches
         private static readonly AccessTools.FieldRef<PrebuiltOrganismLibrary, Dictionary<LibraryProfile, GameObject>> ProfileOldDictRef =
             AccessTools.FieldRefAccess<PrebuiltOrganismLibrary, Dictionary<LibraryProfile, GameObject>>("gameObjectsOldVersionForProfile");
 
+        private static bool _inShowAnimalViews;
+        private static bool _buildingExtraSexes;
+
+        // WorldView.ShowAnimalViewsForArea (L4007, L4065) calls the 2-arg OrganismObjectPool.GetFullSpecificOrganism(def, young)
+        // which hardcodes sexIndex = 0 and hands pooled female models to males (and vice versa).
+        // Skip that 2-arg lookup during ShowAnimalViewsForArea so execution falls through to
+        // GetPrebuiltOrganismProfileBased(..., currentSex, ...) which pools by the exact sexIndex.
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.ShowAnimalViewsForArea))]
+        [HarmonyPrefix]
+        public static void WorldView_ShowAnimalViewsForArea_EnterSexGuard()
+        {
+            _inShowAnimalViews = true;
+        }
+
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.ShowAnimalViewsForArea))]
+        [HarmonyFinalizer]
+        public static Exception WorldView_ShowAnimalViewsForArea_ExitSexGuard(Exception __exception)
+        {
+            _inShowAnimalViews = false;
+            return __exception;
+        }
+
+        [HarmonyPatch(typeof(OrganismObjectPool), nameof(OrganismObjectPool.GetFullSpecificOrganism), new Type[] { typeof(int), typeof(bool) })]
+        [HarmonyPrefix]
+        public static bool OrganismObjectPool_GetFullSpecificOrganism2_SkipInAnimalViews(ref GameObject __result)
+        {
+            if (!_inShowAnimalViews) return true;
+            __result = null;
+            return false;
+        }
+
         // Root fix for 1-2.5s/day ShowAnimalViewsForArea freezes & +1.7 GB native RAM churn:
         // WorldView.ShowAnimalViewsForArea looks up OrganismObjectPool by the individual mutant's
         // definitionIndex, which misses 99% of the time because blueprints stamp CopiedOrganism with
@@ -190,20 +221,14 @@ namespace SaplingRustBridge.Patches
                 return true;
             }
             OrganismObjectPool pool = wv.organismObjectPool;
-            if (pool == null || !pool.enabled) return true;
 
             GameObject blueprint = null;
+            bool fromProfileFallback = false;
 
             Dictionary<SpeciesAndSexIndex, GameObject> sDict = youngVersion ? SpeciesYoungDictRef(__instance) : SpeciesOldDictRef(__instance);
             if (sDict != null)
             {
-                if (!sDict.TryGetValue(new SpeciesAndSexIndex(speciesIndex, sexIndex), out blueprint) || blueprint == null)
-                {
-                    if (sexIndex != 0)
-                    {
-                        sDict.TryGetValue(new SpeciesAndSexIndex(speciesIndex, 0), out blueprint);
-                    }
-                }
+                sDict.TryGetValue(new SpeciesAndSexIndex(speciesIndex, sexIndex), out blueprint);
             }
 
             if (blueprint == null)
@@ -211,29 +236,33 @@ namespace SaplingRustBridge.Patches
                 Dictionary<DefinitionAndSexIndex, GameObject> dDict = youngVersion ? DefYoungDictRef(__instance) : DefOldDictRef(__instance);
                 if (dDict != null)
                 {
-                    if (!dDict.TryGetValue(new DefinitionAndSexIndex(definitionIndex, sexIndex), out blueprint) || blueprint == null)
-                    {
-                        if (sexIndex != 0)
-                        {
-                            dDict.TryGetValue(new DefinitionAndSexIndex(definitionIndex, 0), out blueprint);
-                        }
-                    }
+                    dDict.TryGetValue(new DefinitionAndSexIndex(definitionIndex, sexIndex), out blueprint);
                 }
             }
 
             if (blueprint == null && profile != null)
             {
                 Dictionary<LibraryProfile, GameObject> pDict = youngVersion ? ProfileYoungDictRef(__instance) : ProfileOldDictRef(__instance);
-                if (pDict != null)
+                if (pDict != null && pDict.TryGetValue(profile, out blueprint) && blueprint != null)
                 {
-                    pDict.TryGetValue(profile, out blueprint);
+                    fromProfileFallback = true;
                 }
             }
 
             if (blueprint == null) return true;
 
             CopiedOrganism co = blueprint.GetComponent<CopiedOrganism>();
-            if (co != null)
+            // Never serve a wrong-sex profile blueprint when this species hasn't built its own models yet;
+            // return null so ShowAnimalViewsForArea calls BuildAndCacheAnimal (which builds all sexes).
+            if (fromProfileFallback && sexIndex != 0 && co != null && co.sexIndex != sexIndex &&
+                (sDict == null || !sDict.ContainsKey(new SpeciesAndSexIndex(speciesIndex, 0))))
+            {
+                __instance.lastUsedStorageApproach = StorageApproach.None;
+                __result = null;
+                return false;
+            }
+
+            if (pool != null && pool.enabled && co != null && co.sexIndex == sexIndex)
             {
                 GameObject recycled = pool.GetFullSpecificOrganism(co.definitionIndex, co.sexIndex, youngVersion);
                 if (recycled != null)
@@ -261,14 +290,15 @@ namespace SaplingRustBridge.Patches
             bool youngVersion,
             ref GameObject __result)
         {
-            // Root fix for 10+ second/day freezes & 100 MB/day RAM leaks on multi-sex species:
-            // WorldView.ShowAnimalViewsForArea caches speciesDefinition.exampleOrganism (currentSex == 0)
-            // under (speciesIndex, 0). Animals with currentSex > 0 then miss (speciesIndex, sexIndex)
-            // on every single day, causing vanilla to rebuild exampleOrganism twice per individual forever.
-            // If no sex-specific model exists yet, fall back to the already-cached sex 0 model.
+            // Fallback to sex 0 ONLY when (speciesIndex, 0) was already built (meaning exampleOrganism had
+            // no sex > 0 morph to build). Multi-sex species build all sexes in BuildAndCacheAnimal_Postfix.
             if (__result == null && sexIndex != 0 && __instance != null)
             {
-                __result = __instance.GetPrebuiltOrganismProfileBased(definitionIndex, 0, speciesIndex, profile, youngVersion);
+                Dictionary<SpeciesAndSexIndex, GameObject> sDict = youngVersion ? SpeciesYoungDictRef(__instance) : SpeciesOldDictRef(__instance);
+                if (sDict != null && sDict.ContainsKey(new SpeciesAndSexIndex(speciesIndex, 0)))
+                {
+                    __result = __instance.GetPrebuiltOrganismProfileBased(definitionIndex, 0, speciesIndex, profile, youngVersion);
+                }
             }
             if (__result != null)
             {
@@ -276,27 +306,63 @@ namespace SaplingRustBridge.Patches
             }
         }
 
-        // Also ensure when a representative species model is cached with non-zero currentSex,
-        // sex 0 points to it too so sex-0 animals don't miss and rebuild forever.
+        // Fix vanilla PrebuiltOrganismLibrary.CacheOrganismProfileBased (L189-191) which sets
+        // copiedOrganism.definitionIndex and youngVersion but leaves sexIndex at 0, causing
+        // OrganismObjectPool to mix recycled male and female models in bucket (def, 0).
         [HarmonyPatch(typeof(PrebuiltOrganismLibrary), nameof(PrebuiltOrganismLibrary.CacheOrganismProfileBased))]
         [HarmonyPostfix]
-        public static void PrebuiltOrganismLibrary_CacheOrganismProfileBased_EnsureSex0(
-            PrebuiltOrganismLibrary __instance,
+        public static void PrebuiltOrganismLibrary_CacheOrganismProfileBased_FixSexIndex(
             int sexIndex,
-            int speciesIndex,
-            bool youngVersion,
-            GameObject gameObject,
-            bool isRepresentativeForSpecies)
+            GameObject gameObject)
         {
-            if (__instance == null || !isRepresentativeForSpecies || sexIndex == 0 || gameObject == null) return;
-            Dictionary<SpeciesAndSexIndex, GameObject> dict = youngVersion ? SpeciesYoungDictRef(__instance) : SpeciesOldDictRef(__instance);
-            if (dict != null)
+            if (gameObject == null) return;
+            CopiedOrganism co = gameObject.GetComponent<CopiedOrganism>();
+            if (co != null)
             {
-                SpeciesAndSexIndex key0 = new SpeciesAndSexIndex(speciesIndex, 0);
-                if (!dict.ContainsKey(key0))
+                co.sexIndex = sexIndex;
+            }
+        }
+
+        // Fix vanilla WorldView.ShowAnimalViewsForArea (L4027, L4085) which only calls BuildAndCacheAnimal
+        // for speciesDefinition.exampleOrganism (currentSex == 0), never caching sex 1..N models.
+        [HarmonyPatch(typeof(WorldView), nameof(WorldView.BuildAndCacheAnimal))]
+        [HarmonyPostfix]
+        public static void WorldView_BuildAndCacheAnimal_BuildAllSexes(
+            WorldView __instance,
+            AnimalDefinition animalDefinition,
+            bool youngVersion,
+            int animalSpeciesIndex,
+            LibraryProfile libraryProfile,
+            bool representativeForSpecies)
+        {
+            if (_buildingExtraSexes || !representativeForSpecies || __instance == null ||
+                __instance.prebuiltAnimalLibrary == null || animalDefinition == null ||
+                animalDefinition.sexes == null || animalDefinition.sexes.Length == 0)
+            {
+                return;
+            }
+
+            _buildingExtraSexes = true;
+            try
+            {
+                int totalSexes = animalDefinition.sexes.Length;
+                for (int s = 0; s <= totalSexes; s++)
                 {
-                    dict[key0] = gameObject;
+                    if (s == animalDefinition.currentSex) continue;
+                    if (__instance.prebuiltAnimalLibrary.HasSpeciesSpecificModel(
+                        animalDefinition.definitionIndex, s, animalSpeciesIndex, youngVersion))
+                    {
+                        continue;
+                    }
+                    AnimalDefinition sexClone = animalDefinition.Clone() as AnimalDefinition;
+                    if (sexClone == null) continue;
+                    sexClone.currentSex = s;
+                    __instance.BuildAndCacheAnimal(sexClone, youngVersion, animalSpeciesIndex, libraryProfile, true);
                 }
+            }
+            finally
+            {
+                _buildingExtraSexes = false;
             }
         }
 

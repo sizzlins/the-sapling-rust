@@ -692,7 +692,8 @@ namespace SaplingRustBridge.Patches
         {
             if (animalA != null && __result != null)
             {
-                __result.currentSex = animalA.currentSex;
+                int sex = animalA.currentSex;
+                __result.currentSex = (__result.sexes != null && sex >= 0 && sex <= __result.sexes.Length) ? sex : 0;
             }
         }
 
@@ -728,6 +729,120 @@ namespace SaplingRustBridge.Patches
             if (part is AnimalAccessoireDefinition)
                 return __instance.accessoireInfoPerLocationOnTorso != null && __instance.accessoireInfoPerLocationOnTorso.ContainsKey(key);
 
+            return true;
+        }
+
+        // Fix vanilla sexual animal speciation deadlock:
+        // PopulationBasedClassifier.Classify only branches off a new species when a single non-main
+        // definitionIndex accumulates > branchOffThreshold births (30..300). Because AnimalBlender
+        // unconditionally mints a brand-new definitionIndex on every cross-variant sexual birth,
+        // strictly sexual lineages stay at births==1 per definitionIndex and can never speciate.
+        // Track mutated sexual births per parent species and trigger vanilla's branch-off (-1) on a
+        // birth-giving (female/hermaphrodite) mutant once > branchOffThreshold is reached.
+        private static AnimalDefinition _lastMutatedAnimalDef;
+        private static readonly HashSet<int> _mutatedAnimalDefIds = new HashSet<int>();
+        private static readonly Dictionary<int, int> _sexualMutCountBySpecies = new Dictionary<int, int>();
+        private static PopulationBasedClassifier _sexualMutClassifier;
+        private static bool _inSexualMutatedAnimalClassify;
+        private static bool _canFoundNewSexualSpecies;
+
+        internal static void NotifyProcessedAnimalDef(AnimalDefinition def, bool accepted = true)
+        {
+            if (def == null || !object.ReferenceEquals(def, _lastMutatedAnimalDef)) return;
+            _lastMutatedAnimalDef = null;
+            if (!accepted) return;
+            if (_mutatedAnimalDefIds.Count > 16384) _mutatedAnimalDefIds.Clear();
+            _mutatedAnimalDefIds.Add(def.definitionIndex);
+        }
+
+        [HarmonyPatch(typeof(AnimalMutator), nameof(AnimalMutator.MutateAnimalDefinition))]
+        [HarmonyPostfix]
+        public static void AnimalMutator_MutateAnimalDefinition_TrackSexualSpeciation(AnimalDefinition animal)
+        {
+            _lastMutatedAnimalDef = animal;
+        }
+
+        [HarmonyPatch(typeof(AnimalMutator), nameof(AnimalMutator.CheatEvolveLandAnimal))]
+        [HarmonyPostfix]
+        public static void AnimalMutator_CheatEvolveLandAnimal_TrackSexualSpeciation(AnimalDefinition animal)
+        {
+            _lastMutatedAnimalDef = animal;
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.ProcessNewAnimalDefinition))]
+        [HarmonyPostfix]
+        public static void TimeLine_ProcessNewAnimalDefinition_TrackSexualSpeciation(LivingAnimal animal, bool __result)
+        {
+            if (__result && animal != null)
+            {
+                NotifyProcessedAnimalDef(animal.definition);
+            }
+            else if (animal != null && object.ReferenceEquals(animal.definition, _lastMutatedAnimalDef))
+            {
+                _lastMutatedAnimalDef = null;
+            }
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.AnimalBelongsToSpeciesPopulationBased))]
+        [HarmonyPrefix]
+        public static void TimeLine_AnimalBelongsToSpeciesPopulationBased_SexualSpeciationPrefix(
+            AnimalDefinition animal,
+            bool animalIsManuallyAdded)
+        {
+            _inSexualMutatedAnimalClassify = false;
+            _canFoundNewSexualSpecies = false;
+            if (animalIsManuallyAdded || animal == null || animal.canGiveBirthAsexually) return;
+            if (!animal.canGiveBirthSexually && !animal.canFertilizeInternally && !animal.canFertilizeExternally) return;
+            if (_mutatedAnimalDefIds.Remove(animal.definitionIndex))
+            {
+                _inSexualMutatedAnimalClassify = true;
+                _canFoundNewSexualSpecies = animal.canGiveBirthSexually;
+            }
+        }
+
+        [HarmonyPatch(typeof(TimeLine), nameof(TimeLine.AnimalBelongsToSpeciesPopulationBased))]
+        [HarmonyFinalizer]
+        public static Exception TimeLine_AnimalBelongsToSpeciesPopulationBased_SexualSpeciationFinalizer(Exception __exception)
+        {
+            _inSexualMutatedAnimalClassify = false;
+            _canFoundNewSexualSpecies = false;
+            return __exception;
+        }
+
+        [HarmonyPatch(typeof(PopulationBasedClassifier), nameof(PopulationBasedClassifier.Classify))]
+        [HarmonyPrefix]
+        public static bool PopulationBasedClassifier_Classify_SexualSpeciationPrefix(
+            PopulationBasedClassifier __instance,
+            int definition,
+            int parentDefinition,
+            int branchOffThreshold,
+            bool forceNewSpecies,
+            ref int __result)
+        {
+            if (!_inSexualMutatedAnimalClassify || forceNewSpecies || __instance == null) return true;
+            _inSexualMutatedAnimalClassify = false;
+
+            if (!object.ReferenceEquals(_sexualMutClassifier, __instance))
+            {
+                _sexualMutClassifier = __instance;
+                _sexualMutCountBySpecies.Clear();
+            }
+
+            if (__instance.speciesPerDefinition == null || !__instance.speciesPerDefinition.TryGetValue(parentDefinition, out int parentSp))
+            {
+                return true;
+            }
+
+            int count = (_sexualMutCountBySpecies.TryGetValue(parentSp, out int prev) ? prev : 0) + 1;
+            if (_canFoundNewSexualSpecies && count > branchOffThreshold)
+            {
+                _sexualMutCountBySpecies[parentSp] = 0;
+                __instance.nrOfClassificationsPerDefinition[definition] = 1;
+                __result = -1;
+                return false;
+            }
+
+            _sexualMutCountBySpecies[parentSp] = count;
             return true;
         }
     }

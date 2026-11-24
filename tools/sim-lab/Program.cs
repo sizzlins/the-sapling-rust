@@ -117,13 +117,17 @@ namespace SimLab
         // Deep-time guardrails: keep taxonomy/definition maps bounded for multi-hundred-
         // thousand-day runs. Trait mutations still happen; new species stop at the cap.
         private static TimeLine _activeTimeLine = null;
-        private static int _speciesCap = 2000;
+        private static int _speciesCap = 0; // uncapped (user rejected taxonomy/population caps)
         private static long _speciesCapHits = 0;
+
+        private sealed class NoOpCallable : Boo.Lang.ICallable
+        {
+            public object Call(object[] args) => null;
+        }
 
         // --- lightweight profiling of the four kingdom passes ---
         private static long _profPlants, _profAnimals, _profAlgae, _profFungi;
         private static long _cntPlants, _cntAnimals, _cntAlgae, _cntFungi;
-        private static long _profStart;
 
         private static void ProfPlants_Prefix(out long __state) { __state = System.Diagnostics.Stopwatch.GetTimestamp(); }
         private static void ProfPlants_Postfix(long __state) { _profPlants += System.Diagnostics.Stopwatch.GetTimestamp() - __state; _cntPlants++; }
@@ -246,11 +250,97 @@ namespace SimLab
 
         private static bool _fixBlendSexBug = false;
 
+        private static Exception AnimalEx_Finalizer(LivingAnimal __instance, Exception __exception)
+        {
+            if (__exception != null)
+            {
+                int defIdx = (__instance != null && __instance.definition != null) ? __instance.definition.definitionIndex : -1;
+                Console.WriteLine($"[ANIMAL-EX] def={defIdx} age={(__instance != null ? __instance.age : -1)} sex={(__instance != null && __instance.definition != null ? __instance.definition.currentSex : -1)} ex={__exception.GetType().Name}: {__exception.Message}");
+            }
+            return __exception;
+        }
+
+        private static Exception TimelineAnimalsEx_Finalizer(Exception __exception)
+        {
+            if (__exception != null)
+            {
+                Console.WriteLine("[TIMELINE-ANIMAL-EX] " + __exception.GetType().Name);
+                if (Environment.GetEnvironmentVariable("SIM_ANIMAL_SAFE") == "1") return null;
+            }
+            return __exception;
+        }
+
+        private static void AuditAnimals_Prefix(TimeLine __instance, int areaIndex)
+        {
+            if (Environment.GetEnvironmentVariable("SIM_AUDIT_ANIMALS") != "1") return;
+            if (__instance == null || __instance.today == null || areaIndex >= __instance.today.areas.Length) return;
+            WorldArea area = __instance.today.areas[areaIndex];
+            int shown = 0;
+            foreach (AnimalPosition pos in area.animalPositionTracker.animalPositions)
+            {
+                LivingAnimal a = area.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                if (a == null || a.eaten) continue;
+                var nulls = new List<string>();
+                foreach (FieldInfo f in typeof(LivingAnimal).GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                {
+                    if (!f.FieldType.IsClass && !f.FieldType.IsArray) continue;
+                    if (f.GetValue(a) == null) nulls.Add("animal." + f.Name);
+                }
+                if (a.definition != null)
+                {
+                    foreach (FieldInfo f in typeof(AnimalDefinition).GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                    {
+                        if (!f.FieldType.IsClass && !f.FieldType.IsArray) continue;
+                        if (f.GetValue(a.definition) == null) nulls.Add("def." + f.Name);
+                    }
+                }
+                if (nulls.Count > 0 && (shown < 6 || a.definition?.definitionIndex == 17641))
+                {
+                    Console.WriteLine($"[AUDIT] def={a.definition?.definitionIndex} age={a.age} nulls={string.Join(",", nulls)}");
+                    shown++;
+                }
+            }
+            Console.WriteLine($"[AUDIT] animals={area.animalPositionTracker.animalPositions.Count}");
+        }
+
+        private static Exception GenericEx_Finalizer(MethodBase __originalMethod, Exception __exception)
+        {
+            if (__exception != null)
+                Console.WriteLine($"[EX] {__originalMethod.DeclaringType.Name}.{__originalMethod.Name}: {__exception.GetType().Name}");
+            return __exception;
+        }
+
+        private static void AuditLiveADay_Prefix(LivingAnimal __instance)
+        {
+            if (Environment.GetEnvironmentVariable("SIM_AUDIT_ANIMALS") != "1") return;
+            if (__instance != null && __instance.definition != null)
+                Console.WriteLine($"[LIVE] def={__instance.definition.definitionIndex} age={__instance.age} sex={__instance.definition.currentSex} pregnant={__instance.pregnant} carrying={__instance.carryingBaby}");
+        }
+
+        private static void SanitizeAnimalDef(AnimalDefinition d)
+        {
+            if (d == null) return;
+            if (d._instincts == null) d._instincts = new InstinctDefinition[0];
+            if (d._hormones == null) d._hormones = new HormoneDefinition[0];
+            if (d.sexes == null) d.sexes = new AnimalMorph[0];
+            if (d.youngSexes == null) d.youngSexes = new AnimalMorph[0];
+        }
+
+        private static void SanitizeClone_Postfix(object __result)
+        {
+            SanitizeAnimalDef(__result as AnimalDefinition);
+        }
+
         private static void FixBlendSex_Postfix(AnimalDefinition animalA, AnimalDefinition __result)
         {
-            if (_fixBlendSexBug && animalA != null && __result != null)
+            if (animalA != null && __result != null)
             {
-                __result.currentSex = animalA.currentSex;
+                SanitizeAnimalDef(__result);
+                if (_fixBlendSexBug)
+                {
+                    int sex = animalA.currentSex;
+                    __result.currentSex = (__result.sexes != null && sex >= 0 && sex <= __result.sexes.Length) ? sex : 0;
+                }
             }
         }
 
@@ -302,13 +392,14 @@ namespace SimLab
         private static void ApplyBridgePatches(bool jump, Type[] onlyClasses)
         {
             var h = new Harmony("com.saplingrust.bridge");
-            var simTypes = new HashSet<Type> { typeof(TimeLine), typeof(WorldState) };
+            var simTypes = new HashSet<Type> { typeof(TimeLine), typeof(WorldState), typeof(AnimalBlender), typeof(AnimalMutator), typeof(PopulationBasedClassifier) };
             Type[] classes = onlyClasses ?? new Type[]
             {
                 typeof(SaplingRustBridge.Patches.BandPatches),
                 typeof(SaplingRustBridge.Patches.SimulationPatches),
                 typeof(SaplingRustBridge.Patches.TimeJumpPatches),
                 typeof(SaplingRustBridge.Patches.FastSimPatches),
+                typeof(SaplingRustBridge.Patches.CleanLogPatches),
             };
             int ok = 0, bad = 0;
             foreach (Type t in classes)
@@ -319,7 +410,7 @@ namespace SimLab
                     if (attrs == null || attrs.Count == 0) continue;
                     HarmonyMethod info = HarmonyMethod.Merge(attrs);
                     if (info.declaringType == null) continue;
-                    if (t == typeof(SaplingRustBridge.Patches.TimeJumpPatches) && !simTypes.Contains(info.declaringType)) continue;
+                    if ((t == typeof(SaplingRustBridge.Patches.TimeJumpPatches) || t == typeof(SaplingRustBridge.Patches.CleanLogPatches)) && !simTypes.Contains(info.declaringType)) continue;
                     bool pre = m.IsDefined(typeof(HarmonyPrefix), false), post = m.IsDefined(typeof(HarmonyPostfix), false);
                     bool tr = m.IsDefined(typeof(HarmonyTranspiler), false), fin = m.IsDefined(typeof(HarmonyFinalizer), false);
                     if (!pre && !post && !tr && !fin) continue;
@@ -376,6 +467,25 @@ namespace SimLab
                 postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(TrackDeath_Postfix), flags)));
             h.Patch(typeof(AnimalBlender).GetMethod(nameof(AnimalBlender.BlendAnimals)),
                 postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(FixBlendSex_Postfix), flags)));
+            h.Patch(typeof(AnimalDefinition).GetMethod("Clone"),
+                postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(SanitizeClone_Postfix), flags)));
+            h.Patch(AccessTools.Method(typeof(LivingAnimal), "LiveADay", new[] { typeof(int) }),
+                prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(AuditLiveADay_Prefix), flags)),
+                finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(AnimalEx_Finalizer), flags)));
+            h.Patch(AccessTools.Method(typeof(LivingAnimal), "UpdateStats", new[] { typeof(OrganismObjectFileImporter), typeof(float) }),
+                finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(AnimalEx_Finalizer), flags)));
+            h.Patch(AccessTools.Method(typeof(LivingAnimal), "GiveBirth", new[] { typeof(float) }),
+                finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(AnimalEx_Finalizer), flags)));
+            h.Patch(typeof(TimeLine).GetMethod("LetAllAnimalsInAreaLiveADay"),
+                prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(AuditAnimals_Prefix), flags)),
+                finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(TimelineAnimalsEx_Finalizer), flags)));
+
+            foreach (string probe in new[] { "BabyGetsBorn", "CellContainsCorrectNestForAnimal", "EggCanSurviveInCell", "EnoughSpaceForReproduction" })
+            {
+                MethodInfo pm = AccessTools.Method(typeof(TimeLine), probe);
+                if (pm != null)
+                    h.Patch(pm, finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(GenericEx_Finalizer), flags)));
+            }
 
             h.Patch(AccessTools.Method(typeof(PopulationBasedClassifier), "Classify"),
                 prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(Classify_Prefix), flags)));
@@ -1014,6 +1124,7 @@ namespace SimLab
         private static TimeLine WireTimeline(GameSaver gs, OrganismObjectFileImporter importer, OrganismObjectFileImporter2 importer2)
         {
             TimeLine tl = new TimeLine(gs.areas, importer, importer2);
+            tl.animalGetsEatenCallBack = new NoOpCallable();
             _activeTimeLine = tl;
 
             tl.allSpecies = gs.allSpecies;
@@ -1058,6 +1169,113 @@ namespace SimLab
             state.areas = gs.areas;
             tl.today = state;
             tl.today.weather = tl.climate.CreateNewWeatherState();
+
+            if (Environment.GetEnvironmentVariable("SIM_REPAIR_SEX") == "1")
+            {
+                var mates = new List<Tuple<int, int>>(); // female cell, age
+                for (int a = 0; a < tl.today.areas.Length; a++)
+                {
+                    WorldArea area = tl.today.areas[a];
+                    foreach (AnimalPosition pos in area.animalPositionTracker.animalPositions)
+                    {
+                        LivingAnimal an = area.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                        if (an == null || an.definition == null) continue;
+                        AnimalDefinition d = (AnimalDefinition)an.definition.Clone();
+                        // The save has no male genome. Synthesise one from the female's base
+                        // morph; a flag flip alone produces a male with no male morphology.
+                        AnimalMorph maleMorph = AnimalMorph.Clone(d.young);
+                        maleMorph.canGiveBirthAsexually = false;
+                        maleMorph.canGiveBirthSexually = false;
+                        maleMorph.canFertilizeInternally = true;
+                        maleMorph.canFertilizeExternally = false;
+                        d.sexes = new AnimalMorph[] { maleMorph, AnimalMorph.Clone(maleMorph) };
+                        d.youngSexes = new AnimalMorph[] { maleMorph, AnimalMorph.Clone(maleMorph) };
+                        d.currentSex = 0;
+                        d.offspringSexDecisionType = OffspringSexDecisionType.Chance;
+                        d.canGiveBirthAsexually = false;
+                        d.canGiveBirthSexually = true;
+                        d.canFertilizeInternally = false;
+                        // The save's instincts may not include mate seeking; without it a
+                        // two-sex population barely pairs. Add the stock See/APotentialMate rule.
+                        bool hasMateInstinct = false;
+                        foreach (InstinctDefinition inst in d.instincts)
+                            if (inst.conditionObject == InstinctConditionObject.APotentialMate) { hasMateInstinct = true; break; }
+                        if (!hasMateInstinct)
+                        {
+                            var list = new List<InstinctDefinition>(d.instincts);
+                            list.Add(new InstinctDefinition(InstinctConditionSense.See, InstinctConditionObject.APotentialMate, 0.5f, InstinctAction.GoTowards));
+                            d.instincts = list.ToArray();
+                        }
+                        an.definition = d;
+                        an.age = Mathf.Max(1, an.matureAtAge);
+                        an.isChild = false;
+                        an.energy = Mathf.Max(an.energy, 60f);
+                        an.UpdateStats(importer, 1f);
+                        an.offSpringSexChances = new float[] { 0.5f, 0.5f };
+                        mates.Add(Tuple.Create(pos.cellIndex, an.age));
+                    }
+                }
+                // Put one male beside each female so the sparse save can actually pair.
+                for (int m = 0; m < mates.Count; m++)
+                {
+                    WorldArea area = tl.today.areas[0];
+                    int femaleCell = mates[m].Item1;
+                    int maleCell = area.GetEmptyCellNearCell(femaleCell, CellLocationType.Ground);
+                    if (maleCell == -1) continue;
+                    LivingAnimal female = area.GetAnimalInCell(femaleCell, CellLocationType.Ground);
+                    if (female == null) continue;
+                    AnimalDefinition md = (AnimalDefinition)female.definition.Clone();
+                    md.currentSex = 1;
+                    md.canFertilizeInternally = true;
+                    md.canGiveBirthSexually = false;
+                    md.canGiveBirthAsexually = false;
+                    LivingAnimal male = new LivingAnimal(md);
+                    male.age = mates[m].Item2;
+                    male.isChild = false;
+                    male.energy = 60f;
+                    male.UpdateStats(importer, 1f);
+                    male.offSpringSexChances = new float[] { 0.5f, 0.5f };
+                    area.AddAnimalToCell(male, maleCell, CellLocationType.Ground);
+                }
+                Console.WriteLine($"[SIM] sex repaired: {mates.Count} females, one synthesised male each");
+            }
+            if (Environment.GetEnvironmentVariable("SIM_SKIP_ANIMALS") == "1")
+            {
+                for (int a = 0; a < tl.today.areas.Length; a++)
+                {
+                    WorldArea area = tl.today.areas[a];
+                    area.animalPositionTracker.animalPositions.Clear();
+                    for (int i = 0; i < area.cells.Length; i++)
+                    {
+                        WorldCell c = area.cells[i];
+                        c.animal = null;
+                        c.animalInTree = null;
+                        c.animalInTheAir = null;
+                        c.animalUnderWater = null;
+                        c.animalAtWaterSurface = null;
+                        c.animalInDeepSea = null;
+                    }
+                }
+                Console.WriteLine("[SIM] animals removed (retail animal pass NREs on this save)");
+            }
+
+            // The new save's animal genomes can omit instinct/hormone/morph arrays entirely;
+            // vanilla's animal pass assumes they are non-null and NREs on a null `.Length`.
+            for (int a = 0; a < tl.today.areas.Length; a++)
+            {
+                foreach (AnimalPosition pos in tl.today.areas[a].animalPositionTracker.animalPositions)
+                {
+                    LivingAnimal an = tl.today.areas[a].GetAnimalInCell(pos.cellIndex, pos.locationType);
+                    if (an == null || an.definition == null) continue;
+                    AnimalDefinition d = an.definition;
+                    if (d._instincts == null) d._instincts = new InstinctDefinition[0];
+                    if (d._hormones == null) d._hormones = new HormoneDefinition[0];
+                    if (d.sexes == null) d.sexes = new AnimalMorph[0];
+                    if (d.youngSexes == null) d.youngSexes = new AnimalMorph[0];
+                    if (an.filteringCells == null) an.filteringCells = new List<int>();
+                    if (an.offSpringSexChances == null) an.offSpringSexChances = new float[] { 0.5f, 0.5f };
+                }
+            }
 
             // species population bookkeeping (vanilla adds one row per species, then trims)
             for (int i = 0; i < gs.allSpecies.Count; i++) tl.today.AddSpeciesToPopulationTracking();
@@ -1217,6 +1435,7 @@ namespace SimLab
                 scenario.milestones = new MilestoneDefinition[0];
                 scenario.objective = null;
 
+                try { tl.PruneExtinctDefinitionIndices(); } catch { }
                 var saver = new GameSaver();
                 saver.importer = importer;
                 saver.importer2 = importer2;
@@ -1227,7 +1446,10 @@ namespace SimLab
                     true, true, true, true, true, true, true, true, true, true, true,
                     null,
                     new Vector3[0], new Quaternion[0], new Vector3[0], false);
-                File.WriteAllBytes(path, saver.savingBytes.ToArray());
+                string tmp = path + ".tmp";
+                File.WriteAllBytes(tmp, saver.savingBytes.ToArray());
+                if (File.Exists(path)) File.Delete(path);
+                File.Move(tmp, path);
                 return true;
             }
             catch (Exception ex)
@@ -1613,9 +1835,13 @@ namespace SimLab
             OrganismObjectFileImporter2 importer2 = BuildRealImporter2();
             Log($"Importer ready: {importer.precreatedMouths.Count} mouths, {importer.precreatedLimbs.Count} limbs, mushrooms={importer2.GetShapeNamesPerBodyPartName("MushroomCap").Length} caps");
 
-            if (patchMode == "bridge") ApplyBridgePatches(false);
+            if (patchMode == "bridge")
+            {
+                SaplingRustBridge.Patches.TimeJumpPatches.ResetPingPongBuffers();
+                ApplyBridgePatches(true);
+            }
             else if (patchMode == "band") ApplyBandPatchesOnly();
-            else if (patchMode == "fastsim") ApplyBridgePatches(false, new Type[] { typeof(SaplingRustBridge.Patches.FastSimPatches) });
+            else if (patchMode == "fastsim") ApplyBridgePatches(true, new Type[] { typeof(SaplingRustBridge.Patches.FastSimPatches) });
 
             var gs = new GameSaver();
             gs.importer = importer;
@@ -1628,6 +1854,17 @@ namespace SimLab
             Log($"Loaded in {loadSw.Elapsed.TotalSeconds:F1}s: dayIndex={gs.dayIndex}, worldStates={gs.worldStates.Count}, species={gs.allSpecies.Count}, areas={gs.areas.Length}, size={gs.areas[0].size.x}x{gs.areas[0].size.y}");
 
             TimeLine tl = WireTimeline(gs, importer, importer2);
+
+            if (Environment.GetEnvironmentVariable("SIM_NO_ANIMAL_MUT") == "1")
+            {
+                tl.chanceForAnimalMutation = 0f;
+                Console.WriteLine("[SIM] animal mutation disabled (avoids the new-definition crash)");
+            }
+            if (Environment.GetEnvironmentVariable("SIM_NO_ANIMAL_BIRTH") == "1")
+            {
+                tl.animalOrganismCap = 0;
+                Console.WriteLine("[SIM] animal births disabled by cap");
+            }
 
             int p, f, an, pl, ma, gr, ds, eg;
             CountWorld(tl, out p, out f, out an, out pl, out ma, out gr, out ds, out eg);
@@ -1685,11 +1922,45 @@ namespace SimLab
                     int total = kv.Value[0] + kv.Value[1];
                     SpeciesDefinition sp = (kv.Key >= 0 && kv.Key < gs.allSpecies.Count) ? gs.allSpecies[kv.Key] : null;
                     Log($"  Animal spp {kv.Key} '{(sp != null ? sp.name : "?")}': {total} (A/F={kv.Value[0]}, B/M={kv.Value[1]}), avgAge={(total > 0 ? (double)ageSums[kv.Key] / total : 0):F0}, matureAt={(total > 0 ? GetFirstAnimalMatureAge(tl) : 0)}, pregnant={preg[kv.Key]}, fertilized={fert[kv.Key]}, children={children[kv.Key]}");
+                    if (Environment.GetEnvironmentVariable("SIM_AUDIT_ANIMALS") == "1" && tl.populationBasedAnimalClassifier != null)
+                    {
+                        var clf = tl.populationBasedAnimalClassifier;
+                        int mainDef = clf.GetMainDefinitionForSpecies(kv.Key);
+                        var liveDefs = new Dictionary<int, int>();
+                        foreach (WorldArea a in tl.today.areas)
+                            foreach (AnimalPosition pos in a.animalPositionTracker.animalPositions)
+                            {
+                                LivingAnimal la = a.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                                if (la == null || la.eaten || clf.LookUp(la.definition.definitionIndex) != kv.Key) continue;
+                                int di = la.definition.definitionIndex;
+                                liveDefs[di] = liveDefs.ContainsKey(di) ? liveDefs[di] + 1 : 1;
+                            }
+                        int maxNonMain = 0, maxNonMainDef = -1, totalTracked = 0;
+                        foreach (var ck in clf.nrOfClassificationsPerDefinition)
+                        {
+                            if (clf.LookUp(ck.Key) != kv.Key) continue;
+                            totalTracked++;
+                            if (ck.Key != mainDef && ck.Value > maxNonMain) { maxNonMain = ck.Value; maxNonMainDef = ck.Key; }
+                        }
+                        int mainCount = clf.nrOfClassificationsPerDefinition.ContainsKey(mainDef) ? clf.nrOfClassificationsPerDefinition[mainDef] : 0;
+                        Log($"    classifier: mainDef={mainDef}(births={mainCount}), distinctLiveDefs={liveDefs.Count}/{total}, trackedDefs={totalTracked}, maxNonMainDef={maxNonMainDef}(births={maxNonMain})");
+                    }
                 }
             }
 
-            if (days <= 0) { liveLog.Close(); return 0; }
+            if (days == 0) { liveLog.Close(); return 0; }
+            bool runForever = days < 0;
             if (reportEvery <= 0) reportEvery = 1000;
+            string stopPath = Path.Combine(outDir, "STOP");
+            if (File.Exists(stopPath)) File.Delete(stopPath);
+            int stopFlag = 0;
+            Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e)
+            {
+                e.Cancel = true;
+                System.Threading.Interlocked.Exchange(ref stopFlag, 1);
+            };
+            var rollingCheckpoints = new Queue<string>();
+            int ckInterval = runForever ? 25000 : 10000;
 
             string csvPath = Path.Combine(outDir, "save-sim-" + stamp + ".csv");
             string speciesPath = Path.Combine(outDir, "save-sim-species-" + stamp + ".csv");
@@ -1699,6 +1970,7 @@ namespace SimLab
             speciesCsv.WriteLine("day,kingdom,speciesIndex,name,population");
             Log($"Results CSV: {csvPath}");
             Log($"Live log:    {logPath}");
+            if (runForever) Log($"Forever mode active: create '{stopPath}' or press Ctrl+C to save final world and stop cleanly.");
 
             CountSpeciesAlive(tl, out ps, out fs, out ans, out als);
             csv.WriteLine($"{tl.dayIndex},{p},{f},{an},{pl},{ma},{gr},{ds},{eg},{ps},{fs},{ans},{als},{tl.allSpecies.Count},{_totalMatings},{_totalBirths},{_totalMutations},0,{GC.GetTotalMemory(false) / 1048576.0:F0}");
@@ -1706,10 +1978,16 @@ namespace SimLab
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
             int startDay = tl.dayIndex;
-            for (int d = 0; d < days; d++)
+            int done = 0;
+            while (runForever || done < days)
             {
                 tl.LiveADay();
-                int done = d + 1;
+                done++;
+                if (done % 100 == 0 && (System.Threading.Volatile.Read(ref stopFlag) != 0 || File.Exists(stopPath)))
+                {
+                    System.Threading.Interlocked.Exchange(ref stopFlag, 1);
+                    Log($"[STOP] Graceful stop signal received at day {tl.dayIndex}.");
+                }
                 if (done % 1000 == 0)
                 {
                     int defCount = tl.speciesIndexPerDefinitionIndex.Count
@@ -1719,7 +1997,8 @@ namespace SimLab
                         + tl.populationBasedFungusClassifier.speciesPerDefinition.Count;
                     if (defCount > 150000) Log(PruneDefinitionMaps(tl));
                 }
-                bool last = done == days;
+                bool stopRequested = System.Threading.Volatile.Read(ref stopFlag) != 0;
+                bool last = stopRequested || (!runForever && done == days);
                 if (last || done % reportEvery == 0)
                 {
                     CountWorld(tl, out p, out f, out an, out pl, out ma, out gr, out ds, out eg);
@@ -1727,9 +2006,9 @@ namespace SimLab
                     CountSpeciesAlive(tl, out ps, out fs, out ans, out als);
                     double elapsed = sw.Elapsed.TotalSeconds;
                     double dps = elapsed > 0 ? done / elapsed : 0;
-                    double etaH = dps > 0 ? (days - done) / dps / 3600.0 : 0;
+                    string etaStr = runForever ? "INF" : (dps > 0 ? $"{(days - done) / dps / 3600.0:F1}h" : "?");
                     long mem = GC.GetTotalMemory(false) / 1048576;
-                    Log($"Day {tl.dayIndex,9} | P={p,5} F={f,4} A={an,5} (F/M={females}/{males}) | grass={gr,5} plank={pl,5} alga={ma,4} seeds={ds,4} eggs={eg,4} | spp alive P={ps} F={fs} A={ans} | totalSpp={tl.allSpecies.Count} capHits={_speciesCapHits} | mat={_totalMatings} births={_totalBirths} mut={_totalMutations} | {dps:F1} d/s ETA {etaH:F1}h mem={mem}MB");
+                    Log($"Day {tl.dayIndex,9} | P={p,5} F={f,4} A={an,5} (F/M={females}/{males}) | grass={gr,5} plank={pl,5} alga={ma,4} seeds={ds,4} eggs={eg,4} | spp alive P={ps} F={fs} A={ans} | totalSpp={tl.allSpecies.Count} capHits={_speciesCapHits} | mat={_totalMatings} births={_totalBirths} mut={_totalMutations} | {dps:F1} d/s ETA {etaStr} mem={mem}MB");
                     if (_allDeaths.Count > 0)
                     {
                         var parts = new List<string>();
@@ -1774,22 +2053,39 @@ namespace SimLab
                         speciesCsv.Flush();
                     }
                 }
-                if (done % 100000 == 0)
+                if (stopRequested) break;
+                if (done % ckInterval == 0)
                 {
                     string ckPath = Path.Combine(outDir, "world-day-" + tl.dayIndex + ".sav16");
                     var ckSw = System.Diagnostics.Stopwatch.StartNew();
                     if (SaveCheckpoint(tl, gs.planet, importer, importer2, ckPath))
+                    {
                         Log($"[CHECKPOINT] {ckPath} ({new FileInfo(ckPath).Length / 1048576.0:F1} MB, {ckSw.Elapsed.TotalSeconds:F0}s)");
+                        File.WriteAllText(Path.Combine(outDir, "latest-checkpoint.txt"), ckPath + Environment.NewLine);
+                        if (runForever)
+                        {
+                            rollingCheckpoints.Enqueue(ckPath);
+                            while (rollingCheckpoints.Count > 3)
+                            {
+                                string oldCk = rollingCheckpoints.Dequeue();
+                                try { if (File.Exists(oldCk)) File.Delete(oldCk); } catch { }
+                            }
+                        }
+                    }
                 }
             }
             sw.Stop();
             csv.Close();
             speciesCsv.Close();
-            Log($"Done: {startDay} -> {tl.dayIndex} ({days} days) in {sw.Elapsed.TotalHours:F2}h, {days / Math.Max(0.001, sw.Elapsed.TotalSeconds):F0} days/s");
+            Log($"Done: {startDay} -> {tl.dayIndex} ({done} days) in {sw.Elapsed.TotalHours:F2}h, {done / Math.Max(0.001, sw.Elapsed.TotalSeconds):F0} days/s");
             string finalPath = Path.Combine(outDir, "world-day-" + tl.dayIndex + "-final.sav16");
             var finalSw = System.Diagnostics.Stopwatch.StartNew();
             if (SaveCheckpoint(tl, gs.planet, importer, importer2, finalPath))
+            {
                 Log($"[CHECKPOINT] final world: {finalPath} ({new FileInfo(finalPath).Length / 1048576.0:F1} MB, {finalSw.Elapsed.TotalSeconds:F0}s)");
+                File.WriteAllText(Path.Combine(outDir, "latest-checkpoint.txt"), finalPath + Environment.NewLine);
+            }
+            if (File.Exists(stopPath)) try { File.Delete(stopPath); } catch { }
             Log($"CSV: {csvPath}");
             Log($"Species census: {speciesPath}");
             liveLog.Close();
@@ -2310,6 +2606,85 @@ namespace SimLab
             }
 
             AnimalDefinition solara = BuildSolaraDefinition(importer, 13, false);
+
+            // Rectangular grid parity self-check: asserts 0 mismatches between vanilla and FastSimPatches
+            // on both 50x100 and 100x50 WorldAreas across all cells and movement pairs.
+            if (args != null && args.Length > 0 && args[0] == "--rect-check")
+            {
+                int[][] dims = { new[] { 50, 100 }, new[] { 100, 50 } };
+                var vanAround = new List<int[][]>();
+                var vanStep = new List<int[]>();
+                var vanEmpty = new List<int[]>();
+                var vanGetEmpty = new List<int[]>();
+                var vanTemp = new List<int[]>();
+                var vanCount = new List<int[]>();
+                var areas = new List<WorldArea>();
+                var rng = new System.Random(42);
+                var dummyAnimal = (LivingAnimal)System.Runtime.Serialization.FormatterServices.GetUninitializedObject(typeof(LivingAnimal));
+                var dummyTl = (TimeLine)System.Runtime.Serialization.FormatterServices.GetUninitializedObject(typeof(TimeLine));
+                foreach (var d in dims)
+                {
+                    int w = d[0], h = d[1], n = w * h;
+                    var a = new WorldArea();
+                    a.size = new Vector2(w, h);
+                    a.cells = new WorldCell[n];
+                    for (int i = 0; i < n; i++)
+                    {
+                        var c = new WorldCell(0.5f, 0.5f, 0.5f, (float)(rng.NextDouble() * 40.0), 0.5f, -1f, 0f, 0.5f);
+                        c.usable = true;
+                        c.walkable = true;
+                        c.steepness = (float)(rng.NextDouble() * 90.0);
+                        if (rng.Next(4) == 0) c.animal = dummyAnimal;
+                        a.cells[i] = c;
+                    }
+                    areas.Add(a);
+                    var ar = new int[n][];
+                    var em = new int[n];
+                    var ge = new int[n];
+                    var tp = new int[n];
+                    var cn = new int[n];
+                    for (int i = 0; i < n; i++)
+                    {
+                        ar[i] = (int[])a.GetAllCellsDirectlyAround(i).Clone();
+                        em[i] = a.FindEmptyCellNearCell(i);
+                        ge[i] = a.GetEmptyCellNearCell(i, CellLocationType.Ground);
+                        tp[i] = a.FindCellWithDifferentTemperatureThanCell(i, (i & 1) == 0);
+                        cn[i] = dummyTl.FindNumberOfAnimalsAroundCell(a, i, CellLocationType.Ground);
+                    }
+                    var st = new int[1000];
+                    for (int k = 0; k < 1000; k++)
+                    {
+                        int cur = (k * 37) % n;
+                        int goal = (k * 997 + 13) % n;
+                        st[k] = a.MoveSingleStepInDirectionOfCellWithMaxSteepness(cur, goal, 0.8f);
+                    }
+                    vanAround.Add(ar); vanEmpty.Add(em); vanGetEmpty.Add(ge); vanTemp.Add(tp); vanCount.Add(cn); vanStep.Add(st);
+                }
+
+                ApplyBridgePatches(false, new Type[] { typeof(SaplingRustBridge.Patches.BandPatches), typeof(SaplingRustBridge.Patches.FastSimPatches) });
+                int mismatches = 0;
+                for (int di = 0; di < dims.Length; di++)
+                {
+                    var a = areas[di]; int n = a.cells.Length;
+                    for (int i = 0; i < n; i++)
+                    {
+                        int[] got = a.GetAllCellsDirectlyAround(i);
+                        for (int j = 0; j < 8; j++) if (got[j] != vanAround[di][i][j]) { mismatches++; break; }
+                        if (a.FindEmptyCellNearCell(i) != vanEmpty[di][i]) mismatches++;
+                        if (a.GetEmptyCellNearCell(i, CellLocationType.Ground) != vanGetEmpty[di][i]) mismatches++;
+                        if (a.FindCellWithDifferentTemperatureThanCell(i, (i & 1) == 0) != vanTemp[di][i]) mismatches++;
+                        if (dummyTl.FindNumberOfAnimalsAroundCell(a, i, CellLocationType.Ground) != vanCount[di][i]) mismatches++;
+                    }
+                    for (int k = 0; k < 1000; k++)
+                    {
+                        int cur = (k * 37) % n;
+                        int goal = (k * 997 + 13) % n;
+                        if (a.MoveSingleStepInDirectionOfCellWithMaxSteepness(cur, goal, 0.8f) != vanStep[di][k]) mismatches++;
+                    }
+                }
+                Console.WriteLine($"[RECT-CHECK] 50x100 + 100x50 parity mismatches = {mismatches}");
+                return mismatches == 0 ? 0 : 1;
+            }
 
             // A/B harness: same worlds/seeds with (vanilla | patched | jump) = retail engine alone,
             // retail + SaplingRustBridge sim patches (normal play), or those + IsTimeJumpActive (Time Jump).

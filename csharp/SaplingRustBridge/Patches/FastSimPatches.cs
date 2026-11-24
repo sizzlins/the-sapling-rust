@@ -357,8 +357,9 @@ namespace SaplingRustBridge.Patches
             bool checkLightning = !(lightningChance <= 0f) && __instance.weatherSimulation != null && __instance.weatherSimulation.weatherPerCell != null;
             var weatherMap = checkLightning ? __instance.weatherSimulation.weatherPerCell : null;
 
-            float sizeX = worldArea.size.x;
-            float sizeY = worldArea.size.y;
+            // CellDistanceFinder is initialized as (area.size.y, area.size.x) in WorldArea.GetOrCreateDistanceFinder.
+            float sizeX = worldArea.size.y;
+            float sizeY = worldArea.size.x;
             bool canDirectBand = BandPatches.Enabled && BandPatches.ManagedBandReady && (int)sizeY > 0 && sizeX > 0f;
             // Sample Stopwatch QPC syscalls 1-in-16 days (eliminates ~3.2M icalls/5s on dense worlds).
             bool prof = (__instance.dayIndex & 15) == 0;
@@ -810,8 +811,8 @@ namespace SaplingRustBridge.Patches
             {
                 return SearchNearbyRust(tl, instinct, animal, worldArea, areaIndex, cellIndex, locationType, x, y, ownSpecies, unwarpedPlaceInDayNightCycle, isSee, isHear, cond, cursor);
             }
-            float sizeX = worldArea.size.x;
-            float sizeY = worldArea.size.y;
+            float sizeX = worldArea.size.y;
+            float sizeY = worldArea.size.x;
             int sizeXInt = (int)sizeX;
             int sizeYInt = (int)sizeY;
             if (sizeYInt <= 0 || sizeX <= 0f) return int.MinValue;
@@ -1760,8 +1761,8 @@ namespace SaplingRustBridge.Patches
             }
 
             if (!BandPatches.Enabled || !BandPatches.ManagedBandReady || _bandDepth >= MaxBandScratchDepth) return true;
-            float sizeX = area.size.x;
-            float sizeY = area.size.y;
+            float sizeX = area.size.y;
+            float sizeY = area.size.x;
             if ((int)sizeY <= 0 || sizeX <= 0f) return true;
 
             int dist = (int)movementDistance;
@@ -1807,8 +1808,8 @@ namespace SaplingRustBridge.Patches
             if (seedPackage.Count == 0) return false;
             if (!BandPatches.Enabled || !BandPatches.ManagedBandReady || _bandDepth >= MaxBandScratchDepth) return true;
 
-            float sizeX = area.size.x;
-            float sizeY = area.size.y;
+            float sizeX = area.size.y;
+            float sizeY = area.size.x;
             if ((int)sizeY <= 0 || sizeX <= 0f) return true;
 
             int[] buf = _bandScratch[_bandDepth++];
@@ -1844,8 +1845,8 @@ namespace SaplingRustBridge.Patches
             if (!Enabled || __instance == null || lifeForm == null || area == null) return true;
             if (!BandPatches.Enabled || !BandPatches.ManagedBandReady || _bandDepth >= MaxBandScratchDepth) return true;
 
-            float sizeX = area.size.x;
-            float sizeY = area.size.y;
+            float sizeX = area.size.y;
+            float sizeY = area.size.x;
             if ((int)sizeY <= 0 || sizeX <= 0f) return true;
 
             bool usePop = __instance.usePopulationBasedClassification;
@@ -1905,8 +1906,8 @@ namespace SaplingRustBridge.Patches
             ref int __result)
         {
             if (!Enabled || area == null || area.cells == null) return true;
-            float sizeX = area.size.x;
-            float sizeY = area.size.y;
+            float sizeX = area.size.y;
+            float sizeY = area.size.x;
             int sizeYInt = (int)sizeY;
             if (sizeYInt <= 0 || sizeX <= 0f) return true;
 
@@ -1954,8 +1955,8 @@ namespace SaplingRustBridge.Patches
             if (!Enabled || __instance == null || animal == null || area == null) return true;
             if (!BandPatches.Enabled || !BandPatches.ManagedBandReady || _bandDepth >= MaxBandScratchDepth) return true;
 
-            float sizeX = area.size.x;
-            float sizeY = area.size.y;
+            float sizeX = area.size.y;
+            float sizeY = area.size.x;
             if ((int)sizeY <= 0 || sizeX <= 0f) return true;
 
             int d = (int)distance;
@@ -1996,8 +1997,8 @@ namespace SaplingRustBridge.Patches
             if (!Enabled || __instance == null || __instance.cells == null) return true;
             if (!BandPatches.Enabled || !BandPatches.ManagedBandReady || _bandDepth >= MaxBandScratchDepth) return true;
 
-            float sizeX = __instance.size.x;
-            float sizeY = __instance.size.y;
+            float sizeX = __instance.size.y;
+            float sizeY = __instance.size.x;
             if ((int)sizeY <= 0 || sizeX <= 0f) return true;
 
             WorldCell[] cells = __instance.cells;
@@ -2037,8 +2038,8 @@ namespace SaplingRustBridge.Patches
             }
             if (!BandPatches.Enabled || !BandPatches.ManagedBandReady || _bandDepth >= MaxBandScratchDepth) return true;
 
-            float sizeX = __instance.size.x;
-            float sizeY = __instance.size.y;
+            float sizeX = __instance.size.y;
+            float sizeY = __instance.size.x;
             if ((int)sizeY <= 0 || sizeX <= 0f) return true;
 
             int[] buf = _bandScratch[_bandDepth++];
@@ -2077,8 +2078,8 @@ namespace SaplingRustBridge.Patches
             }
             if (!BandPatches.Enabled || !BandPatches.ManagedBandReady || _bandDepth >= MaxBandScratchDepth) return true;
 
-            float sizeX = __instance.size.x;
-            float sizeY = __instance.size.y;
+            float sizeX = __instance.size.y;
+            float sizeY = __instance.size.x;
             if ((int)sizeY <= 0 || sizeX <= 0f) return true;
 
             float temperature = cells[cellIndex].temperature;
@@ -2136,8 +2137,8 @@ namespace SaplingRustBridge.Patches
             if (fungus == null || __instance.fungusCapped) return false;
             if (!BandPatches.Enabled || !BandPatches.ManagedBandReady || _bandDepth >= MaxBandScratchDepth) return true;
 
-            float sizeX = area.size.x;
-            float sizeY = area.size.y;
+            float sizeX = area.size.y;
+            float sizeY = area.size.x;
             int sizeXInt = (int)sizeX;
             int sizeYInt = (int)sizeY;
             if (sizeYInt <= 0 || sizeX <= 0f) return true;
@@ -2554,8 +2555,9 @@ namespace SaplingRustBridge.Patches
             bool debugWalk = __instance.debugProceduralWalking;
             bool evolution = __instance.evolution;
             float mutChance = __instance.chanceForAnimalMutation;
-            float sizeX = worldArea.size.x;
-            float sizeY = worldArea.size.y;
+            // CellDistanceFinder is initialized as (area.size.y, area.size.x) in WorldArea.GetOrCreateDistanceFinder.
+            float sizeX = worldArea.size.y;
+            float sizeY = worldArea.size.x;
             bool canDirectBand = BandPatches.Enabled && BandPatches.ManagedBandReady && (int)sizeY > 0 && sizeX > 0f;
             // Sample sub-phase Stopwatch icalls 1-in-16 days (~450k vs ~7.2M QPC calls per 5s window).
             bool prof = (__instance.dayIndex & 15) == 0;
@@ -2855,6 +2857,7 @@ namespace SaplingRustBridge.Patches
 
                     if (defChanged && !ProcessNewAnimalDefinitionFast(__instance, child, livingAnimal, cellLocationType, true))
                     {
+                        CleanLogPatches.NotifyProcessedAnimalDef(child.definition, false);
                         int fallbackSex;
                         child = GiveBirthFast(livingAnimal, worldCell.temperature, false, out fallbackSex);
                     }
@@ -3997,14 +4000,14 @@ namespace SaplingRustBridge.Patches
             }
             float sx = __instance.size.x;
             float sy = __instance.size.y;
-            int sizeXInt = (int)sx;
-            int sizeYInt = (int)sy;
-            if (sizeYInt <= 0 || sizeXInt <= 0 || (float)sizeXInt != sx || (float)sizeYInt != sy) return true;
+            int dfXInt = (int)sy;
+            int dfYInt = (int)sx;
+            if (dfYInt <= 0 || dfXInt <= 0 || (float)dfYInt != sx || (float)dfXInt != sy) return true;
 
-            int cx = currentCellIndex / sizeYInt;
-            int cy = currentCellIndex % sizeYInt;
-            int gx = goalCellIndex / sizeYInt;
-            int gy = goalCellIndex % sizeYInt;
+            int cx = currentCellIndex / dfYInt;
+            int cy = currentCellIndex % dfYInt;
+            int gx = goalCellIndex / dfYInt;
+            int gy = goalCellIndex % dfYInt;
             int dx = gx - cx;
             int dy = gy - cy;
             int adx = (dx < 0) ? -dx : dx;
@@ -4013,11 +4016,11 @@ namespace SaplingRustBridge.Patches
             else cy += (dy > 0) ? 1 : -1;
 
             if (cx < 0) cx = 0;
-            else if (cx > sizeYInt - 1) cx = sizeYInt - 1;
+            else if (cx > dfXInt - 1) cx = dfXInt - 1;
             if (cy < 0) cy = 0;
-            else if (cy > sizeXInt - 1) cy = sizeXInt - 1;
+            else if (cy > dfYInt - 1) cy = dfYInt - 1;
 
-            int next = cx * sizeYInt + cy;
+            int next = cx * dfYInt + cy;
             __result = ((uint)next < (uint)len && cells[next].CalculateNormalizedSteepness() <= maxSteepness) ? next : -1;
             return false;
         }
@@ -6006,6 +6009,7 @@ namespace SaplingRustBridge.Patches
                 {
                     animal.definition.definitionIndex = tl.nextDefinitionIndex;
                     tl.nextDefinitionIndex++;
+                    CleanLogPatches.NotifyProcessedAnimalDef(animal.definition, true);
                 }
                 animal.visualSalienceOfDifferenceToParent = tl.animalMutator.visualSalienceOfLastChange;
                 bool differs =
@@ -8869,16 +8873,16 @@ namespace SaplingRustBridge.Patches
             }
             float sx = area.size.x;
             float sy = area.size.y;
-            int sizeXInt = (int)sx;
-            int sizeYInt = (int)sy;
-            if (sizeYInt <= 0 || sizeXInt <= 0 || (float)sizeXInt != sx || (float)sizeYInt != sy)
+            int dfXInt = (int)sy;
+            int dfYInt = (int)sx;
+            if (dfYInt <= 0 || dfXInt <= 0 || (float)dfYInt != sx || (float)dfXInt != sy)
             {
                 return area.MoveSingleStepInDirectionOfCellWithMaxSteepness(currentCellIndex, goalCellIndex, maxSteepness);
             }
-            int cx = currentCellIndex / sizeYInt;
-            int cy = currentCellIndex % sizeYInt;
-            int gx = goalCellIndex / sizeYInt;
-            int gy = goalCellIndex % sizeYInt;
+            int cx = currentCellIndex / dfYInt;
+            int cy = currentCellIndex % dfYInt;
+            int gx = goalCellIndex / dfYInt;
+            int gy = goalCellIndex % dfYInt;
             int dx = gx - cx;
             int dy = gy - cy;
             int adx = (dx < 0) ? -dx : dx;
@@ -8886,10 +8890,10 @@ namespace SaplingRustBridge.Patches
             if (adx > ady) cx += (dx > 0) ? 1 : -1;
             else cy += (dy > 0) ? 1 : -1;
             if (cx < 0) cx = 0;
-            else if (cx > sizeYInt - 1) cx = sizeYInt - 1;
+            else if (cx > dfXInt - 1) cx = dfXInt - 1;
             if (cy < 0) cy = 0;
-            else if (cy > sizeXInt - 1) cy = sizeXInt - 1;
-            int next = cx * sizeYInt + cy;
+            else if (cy > dfYInt - 1) cy = dfYInt - 1;
+            int next = cx * dfYInt + cy;
             return ((uint)next < (uint)len && cells[next].CalculateNormalizedSteepness() <= maxSteepness) ? next : -1;
         }
 
@@ -8951,23 +8955,23 @@ namespace SaplingRustBridge.Patches
             if (!Enabled || __instance == null) return true;
             float sx = __instance.size.x;
             float sy = __instance.size.y;
-            int sizeXInt = (int)sx;
-            int sizeYInt = (int)sy;
-            if (sizeXInt <= 0 || sizeYInt <= 0 || (float)sizeXInt != sx || (float)sizeYInt != sy) return true;
+            int dfXInt = (int)sy;
+            int dfYInt = (int)sx;
+            if (dfXInt <= 0 || dfYInt <= 0 || (float)dfYInt != sx || (float)dfXInt != sy) return true;
 
-            int vx = cellIndex / sizeYInt;
-            int vy = cellIndex % sizeYInt;
-            int maxX = sizeXInt - 1;
-            int maxY = sizeYInt - 1;
+            int vx = cellIndex / dfYInt;
+            int vy = cellIndex % dfYInt;
+            int maxX = dfXInt - 1;
+            int maxY = dfYInt - 1;
 
-            _aroundScratch[0] = (vx > 0) ? ((vx - 1) * sizeYInt + vy) : -1;
-            _aroundScratch[1] = (vx < maxX) ? ((vx + 1) * sizeYInt + vy) : -1;
-            _aroundScratch[2] = (vy > 0) ? (vx * sizeYInt + (vy - 1)) : -1;
-            _aroundScratch[3] = (vy < maxY) ? (vx * sizeYInt + (vy + 1)) : -1;
-            _aroundScratch[4] = (vx > 0 && vy > 0) ? ((vx - 1) * sizeYInt + (vy - 1)) : -1;
-            _aroundScratch[5] = (vx < maxX && vy < maxY) ? ((vx + 1) * sizeYInt + (vy + 1)) : -1;
-            _aroundScratch[6] = (vx > 0 && vy < maxY) ? ((vx - 1) * sizeYInt + (vy + 1)) : -1;
-            _aroundScratch[7] = (vx < maxX && vy > 0) ? ((vx + 1) * sizeYInt + (vy - 1)) : -1;
+            _aroundScratch[0] = (vx > 0) ? ((vx - 1) * dfYInt + vy) : -1;
+            _aroundScratch[1] = (vx < maxX) ? ((vx + 1) * dfYInt + vy) : -1;
+            _aroundScratch[2] = (vy > 0) ? (vx * dfYInt + (vy - 1)) : -1;
+            _aroundScratch[3] = (vy < maxY) ? (vx * dfYInt + (vy + 1)) : -1;
+            _aroundScratch[4] = (vx > 0 && vy > 0) ? ((vx - 1) * dfYInt + (vy - 1)) : -1;
+            _aroundScratch[5] = (vx < maxX && vy < maxY) ? ((vx + 1) * dfYInt + (vy + 1)) : -1;
+            _aroundScratch[6] = (vx > 0 && vy < maxY) ? ((vx - 1) * dfYInt + (vy + 1)) : -1;
+            _aroundScratch[7] = (vx < maxX && vy > 0) ? ((vx + 1) * dfYInt + (vy - 1)) : -1;
 
             __result = _aroundScratch;
             return false;
