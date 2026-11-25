@@ -326,14 +326,45 @@ namespace SimLab
             if (animal != null) animal.currentSex = _problemSex;
         }
 
+        // Persistent 50/50: GiveBirth reads the parent's brackets through AnimalStatsCalculator,
+        // so fixing the saved definitions is what makes a save stay balanced outside SimLab.
+        private static void FixSexBrackets(AnimalDefinition d)
+        {
+            d._offspringSexDecisionType = OffspringSexDecisionType.Chance;
+            d._offspringSexChanceBracket0 = 0; d._offspringSexChanceBracket1 = 0; d._offspringSexChanceBracket2 = 0;
+            d._offspringSexChanceBracket3 = 0; d._offspringSexChanceBracket4 = 0; d._offspringSexChanceBracket5 = 0;
+            d._offspringSexChanceBracket6 = 1; d._offspringSexChanceBracket7 = 1; d._offspringSexChanceBracket8 = 1;
+            d._offspringSexChanceBracket9 = 1; d._offspringSexChanceBracket10 = 1; d._offspringSexChanceBracket11 = 1;
+            if (d.sexes != null)
+                for (int i = 0; i < d.sexes.Length; i++)
+                    FixMorphBrackets(ref d.sexes[i]);
+            if (d.youngSexes != null)
+                for (int i = 0; i < d.youngSexes.Length; i++)
+                    FixMorphBrackets(ref d.youngSexes[i]);
+        }
+
+        private static void FixMorphBrackets(ref AnimalMorph m)
+        {
+            m.offspringSexDecisionType = OffspringSexDecisionType.Chance;
+            m.offspringSexChanceBracket0 = 0; m.offspringSexChanceBracket1 = 0; m.offspringSexChanceBracket2 = 0;
+            m.offspringSexChanceBracket3 = 0; m.offspringSexChanceBracket4 = 0; m.offspringSexChanceBracket5 = 0;
+            m.offspringSexChanceBracket6 = 1; m.offspringSexChanceBracket7 = 1; m.offspringSexChanceBracket8 = 1;
+            m.offspringSexChanceBracket9 = 1; m.offspringSexChanceBracket10 = 1; m.offspringSexChanceBracket11 = 1;
+        }
+
         private static void LogSexDiag(TimeLine tl, Action<string> log)
         {
             var bySex = new SortedDictionary<int, int>();
             var sexesLens = new Dictionary<string, int>();
             var chances = new Dictionary<string, int>();
             var defs = new HashSet<AnimalDefinition>();
+            var spN = new Dictionary<int, int>();
+            var spC = new Dictionary<int, int>();
             int preg = 0, fert = 0, blockedNoBirth = 0, blockedFlag = 0, blockedMeat = 0, blockedEnergy = 0, kids = 0;
             int nf = 0, nready = 0, kf = 0, km = 0; double fE = 0, fT = 0;
+            int nCarn = 0, nHerb = 0, nOmni = 0, nMeatOnly = 0;
+            int nRealPred = 0, nRealHerb = 0, nRealOmni = 0, nMouthMeat = 0, nFungOnly = 0;
+            int ocN = 0, ocF = 0;
             for (int ai = 0; ai < tl.today.areas.Length; ai++)
             {
                 WorldArea a = tl.today.areas[ai];
@@ -348,6 +379,42 @@ namespace SimLab
                     if (an.fertilized) fert++;
                     if (an.isChild) { kids++; if (an.definition.currentSex == 0) kf++; else km++; }
                     if (an.definition.currentSex == 0) { nf++; fE += an.energy; fT += an.CalculateReproductionThreshold(); if (an.readyToGiveBirth) nready++; }
+                    if (an.eatsMeatOnly) nMeatOnly++;
+                    if (an.eatsMeat && an.eatsPlants) nOmni++;
+                    else if (an.eatsMeat) nCarn++;
+                    else nHerb++;
+                    float meatE = 0f, plantE = 0f, fungE = 0f;
+                    if (an.orderedDetailedFoodTypes != null && an.energyPerDetailedFoodType != null)
+                        for (int fi = 0; fi < an.orderedDetailedFoodTypes.Length && fi < an.energyPerDetailedFoodType.Length; fi++)
+                        {
+                            float ev = an.energyPerDetailedFoodType[fi];
+                            if (ev <= 0f) continue;
+                            switch (an.orderedDetailedFoodTypes[fi])
+                            {
+                                case DetailedFoodType.WholeAnimal:
+                                case DetailedFoodType.FreshMeat:
+                                case DetailedFoodType.OldMeat:
+                                case DetailedFoodType.Egg:
+                                case DetailedFoodType.Blood: meatE += ev; break;
+                                case DetailedFoodType.Fungus: fungE += ev; break;
+                                case DetailedFoodType.Plankton:
+                                case DetailedFoodType.MarineSnow: break;
+                                default: plantE += ev; break;
+                            }
+                        }
+                    bool realPred = meatE > 0f;
+                    if (realPred && plantE + fungE <= 0f) nRealPred++;
+                    else if (realPred) nRealOmni++;
+                    else nRealHerb++;
+                    if (an.eatsMeat && !realPred) nMouthMeat++;
+                    if (fungE > 0f && plantE <= 0f && meatE <= 0f) nFungOnly++;
+                    if (IsObligateCarnivoreDef(an.definition)) { ocN++; if (an.definition.currentSex == 0) ocF++; }
+                    int spx = tl.populationBasedAnimalClassifier.LookUp(an.definition.definitionIndex);
+                    if (spx >= 0)
+                    {
+                        spN[spx] = spN.TryGetValue(spx, out int sc1) ? sc1 + 1 : 1;
+                        if (realPred) spC[spx] = spC.TryGetValue(spx, out int sc2) ? sc2 + 1 : 1;
+                    }
                     if (!an.definition.CanGiveBirth()) blockedNoBirth++;
                     else if (!(an.definition.canGiveBirthAsexually || an.fertilized)) blockedFlag++;
                     else if (an.eatsMeat && an.nrOfChildren >= an.maximumNrOfChildren) blockedMeat++;
@@ -367,6 +434,19 @@ namespace SimLab
             foreach (var kv in bySex) bySexStr.Add(kv.Key + ":" + kv.Value);
             log($"[SEXDIAG] bySex=[{string.Join(",", bySexStr)}] preg={preg} fert={fert} kids={kids}(F={kf}/M={km}) blockedNoBirth={blockedNoBirth} blockedFlag={blockedFlag} blockedMeatCap={blockedMeat} blockedEnergy={blockedEnergy} females={nf} avgE={(nf > 0 ? fE / nf : 0):F1} avgThr={(nf > 0 ? fT / nf : 0):F1} ready={nready} distinctDefs={defs.Count}");
             foreach (var kv in sexesLens) log($"  [SEXDIAG] {kv.Key} n={kv.Value}");
+            log($"  [DIET] mouth-can-eat: herbivores={nHerb} carnivores={nCarn} omnivores={nOmni} meatOnly={nMeatOnly}");
+            log($"  [DIET2] actual-energy: predators={nRealPred} herbivores={nRealHerb} omnivores={nRealOmni} mouthMeatNoMeatEnergy={nMouthMeat} fungusOnly={nFungOnly}");
+            log($"  [PRED] obligate-carnivores={ocN} females={ocF} males={ocN - ocF}");
+            var order = new List<int>(spN.Keys);
+            order.Sort((x, y) => spN[y].CompareTo(spN[x]));
+            int shownSp = 0;
+            foreach (int spx in order)
+            {
+                if (shownSp++ >= 25) break;
+                spC.TryGetValue(spx, out int cc);
+                string nm = (spx >= 0 && spx < tl.allSpecies.Count) ? tl.allSpecies[spx].name : "?";
+                log($"  [SP] {spx} '{nm}' n={spN[spx]} pred={cc}");
+            }
             foreach (var kv in chances) log($"  [SEXDIAG] {kv.Key} n={kv.Value}");
         }
 
@@ -1535,6 +1615,7 @@ namespace SimLab
                     LivingAnimal an = a.GetAnimalInCell(pos.cellIndex, pos.locationType);
                     if (an == null || an.eaten || an.definition == null) continue;
                     if (an.definition.sexes == null || an.definition.sexes.Length == 0) continue;
+                    if (IsObligateCarnivoreDef(an.definition)) continue;
                     int sp = tl.populationBasedAnimalClassifier.LookUp(an.definition.definitionIndex);
                     if (sp < 0) continue;
                     var map = an.definition.currentSex == 0 ? fem : mal;
@@ -2472,7 +2553,9 @@ namespace SimLab
                     {
                         LivingAnimal lx = a.GetAnimalInCell(pos.cellIndex, pos.locationType);
                         if (lx == null || lx.eaten || lx.definition == null) continue;
+                        if (IsObligateCarnivoreDef(lx.definition)) continue;
                         lx.offSpringSexChances = new float[] { 0.5f, 0.5f };
+                        FixSexBrackets(lx.definition);
                         lx.definition.offspringSexDecisionType = OffspringSexDecisionType.Chance;
                         if (lx.definition.currentSex > 0)
                         {
@@ -3023,6 +3106,30 @@ namespace SimLab
                 }
         }
 
+        // Adds egg/blood energy to every mouth so the seeded predator also eats eggs and blood,
+        // not just fresh/old meat and whole animals. Everything plant/fungus stays excluded.
+        private static void AddMeatExtras(AnimalDefinition def, float eggEnergy, float bloodEnergy)
+        {
+            if (def == null) return;
+            if (def.torso != null)
+                foreach (TorsoPartDefinition tp in def.torso)
+                {
+                    if (tp == null || tp.children == null) continue;
+                    foreach (var kv in tp.children)
+                    {
+                        if (!(kv.Value is MouthDefinition md)) continue;
+                        if (md.energyPerFoodType == null) md.energyPerFoodType = new Dictionary<DetailedFoodType, float>();
+                        md.energyPerFoodType[DetailedFoodType.Egg] = eggEnergy;
+                        md.energyPerFoodType[DetailedFoodType.Blood] = bloodEnergy;
+                    }
+                }
+            if (def._excludeFromDiet != null)
+            {
+                def._excludeFromDiet.Remove(DetailedFoodType.Egg);
+                def._excludeFromDiet.Remove(DetailedFoodType.Blood);
+            }
+        }
+
         private static void SeedFromArchivedBodyplan(
             TimeLine tl, OrganismObjectFileImporter importer, OrganismObjectFileImporter2 importer2,
             string species16Path, string overrideName, bool obligateCarnivore, int count, int targetSize, int overrideMouthId, Action<string> log)
@@ -3235,6 +3342,8 @@ namespace SimLab
             if (obligateCarnivore)
             {
                 EnforceObligateCarnivoreDiet(def);
+                if (Environment.GetEnvironmentVariable("SIM_CARN_EATS_EGGS") == "1")
+                    AddMeatExtras(def, 6f, 5f);
                 def._wholeAnimalDietHueRange = new Vector2(0f, 1f);
                 def._wholeAnimalDietBrightnessRange = new Vector2(0f, 1f);
                 def._wholeAnimalDietSecondaryHueRange = new Vector2(0f, 1f);
