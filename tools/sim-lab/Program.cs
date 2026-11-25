@@ -2675,6 +2675,12 @@ namespace SimLab
                         foreach (var kv in _allDeaths) parts.Add($"{kv.Key}={kv.Value}");
                         Log("    deaths: " + string.Join(", ", parts));
                     }
+                    if (_carnDeaths.Count > 0)
+                    {
+                        var cp = new List<string>();
+                        foreach (var kv in _carnDeaths) cp.Add($"{kv.Key}={kv.Value}");
+                        Log("    carn-deaths: " + string.Join(", ", cp));
+                    }
                     {
                         double freq = System.Diagnostics.Stopwatch.Frequency;
                         double tp = _profPlants * 1000.0 / freq;
@@ -3558,7 +3564,12 @@ namespace SimLab
                     if (placed != null)
                     {
                         placed.isChild = false;
-                        placed.age = Math.Max(12, ac0.expectedAge / 4 + 1);
+                        // Stagger founder ages: spawning a whole cohort at one age makes them all
+                        // die of old age together, collapsing the species before generation 2 breeds.
+                        int ageMax = Math.Max(13, (int)ac0.expectedAge - 1);
+                        placed.age = obligateCarnivore
+                            ? 12 + (spawned * 7) % Math.Max(1, ageMax - 12)
+                            : Math.Max(12, ac0.expectedAge / 4 + 1);
                         placed.UpdateTemperature(area.cells[pairCells[s]].temperature);
                         if (spawned == 0)
                         {
