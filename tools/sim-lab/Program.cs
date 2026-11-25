@@ -3179,6 +3179,21 @@ namespace SimLab
                     def.torso[t].childrenSummary.Clear();
                 }
             }
+            if (obligateCarnivore && Environment.GetEnvironmentVariable("SIM_CARN_EXTRA_LEGS") == "1" && def.torso != null && def.torso.Length >= 4)
+            {
+                LimbDefinition src = null;
+                for (int t = 0; t < def.torso.Length && src == null; t++)
+                    if (def.torso[t]?.children != null)
+                        foreach (var kv in def.torso[t].children)
+                            if (kv.Value is LimbDefinition ld) { src = ld; break; }
+                if (src != null)
+                {
+                    LimbDefinition extra = importer.CreateLimbWithShapeIndex(src.shapeIndex);
+                    extra.scale = src.scale;
+                    def.torso[3].SetChild(extra, TorsoPartSide.Side);
+                    def.torso[3].childrenSummary.Clear();
+                }
+            }
             if (obligateCarnivore && Environment.GetEnvironmentVariable("SIM_CARN_NO_FIN") == "1" && def.torso != null)
             {
                 for (int t = 0; t < def.torso.Length; t++)
@@ -3437,10 +3452,10 @@ namespace SimLab
             var yc0 = new AnimalStatsCalculator(importer, 1f); yc0.Calculate(def, true);
             var ac0 = new AnimalStatsCalculator(importer, 1f); ac0.Calculate(def, false);
             // If scaled up in bodySize so predator > prey, gently trim torso diameters proportionally to stay under leg weight limit.
-            for (int iter = 0; iter < 20 && ac0.weight > ac0.weightSupportedForWalking - 0.15f && def.torso != null; iter++)
+            for (int iter = 0; iter < 60 && ac0.weight > ac0.weightSupportedForWalking - 0.15f && def.torso != null; iter++)
             {
                 for (int t = 0; t < def.torso.Length; t++)
-                    def.torso[t].diameter = Math.Max(1.6f, def.torso[t].diameter * 0.95f);
+                    def.torso[t].diameter = Math.Max(1.2f, def.torso[t].diameter * 0.95f);
                 yc0.Calculate(def, true);
                 ac0.Calculate(def, false);
             }
