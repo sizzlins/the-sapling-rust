@@ -362,6 +362,7 @@ namespace SimLab
             var spC = new Dictionary<int, int>();
             int preg = 0, fert = 0, blockedNoBirth = 0, blockedFlag = 0, blockedMeat = 0, blockedEnergy = 0, kids = 0;
             int nf = 0, nready = 0, kf = 0, km = 0; double fE = 0, fT = 0;
+            int rdyNest = 0, rdyEgg = 0, rdySpace = 0, rdyWalk = 0, rdyWater = 0;
             int nCarn = 0, nHerb = 0, nOmni = 0, nMeatOnly = 0;
             int nRealPred = 0, nRealHerb = 0, nRealOmni = 0, nMouthMeat = 0, nFungOnly = 0;
             int ocN = 0, ocF = 0, ocFert = 0, ocPreg = 0, ocPoisoned = 0, ocParasites = 0;
@@ -380,6 +381,15 @@ namespace SimLab
                     if (an.fertilized) fert++;
                     if (an.isChild) { kids++; if (an.definition.currentSex == 0) kf++; else km++; }
                     if (an.definition.currentSex == 0) { nf++; fE += an.energy; fT += an.CalculateReproductionThreshold(); if (an.readyToGiveBirth) nready++; }
+                    if (an.readyToGiveBirth)
+                    {
+                        WorldCell wc = a.cells[pos.cellIndex];
+                        if (!tl.CellContainsCorrectNestForAnimal(wc, an)) rdyNest++;
+                        if (!tl.EggCanSurviveInCell(wc, an)) rdyEgg++;
+                        if (!tl.EnoughSpaceForReproduction(an, a, ai, pos.cellIndex, pos.locationType)) rdySpace++;
+                        if (!(wc.oceanDepth != -1f || an.canWalk || an.sessile)) rdyWalk++;
+                        if (!(an.timeInWater == -1 || pos.locationType != CellLocationType.UnderWater)) rdyWater++;
+                    }
                     if (an.eatsMeatOnly) nMeatOnly++;
                     if (an.eatsMeat && an.eatsPlants) nOmni++;
                     else if (an.eatsMeat) nCarn++;
@@ -431,6 +441,7 @@ namespace SimLab
                     }
                 }
             }
+            log($"  [RDY] n={nready} badNest={rdyNest} badEgg={rdyEgg} badSpace={rdySpace} badWalk={rdyWalk} badWater={rdyWater}");
             var bySexStr = new List<string>();
             foreach (var kv in bySex) bySexStr.Add(kv.Key + ":" + kv.Value);
             log($"[SEXDIAG] bySex=[{string.Join(",", bySexStr)}] preg={preg} fert={fert} kids={kids}(F={kf}/M={km}) blockedNoBirth={blockedNoBirth} blockedFlag={blockedFlag} blockedMeatCap={blockedMeat} blockedEnergy={blockedEnergy} females={nf} avgE={(nf > 0 ? fE / nf : 0):F1} avgThr={(nf > 0 ? fT / nf : 0):F1} ready={nready} distinctDefs={defs.Count}");
@@ -1363,6 +1374,21 @@ namespace SimLab
             state.areas = gs.areas;
             tl.today = state;
             tl.today.weather = tl.climate.CreateNewWeatherState();
+
+            // Vanilla GameSaver.GetLivingAnimal reloads every animal with gravity=1, so animals
+            // evolved on a low-gravity planet come back overweight with canWalk=false and can
+            // never deliver (the birth gate needs canWalk || sessile). Recompute with the planet's
+            // real gravity before anything else touches them.
+            tl.gravity = gs.planet.gravity;
+            for (int ga = 0; ga < tl.today.areas.Length; ga++)
+            {
+                WorldArea garea = tl.today.areas[ga];
+                foreach (AnimalPosition gpos in garea.animalPositionTracker.animalPositions)
+                {
+                    LivingAnimal gani = garea.GetAnimalInCell(gpos.cellIndex, gpos.locationType);
+                    if (gani != null && !gani.eaten && gani.definition != null) gani.UpdateStats(importer, tl.gravity);
+                }
+            }
 
             if (Environment.GetEnvironmentVariable("SIM_REPAIR_SEX") == "1")
             {
