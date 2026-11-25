@@ -28,7 +28,7 @@ Newly spawned animals start as juveniles and wander randomly until they mature (
 
 Use `stalk` eyes (`#15`) whenever possible. They have a 360-degree field of view and 20-cell vision during both day and twilight, covering roughly 1,256 cells. If you want an alternative, `peduncle` (`#10`) also reaches 20 cells during the day with a 180-degree field of view.
 
-Avoid `receptor` (`#13`) for small spawns. Its 4-cell range covers only about 50 cells, so 10 to 20 founders usually scatter and go extinct. Note that `ArchivedAnimals/Sex Herbivore.species16` still has `receptor` eyes; swap them to `stalk` in the editor if you plan to spawn fewer than 40 founders. Also avoid `pseudopupil` (`#21`) at large eye scales, since its daytime sight curve (`[0.6, 0.0]`) shrinks as eye scale grows and drops to around 2.7 cells on large eyes.
+Avoid `receptor` (`#13`) for small spawns. Its 4-cell range covers only about 50 cells, so 10 to 20 founders usually scatter and go extinct. Also avoid `pseudopupil` (`#21`) at large eye scales if your body plan scales eyes down toward the low end of its daytime sight curve (`[0.6, 0.0]`).
 
 ### Legs and skin
 
