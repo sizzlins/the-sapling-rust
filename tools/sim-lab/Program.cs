@@ -312,11 +312,97 @@ namespace SimLab
             return __exception;
         }
 
+        // Why aren't animals breeding? Histogram of sex, sexes-array length, sex-chance arrays,
+        // and which gate of LiveADay's reproduction branch rejects each living animal.
+        private static int _problemSex;
+        private static void ProblemSex_Prefix(AnimalDefinition animal)
+        {
+            if (animal != null) _problemSex = animal.currentSex;
+        }
+        // DetectProblemInAnimal walks every morph by overwriting currentSex; an exception
+        // (the world's malformed animals throw NREs) leaves the animal stuck as male.
+        private static void ProblemSex_Finalizer(AnimalDefinition animal)
+        {
+            if (animal != null) animal.currentSex = _problemSex;
+        }
+
+        private static void LogSexDiag(TimeLine tl, Action<string> log)
+        {
+            var bySex = new SortedDictionary<int, int>();
+            var sexesLens = new Dictionary<string, int>();
+            var chances = new Dictionary<string, int>();
+            var defs = new HashSet<AnimalDefinition>();
+            int preg = 0, fert = 0, blockedNoBirth = 0, blockedFlag = 0, blockedMeat = 0, blockedEnergy = 0, kids = 0;
+            int nf = 0, nready = 0, kf = 0, km = 0; double fE = 0, fT = 0;
+            for (int ai = 0; ai < tl.today.areas.Length; ai++)
+            {
+                WorldArea a = tl.today.areas[ai];
+                foreach (AnimalPosition pos in a.animalPositionTracker.animalPositions)
+                {
+                    LivingAnimal an = a.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                    if (an == null || an.eaten || an.definition == null) continue;
+                    int sex = an.definition.currentSex;
+                    defs.Add(an.definition);
+                    bySex[sex] = bySex.TryGetValue(sex, out int c) ? c + 1 : 1;
+                    if (an.pregnant) preg++;
+                    if (an.fertilized) fert++;
+                    if (an.isChild) { kids++; if (an.definition.currentSex == 0) kf++; else km++; }
+                    if (an.definition.currentSex == 0) { nf++; fE += an.energy; fT += an.CalculateReproductionThreshold(); if (an.readyToGiveBirth) nready++; }
+                    if (!an.definition.CanGiveBirth()) blockedNoBirth++;
+                    else if (!(an.definition.canGiveBirthAsexually || an.fertilized)) blockedFlag++;
+                    else if (an.eatsMeat && an.nrOfChildren >= an.maximumNrOfChildren) blockedMeat++;
+                    else if (an.energy <= an.CalculateReproductionThreshold()) blockedEnergy++;
+                    string sk = "sexes=" + (an.definition.sexes == null ? -1 : an.definition.sexes.Length);
+                    sexesLens[sk] = sexesLens.TryGetValue(sk, out int c2) ? c2 + 1 : 1;
+                    string ck = "dec=" + an.definition.offspringSexDecisionType + " ch=" + (an.offSpringSexChances == null ? "null" : string.Join("/", an.offSpringSexChances));
+                    chances[ck] = chances.TryGetValue(ck, out int c3) ? c3 + 1 : 1;
+                    if (an.readyToGiveBirth && nready <= 6)
+                    {
+                        WorldCell wc = a.cells[pos.cellIndex];
+                        log($"  [SEXDIAG] ready sex={sex} nest={tl.CellContainsCorrectNestForAnimal(wc, an)} egg={tl.EggCanSurviveInCell(wc, an)} space={tl.EnoughSpaceForReproduction(an, a, ai, pos.cellIndex, pos.locationType)} walk={an.canWalk} ocean={wc.oceanDepth} inWater={an.timeInWater} loc={pos.locationType} eggType={an.definition.eggType} nestType={an.definition.nestType}");
+                    }
+                }
+            }
+            var bySexStr = new List<string>();
+            foreach (var kv in bySex) bySexStr.Add(kv.Key + ":" + kv.Value);
+            log($"[SEXDIAG] bySex=[{string.Join(",", bySexStr)}] preg={preg} fert={fert} kids={kids}(F={kf}/M={km}) blockedNoBirth={blockedNoBirth} blockedFlag={blockedFlag} blockedMeatCap={blockedMeat} blockedEnergy={blockedEnergy} females={nf} avgE={(nf > 0 ? fE / nf : 0):F1} avgThr={(nf > 0 ? fT / nf : 0):F1} ready={nready} distinctDefs={defs.Count}");
+            foreach (var kv in sexesLens) log($"  [SEXDIAG] {kv.Key} n={kv.Value}");
+            foreach (var kv in chances) log($"  [SEXDIAG] {kv.Key} n={kv.Value}");
+        }
+
+        private static int _giveBirthLogs = 0;
+        private static void GiveBirth_Audit_Prefix(LivingAnimal __instance)
+        {
+            if (Environment.GetEnvironmentVariable("SIM_AUDIT_SEX") != "1") return;
+            if (__instance == null || __instance.definition == null || _giveBirthLogs >= 10) return;
+            _giveBirthLogs++;
+            Console.WriteLine($"[BIRTH] parentSex={__instance.definition.currentSex} sexes={__instance.definition.sexes.Length} dec={__instance.definition.offspringSexDecisionType} ch={(__instance.offSpringSexChances == null ? "null" : string.Join("/", __instance.offSpringSexChances))} fert={__instance.fertilized}");
+        }
+
+        private static int _birthPost = 0;
+        private static void GiveBirth_Postfix(LivingAnimal __result)
+        {
+            if (Environment.GetEnvironmentVariable("SIM_AUDIT_SEX") != "1") return;
+            if (_birthPost >= 20) return;
+            _birthPost++;
+            Console.WriteLine($"[BIRTHOUT] childSex={(__result != null && __result.definition != null ? __result.definition.currentSex : -1)} def={(__result != null && __result.definition != null ? __result.definition.definitionIndex : -1)}");
+        }
+
         private static void AuditLiveADay_Prefix(LivingAnimal __instance)
         {
             if (Environment.GetEnvironmentVariable("SIM_AUDIT_ANIMALS") != "1") return;
             if (__instance != null && __instance.definition != null)
                 Console.WriteLine($"[LIVE] def={__instance.definition.definitionIndex} age={__instance.age} sex={__instance.definition.currentSex} pregnant={__instance.pregnant} carrying={__instance.carryingBaby}");
+        }
+
+        private static bool CanGiveBirth_Prefix(AnimalDefinition __instance, ref bool __result)
+        {
+            if (__instance != null && __instance.currentSex > 0)
+            {
+                __result = false;
+                return false;
+            }
+            return true;
         }
 
         private static void SanitizeAnimalDef(AnimalDefinition d)
@@ -331,6 +417,16 @@ namespace SimLab
         private static void SanitizeClone_Postfix(object __result)
         {
             SanitizeAnimalDef(__result as AnimalDefinition);
+        }
+
+        // Offspring sex is otherwise read from mutated Chance/Temperature brackets, which is why
+        // the evolved world drifted to 96% one sex. Every stats refresh resets it to a fair 50/50;
+        // GiveBirth reads the parent's field, so this covers every newborn.
+        private static void BalanceSex_Postfix(AnimalDefinition animal, AnimalStatsCalculator __instance)
+        {
+            if (animal == null || animal.sexes == null || animal.sexes.Length == 0) return;
+            animal.offspringSexDecisionType = OffspringSexDecisionType.Chance;
+            if (__instance != null) __instance.offSpringSexChances = new float[] { 0.5f, 0.5f };
         }
 
         private static void FixBlendSex_Postfix(AnimalDefinition animalA, AnimalDefinition __result)
@@ -476,12 +572,22 @@ namespace SimLab
                 postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(FixBlendSex_Postfix), flags)));
             h.Patch(typeof(AnimalDefinition).GetMethod("Clone"),
                 postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(SanitizeClone_Postfix), flags)));
+            if (Environment.GetEnvironmentVariable("SIM_NO_MALE_BIRTH") == "1")
+                h.Patch(typeof(AnimalDefinition).GetMethod("CanGiveBirth"),
+                    prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(CanGiveBirth_Prefix), flags)));
+            h.Patch(AccessTools.Method(typeof(AnimalStatsCalculator), "Calculate", new[] { typeof(AnimalDefinition), typeof(bool) }),
+                postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(BalanceSex_Postfix), flags)));
             h.Patch(AccessTools.Method(typeof(LivingAnimal), "LiveADay", new[] { typeof(int) }),
                 prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(AuditLiveADay_Prefix), flags)),
                 finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(AnimalEx_Finalizer), flags)));
             h.Patch(AccessTools.Method(typeof(LivingAnimal), "UpdateStats", new[] { typeof(OrganismObjectFileImporter), typeof(float) }),
                 finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(AnimalEx_Finalizer), flags)));
+            h.Patch(AccessTools.Method(typeof(OrganismProblemDetection), "DetectProblemInAnimal"),
+                prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(ProblemSex_Prefix), flags)),
+                finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(ProblemSex_Finalizer), flags)));
             h.Patch(AccessTools.Method(typeof(LivingAnimal), "GiveBirth", new[] { typeof(float) }),
+                prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(GiveBirth_Audit_Prefix), flags)),
+                postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(GiveBirth_Postfix), flags)),
                 finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(AnimalEx_Finalizer), flags)));
             h.Patch(typeof(TimeLine).GetMethod("LetAllAnimalsInAreaLiveADay"),
                 prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(AuditAnimals_Prefix), flags)),
@@ -1195,13 +1301,14 @@ namespace SimLab
                         maleMorph.canGiveBirthSexually = false;
                         maleMorph.canFertilizeInternally = true;
                         maleMorph.canFertilizeExternally = false;
-                        d.sexes = new AnimalMorph[] { maleMorph, AnimalMorph.Clone(maleMorph) };
-                        d.youngSexes = new AnimalMorph[] { maleMorph, AnimalMorph.Clone(maleMorph) };
+                        d.sexes = new AnimalMorph[] { maleMorph };
+                        d.youngSexes = new AnimalMorph[] { AnimalMorph.Clone(maleMorph) };
                         d.currentSex = 0;
+                        d._offspringSexDecisionType = OffspringSexDecisionType.Chance;
                         d.offspringSexDecisionType = OffspringSexDecisionType.Chance;
-                        d.canGiveBirthAsexually = false;
-                        d.canGiveBirthSexually = true;
-                        d.canFertilizeInternally = false;
+                        d._canGiveBirthAsexually = false;
+                        d._canGiveBirthSexually = true;
+                        d._canFertilizeInternally = false;
                         // The save's instincts may not include mate seeking; without it a
                         // two-sex population barely pairs. Add the stock See/APotentialMate rule.
                         bool hasMateInstinct = false;
@@ -1413,6 +1520,111 @@ namespace SimLab
                     if (an.definition.currentSex == 0) females++; else males++;
                 }
             }
+        }
+
+        // The save's morphs make one sex out-survive the other, so the live ratio drifts to ~90%
+        // male even with 50/50 births. Re-deal the two live sexes per species so both stay present.
+        // shortcut: fixes the ratio, not the underlying survival asymmetry, revisit if morphs are rebuilt
+        private static int BalanceSexes(TimeLine tl)
+        {
+            var fem = new Dictionary<int, List<LivingAnimal>>();
+            var mal = new Dictionary<int, List<LivingAnimal>>();
+            foreach (WorldArea a in tl.today.areas)
+                foreach (AnimalPosition pos in a.animalPositionTracker.animalPositions)
+                {
+                    LivingAnimal an = a.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                    if (an == null || an.eaten || an.definition == null) continue;
+                    if (an.definition.sexes == null || an.definition.sexes.Length == 0) continue;
+                    int sp = tl.populationBasedAnimalClassifier.LookUp(an.definition.definitionIndex);
+                    if (sp < 0) continue;
+                    var map = an.definition.currentSex == 0 ? fem : mal;
+                    if (!map.TryGetValue(sp, out List<LivingAnimal> list)) map[sp] = list = new List<LivingAnimal>();
+                    list.Add(an);
+                }
+            int flipped = 0;
+            var allSp = new HashSet<int>(fem.Keys);
+            foreach (int k in mal.Keys) allSp.Add(k);
+            foreach (int sp in allSp)
+            {
+                fem.TryGetValue(sp, out List<LivingAnimal> flist);
+                mal.TryGetValue(sp, out List<LivingAnimal> mlist);
+                int nf2 = flist != null ? flist.Count : 0, nm2 = mlist != null ? mlist.Count : 0;
+                int total = nf2 + nm2;
+                if (total < 4) continue;
+                int wantF = total / 2;
+                if (nf2 < wantF && mlist != null)
+                {
+                    for (int i = 0; i < mlist.Count && nf2 < wantF; i++)
+                    {
+                        MakeFemale(mlist[i].definition);
+                        nf2++;
+                        flipped++;
+                    }
+                }
+                else if (nf2 > wantF + 1 && flist != null)
+                {
+                    for (int i = 0; i < flist.Count && nf2 > wantF; i++)
+                    {
+                        MakeMale(flist[i].definition);
+                        nf2--;
+                        flipped++;
+                    }
+                }
+            }
+            return flipped;
+        }
+
+        private static void MakeFemale(AnimalDefinition d)
+        {
+            d.currentSex = 0;
+            d._canGiveBirthAsexually = true;
+            d._canGiveBirthSexually = true;
+            d._canFertilizeInternally = false;
+        }
+
+        private static void MakeMale(AnimalDefinition d)
+        {
+            if (d.sexes == null || d.sexes.Length == 0) return;
+            d.currentSex = 1;
+            d.canGiveBirthAsexually = true;
+            d.canGiveBirthSexually = false;
+            d.canFertilizeInternally = true;
+        }
+
+        // Mate-finding relies on the See/APotentialMate instinct, which almost never fires across
+        // 5000 cells, so a sparse two-sex population dies out. Pair each unfertilized female with
+        // any living male of her species instead; GiveBirth still blends both genomes.
+        private static int AssignMates(TimeLine tl)
+        {
+            var males = new Dictionary<int, List<AnimalDefinition>>();
+            var females = new List<LivingAnimal>();
+            foreach (WorldArea a in tl.today.areas)
+                foreach (AnimalPosition pos in a.animalPositionTracker.animalPositions)
+                {
+                    LivingAnimal an = a.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                    if (an == null || an.eaten || an.definition == null || an.age < an.matureAtAge) continue;
+                    if (an.definition.sexes == null || an.definition.sexes.Length == 0) continue;
+                    int sp = tl.populationBasedAnimalClassifier.LookUp(an.definition.definitionIndex);
+                    if (sp < 0) continue;
+                    if (an.definition.currentSex > 0)
+                    {
+                        if (!males.TryGetValue(sp, out List<AnimalDefinition> list)) males[sp] = list = new List<AnimalDefinition>();
+                        list.Add(an.definition);
+                    }
+                    else if (!an.fertilized) females.Add(an);
+                }
+            int n = 0;
+            foreach (LivingAnimal f in females)
+            {
+                int sp = tl.populationBasedAnimalClassifier.LookUp(f.definition.definitionIndex);
+                if (sp < 0 || !males.TryGetValue(sp, out List<AnimalDefinition> list) || list.Count == 0) continue;
+                f.fertilized = true;
+                f.fertilizedByAnimal = list[n % list.Count];
+                f.hasSharedGenes = true;
+                f.ageAtLastMating = f.age;
+                n++;
+            }
+            return n;
         }
 
         private static void CountSpeciesAlive(TimeLine tl, out int plantSpp, out int fungusSpp, out int animalSpp, out int algaSpp)
@@ -1812,6 +2024,212 @@ namespace SimLab
             return 0;
         }
 
+        private static int ExportTopSexualFromSave(string savePath, string herbOut, string carnOut, OrganismObjectFileImporter importer)
+        {
+            var importer2 = BuildRealImporter2();
+            var gs = new GameSaver { importer = importer, importer2 = importer2, currentSaveFileFormatVersion = 16 };
+            gs.Decode(File.ReadAllBytes(savePath));
+            TimeLine tl = WireTimeline(gs, importer, importer2);
+            float grav = tl.gravity;
+
+            // Group living animals by species index
+            var bySpecies = new Dictionary<int, List<LivingAnimal>>();
+            foreach (AnimalPosition pos in tl.today.areas[0].animalPositionTracker.animalPositions)
+            {
+                var la = tl.today.areas[0].GetAnimalInCell(pos.cellIndex, pos.locationType);
+                if (la == null || la.eaten || la.definition == null) continue;
+                int spIdx = tl.usePopulationBasedClassification
+                    ? tl.populationBasedAnimalClassifier.LookUp(la.definition.definitionIndex)
+                    : (tl.speciesIndexPerDefinitionIndex.TryGetValue(la.definition.definitionIndex, out int s) ? s : -1);
+                if (spIdx < 0) continue;
+                if (!bySpecies.TryGetValue(spIdx, out var list)) { list = new List<LivingAnimal>(); bySpecies[spIdx] = list; }
+                list.Add(la);
+            }
+
+            var ranked = new List<KeyValuePair<int, List<LivingAnimal>>>(bySpecies);
+            ranked.Sort((a, b) => b.Value.Count.CompareTo(a.Value.Count));
+
+            AnimalDefinition bestHerb = null; string bestHerbInfo = "";
+            AnimalDefinition bestCarn = null; string bestCarnInfo = "";
+
+            Console.WriteLine($"Day {tl.dayIndex} (grav={grav:F2}): {ranked.Count} living animal species");
+            foreach (var kv in ranked)
+            {
+                int spIdx = kv.Key;
+                var list = kv.Value;
+                string spName = (spIdx >= 0 && spIdx < tl.allSpecies.Count && tl.allSpecies[spIdx] != null) ? tl.allSpecies[spIdx].name : $"spp{spIdx}";
+                int nF = 0, nM = 0;
+                foreach (var la in list) if (la.definition.currentSex == 0) nF++; else nM++;
+                if (nF == 0 || nM == 0) continue;
+
+                // Prefer a strictly non-asexual living individual in this species (highest speed, NoProblem on both sexes);
+                // fall back to modal sexually active individual if none exist.
+                AnimalDefinition chosen = null;
+                float chosenSpd = -1f;
+                bool chosenStrict = false;
+                bool chosenHerbOrFung = false, chosenObligCarn = false;
+                string chosenDiet = "";
+
+                var seenDefs = new HashSet<int>();
+                foreach (var la in list)
+                {
+                    var d = la.definition;
+                    if (!seenDefs.Add(d.definitionIndex)) continue;
+                    if (d.sexes == null || d.sexes.Length < 1) continue;
+                    int sv = d.currentSex;
+                    d.currentSex = 0;
+                    var sc0 = new AnimalStatsCalculator(importer, grav); sc0.Calculate(d, false);
+                    var yc0 = new AnimalStatsCalculator(importer, grav); yc0.Calculate(d, true);
+                    var p0 = OrganismProblemDetection.DetectProblemInAnimal(d, yc0, sc0);
+                    d.currentSex = 1;
+                    var sc1 = new AnimalStatsCalculator(importer, grav); sc1.Calculate(d, false);
+                    var yc1 = new AnimalStatsCalculator(importer, grav); yc1.Calculate(d, true);
+                    var p1 = OrganismProblemDetection.DetectProblemInAnimal(d, yc1, sc1);
+                    d.currentSex = sv;
+                    if (p0 != OrganismProblem.NoProblem || p1 != OrganismProblem.NoProblem) continue;
+
+                    bool fSex = d._canGiveBirthSexually && !d._canGiveBirthAsexually && !d._canFertilizeInternally;
+                    bool mSex = d.sexes[0].canFertilizeInternally && !d.sexes[0].canGiveBirthSexually;
+                    if (!fSex || !mSex) continue;
+                    bool strict = !d.sexes[0].canGiveBirthAsexually;
+
+                    bool eatsMeat = false, eatsPlantOrFung = false;
+                    var dl = new List<string>();
+                    if (sc0.orderedDetailedFoodTypes != null)
+                        for (int i = 0; i < sc0.orderedDetailedFoodTypes.Length; i++)
+                        {
+                            var ft = sc0.orderedDetailedFoodTypes[i];
+                            dl.Add($"{ft}:{sc0.energyPerDetailedFoodType[i]:F0}");
+                            if (ft == DetailedFoodType.WholeAnimal || ft == DetailedFoodType.FreshMeat || ft == DetailedFoodType.OldMeat || ft == DetailedFoodType.Egg || ft == DetailedFoodType.Blood)
+                                eatsMeat = true;
+                            else if (ft != DetailedFoodType.None)
+                                eatsPlantOrFung = true;
+                        }
+                    bool herbOrFung = !eatsMeat && eatsPlantOrFung;
+                    bool obligCarn = eatsMeat && !eatsPlantOrFung;
+                    if (!herbOrFung && !obligCarn) continue;
+
+                    if (chosen == null || (strict && !chosenStrict) || (strict == chosenStrict && sc0.speed > chosenSpd))
+                    {
+                        chosen = d; chosenSpd = sc0.speed; chosenStrict = strict;
+                        chosenHerbOrFung = herbOrFung; chosenObligCarn = obligCarn;
+                        chosenDiet = string.Join(",", dl);
+                    }
+                }
+                if (chosen == null) continue;
+
+                if (bestHerb == null && chosenHerbOrFung)
+                {
+                    bestHerb = chosen;
+                    bestHerbInfo = $"spp {spIdx} '{spName}' pop={list.Count} (F={nF}/M={nM}) strict={chosenStrict} sz={chosen.bodySize} spd={chosenSpd:F1} diet=[{chosenDiet}]";
+                }
+                if (bestCarn == null && chosenObligCarn)
+                {
+                    bestCarn = chosen;
+                    bestCarnInfo = $"spp {spIdx} '{spName}' pop={list.Count} (F={nF}/M={nM}) strict={chosenStrict} sz={chosen.bodySize} spd={chosenSpd:F1} diet=[{chosenDiet}]";
+                }
+                if (bestHerb != null && bestCarn != null) break;
+            }
+
+            void WriteAndVerify(AnimalDefinition chosen, string name, string outPath, string info)
+            {
+                if (chosen == null) { Console.Error.WriteLine($"ERROR: No matching species found for {name}!"); return; }
+                // Clone via GameSaver round-trip so we never mutate the live object
+                var tmp = new GameSaver { importer = importer, importer2 = importer2, savingBytes = new List<byte>() };
+                int prevSex = chosen.currentSex;
+                int prevIdx = chosen.definitionIndex;
+                chosen.currentSex = 0;
+                chosen.definitionIndex = -1;
+                var sp = new SpeciesDefinition(chosen, name, 0)
+                {
+                    speciesType = OrganismType.Animal,
+                    manuallyAdded = true,
+                    birthPlaces = new List<int>(),
+                    numberOfYearsNotExtinct = 0,
+                    peakNumberOfLivingOrganisms = 0,
+                    extinctSinceYear = -1,
+                };
+                tmp.AddSpecies(sp);
+                chosen.currentSex = prevSex;
+                chosen.definitionIndex = prevIdx;
+
+                byte[] bytes = tmp.savingBytes.ToArray();
+                Directory.CreateDirectory(Path.GetDirectoryName(outPath));
+                File.WriteAllBytes(outPath, bytes);
+
+                var loader = new GameSaver { importer = importer, importer2 = importer2, currentSaveFileFormatVersion = 16, loadingBytes = bytes };
+                var loaded = loader.GetSpecies();
+                var ld = (AnimalDefinition)loaded.exampleOrganism;
+                ld.currentSex = 0; bool fOk = ld.canGiveBirthSexually && !ld.canGiveBirthAsexually && !ld.canFertilizeInternally;
+                ld.currentSex = 1; bool mOk = ld.canFertilizeInternally && !ld.canGiveBirthSexually && !ld.canGiveBirthAsexually;
+                Console.WriteLine($"EXPORTED '{name}' -> {outPath} ({bytes.Length} bytes) from {info} | round-trip name='{loaded.name}' sexes={ld.sexes.Length + 1} F={fOk} M={mOk}");
+            }
+
+            WriteAndVerify(bestHerb, "Sex Herbivore", herbOut, bestHerbInfo);
+            WriteAndVerify(bestCarn, "Sex Obligate Carnivore", carnOut, bestCarnInfo);
+            return (bestHerb != null && bestCarn != null) ? 0 : 2;
+        }
+
+        private static int InspectFile(string path, OrganismObjectFileImporter importer)
+        {
+            var importer2 = BuildRealImporter2();
+            void DumpDef(string label, AnimalDefinition def, float grav)
+            {
+                int prevSex = def.currentSex;
+                int nSex = 1 + (def.sexes != null ? def.sexes.Length : 0);
+                for (int s = 0; s < nSex; s++)
+                {
+                    def.currentSex = s;
+                    var sc = new AnimalStatsCalculator(importer, grav);
+                    sc.Calculate(def, false);
+                    var yc = new AnimalStatsCalculator(importer, grav);
+                    yc.Calculate(def, true);
+                    var parts = new List<string>();
+                    if (def.torso != null)
+                        for (int t = 0; t < def.torso.Length; t++)
+                            if (def.torso[t]?.children != null)
+                                foreach (var kv in def.torso[t].children)
+                                    parts.Add($"t{t}:{kv.Key.side}:{kv.Value.GetType().Name.Replace("Definition","")}({kv.Value.shapeName}#{kv.Value.shapeIndex},sc={kv.Value.scale:F2})");
+                    var insts = new List<string>();
+                    if (def.instincts != null)
+                        foreach (var ins in def.instincts)
+                            if (ins != null) insts.Add($"{ins.conditionSense}:{ins.conditionObject}->{ins.action}");
+                    var diet = new List<string>();
+                    if (sc.orderedDetailedFoodTypes != null)
+                        for (int i = 0; i < sc.orderedDetailedFoodTypes.Length; i++)
+                            diet.Add($"{sc.orderedDetailedFoodTypes[i]}:{sc.energyPerDetailedFoodType[i]:F1}");
+                    Console.WriteLine($"[{label} sex={s}] grav={grav:F2} size={def.bodySize} age={sc.expectedAge}d mat={sc.matureAtAge}d preg={sc.pregnancyTime}d eggT={sc.embryoDevelopmentTime - sc.pregnancyTime}d spd={sc.speed:F2}(y:{yc.speed:F2}) cw={sc.canWalk} wt={sc.weight:F1}/{sc.weightSupportedForWalking:F1} see(D/T/N)={sc.furthestSeeingDistanceDuringDayTime*5:F1}/{sc.furthestSeeingDistanceAtTwilight*5:F1}/{sc.furthestSeeingDistanceAtNight*5:F1} fov={sc.fieldOfView} hear={sc.furthestHearingDistance:F1} temp=[{sc.minimumTemperatureThisOrganismCanHandle:F1}..{sc.maximumTemperatureThisOrganismCanHandle:F1}] noEgg=[{def.noEggsBelowTemperature:F2}..{def.noEggsAboveTemperature:F2}] noHatch=[{def.noHatchBelowTemperature:F2}..{def.noHatchAboveTemperature:F2}] reproCost={sc.energyNeededToReproduce:F1} asex={def.canGiveBirthAsexually} sexB={def.canGiveBirthSexually} fertInt={def.canFertilizeInternally} prob={OrganismProblemDetection.DetectProblemInAnimal(def, yc, sc)}");
+                    Console.WriteLine($"  diet=[{string.Join(",", diet)}] sexDec={def.offspringSexDecisionType} ch=[{(sc.offSpringSexChances != null ? string.Join(",", sc.offSpringSexChances) : "")}]");
+                    Console.WriteLine($"  inst({insts.Count})=[{string.Join("; ", insts)}]");
+                    if (s == 0) Console.WriteLine($"  parts=[{string.Join(", ", parts)}]");
+                }
+                def.currentSex = prevSex;
+            }
+            if (path.EndsWith(".species16", StringComparison.OrdinalIgnoreCase))
+            {
+                var gs = new GameSaver { importer = importer, importer2 = importer2, currentSaveFileFormatVersion = 16, loadingBytes = File.ReadAllBytes(path) };
+                var sp = gs.GetSpecies();
+                DumpDef(sp.name, (AnimalDefinition)sp.exampleOrganism, 0.5f);
+                return 0;
+            }
+            var g = new GameSaver { importer = importer, importer2 = importer2, currentSaveFileFormatVersion = 16 };
+            g.Decode(File.ReadAllBytes(path));
+            float grav2 = g.scenarioIndex == 999 ? g.planet.gravity : 1f;
+            float tMin = 999f, tMax = -999f;
+            foreach (var c in g.areas[0].cells) if (c != null && c.oceanDepth == -1f) { if (c.baseTemperature < tMin) tMin = c.baseTemperature; if (c.baseTemperature > tMax) tMax = c.baseTemperature; }
+            Console.WriteLine($"SAVE day={g.dayIndex} scen={g.scenarioIndex} grav={grav2:F3} (denorm={SimulationTools.DenormalizeGravity(grav2):F3}) landBaseTemp=[{tMin:F2}..{tMax:F2}]");
+            var seen = new HashSet<int>();
+            foreach (AnimalPosition pos in g.areas[0].animalPositionTracker.animalPositions)
+            {
+                var la = g.areas[0].GetAnimalInCell(pos.cellIndex, pos.locationType);
+                if (la == null || !seen.Add(la.definition.definitionIndex)) continue;
+                var wc = g.areas[0].cells[pos.cellIndex];
+                Console.WriteLine($"  LIVE def={la.definition.definitionIndex} sex={la.definition.currentSex} age={la.age} child={la.isChild} cellTemp={wc.temperature:F2}(base={wc.baseTemperature:F2}) E={la.energy:F1} spd={la.speed:F2} cw={la.canWalk}");
+                DumpDef($"def{la.definition.definitionIndex}", la.definition, grav2);
+            }
+            return 0;
+        }
+
         private static int RunSaveSimulation(string savePath, int days, int reportEvery, int seed, string patchMode)
         {
             string outDir = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "sim-results");
@@ -2025,6 +2443,65 @@ namespace SimLab
                 }
             }
 
+            if (Environment.GetEnvironmentVariable("SIM_FEMALE_ASEXUAL") == "1")
+            {
+                foreach (WorldArea a in tl.today.areas)
+                    foreach (AnimalPosition pos in a.animalPositionTracker.animalPositions)
+                    {
+                        LivingAnimal la3 = a.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                        if (la3 == null || la3.definition == null) continue;
+                        if (la3.definition.currentSex == 0)
+                        {
+                            la3.definition.canGiveBirthAsexually = true;
+                            la3.definition.canGiveBirthSexually = true;
+                        }
+                        else
+                        {
+                            la3.definition.canGiveBirthAsexually = false;
+                            la3.definition.canGiveBirthSexually = false;
+                        }
+                    }
+                Console.WriteLine("[SIM] female asexual cloning enabled; male gestation disabled");
+            }
+
+            if (Environment.GetEnvironmentVariable("SIM_FIX_SEX") == "1")
+            {
+                int nsx = 0, nsm = 0;
+                foreach (WorldArea a in tl.today.areas)
+                    foreach (AnimalPosition pos in a.animalPositionTracker.animalPositions)
+                    {
+                        LivingAnimal lx = a.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                        if (lx == null || lx.eaten || lx.definition == null) continue;
+                        lx.offSpringSexChances = new float[] { 0.5f, 0.5f };
+                        lx.definition.offspringSexDecisionType = OffspringSexDecisionType.Chance;
+                        if (lx.definition.currentSex > 0)
+                        {
+                            lx.definition.canGiveBirthAsexually = true;
+                            lx.definition.canGiveBirthSexually = false;
+                            lx.definition.canFertilizeInternally = true;
+                            nsm++;
+                        }
+                        else
+                        {
+                            lx.definition._canGiveBirthAsexually = true;
+                            lx.definition._canGiveBirthSexually = true;
+                            lx.definition._canFertilizeInternally = false;
+                        }
+                        nsx++;
+                    }
+                Console.WriteLine($"[SIM] sex fixed on {nsx} animals ({nsm} male)");
+            }
+
+            bool assignMates = Environment.GetEnvironmentVariable("SIM_MATE_ASSIGN") == "1";
+            bool balanceSex = Environment.GetEnvironmentVariable("SIM_BALANCE_SEX") == "1";
+            if (balanceSex) Console.WriteLine($"[SIM] sexes rebalanced at load: {BalanceSexes(tl)}");
+            if (assignMates) Console.WriteLine($"[SIM] mates assigned at load: {AssignMates(tl)}");
+
+            if (Environment.GetEnvironmentVariable("SIM_AUDIT_SEX") == "1")
+            {
+                LogSexDiag(tl, Console.WriteLine);
+            }
+
             if (days == 0) { liveLog.Close(); return 0; }
             bool runForever = days < 0;
             if (reportEvery <= 0) reportEvery = 1000;
@@ -2060,6 +2537,8 @@ namespace SimLab
             {
                 tl.LiveADay();
                 done++;
+                if (assignMates && done % 10 == 0) AssignMates(tl);
+                if (balanceSex && done % 10 == 0) BalanceSexes(tl);
                 if (done <= 1000 && done % 50 == 0 && Environment.GetEnvironmentVariable("SIM_COEVO_VERBOSE") == "1")
                 {
                     int cCnt = 0, cF = 0, cM = 0, cFert = 0, cKids = 0, cEggs = 0, cCapped = 0; double cSumE = 0;
@@ -2106,6 +2585,7 @@ namespace SimLab
                     string etaStr = runForever ? "INF" : (dps > 0 ? $"{(days - done) / dps / 3600.0:F1}h" : "?");
                     long mem = GC.GetTotalMemory(false) / 1048576;
                     Log($"Day {tl.dayIndex,9} | P={p,5} F={f,4} A={an,5} (F/M={females}/{males}) | grass={gr,5} plank={pl,5} alga={ma,4} seeds={ds,4} eggs={eg,4} | spp alive P={ps} F={fs} A={ans} | totalSpp={tl.allSpecies.Count} capHits={_speciesCapHits} | mat={_totalMatings} births={_totalBirths} mut={_totalMutations} | {dps:F1} d/s ETA {etaStr} mem={mem}MB");
+                    if (Environment.GetEnvironmentVariable("SIM_AUDIT_SEX") == "1") LogSexDiag(tl, Log);
                     if (_allDeaths.Count > 0)
                     {
                         var parts = new List<string>();
@@ -3471,6 +3951,15 @@ namespace SimLab
             if (args != null && args.Length > 2 && args[0] == "--export-biogenesis")
             {
                 return ExportBiogenesis(args[1], args[2], args.Length > 3 ? int.Parse(args[3]) : 42);
+            }
+
+            if (args != null && args.Length > 1 && args[0] == "--inspect")
+            {
+                return InspectFile(args[1], importer);
+            }
+            if (args != null && args.Length > 3 && args[0] == "--export-top-sexual")
+            {
+                return ExportTopSexualFromSave(args[1], args[2], args[3], importer);
             }
 
             // Load a real save and continue its ecosystem for N days:
