@@ -364,7 +364,7 @@ namespace SimLab
             int nf = 0, nready = 0, kf = 0, km = 0; double fE = 0, fT = 0;
             int nCarn = 0, nHerb = 0, nOmni = 0, nMeatOnly = 0;
             int nRealPred = 0, nRealHerb = 0, nRealOmni = 0, nMouthMeat = 0, nFungOnly = 0;
-            int ocN = 0, ocF = 0;
+            int ocN = 0, ocF = 0, ocFert = 0, ocPreg = 0;
             for (int ai = 0; ai < tl.today.areas.Length; ai++)
             {
                 WorldArea a = tl.today.areas[ai];
@@ -408,7 +408,7 @@ namespace SimLab
                     else nRealHerb++;
                     if (an.eatsMeat && !realPred) nMouthMeat++;
                     if (fungE > 0f && plantE <= 0f && meatE <= 0f) nFungOnly++;
-                    if (IsObligateCarnivoreDef(an.definition)) { ocN++; if (an.definition.currentSex == 0) ocF++; }
+                    if (IsObligateCarnivoreDef(an.definition)) { ocN++; if (an.definition.currentSex == 0) ocF++; if (an.fertilized) ocFert++; if (an.pregnant) ocPreg++; }
                     int spx = tl.populationBasedAnimalClassifier.LookUp(an.definition.definitionIndex);
                     if (spx >= 0)
                     {
@@ -436,7 +436,7 @@ namespace SimLab
             foreach (var kv in sexesLens) log($"  [SEXDIAG] {kv.Key} n={kv.Value}");
             log($"  [DIET] mouth-can-eat: herbivores={nHerb} carnivores={nCarn} omnivores={nOmni} meatOnly={nMeatOnly}");
             log($"  [DIET2] actual-energy: predators={nRealPred} herbivores={nRealHerb} omnivores={nRealOmni} mouthMeatNoMeatEnergy={nMouthMeat} fungusOnly={nFungOnly}");
-            log($"  [PRED] obligate-carnivores={ocN} females={ocF} males={ocN - ocF}");
+            log($"  [PRED] obligate-carnivores={ocN} females={ocF} males={ocN - ocF} fertilized={ocFert} pregnant={ocPreg}");
             var order = new List<int>(spN.Keys);
             order.Sort((x, y) => spN[y].CompareTo(spN[x]));
             int shownSp = 0;
@@ -1686,7 +1686,7 @@ namespace SimLab
                     if (an == null || an.eaten || an.definition == null || an.age < an.matureAtAge) continue;
                     if (an.definition.sexes == null || an.definition.sexes.Length == 0) continue;
                     int sp = tl.populationBasedAnimalClassifier.LookUp(an.definition.definitionIndex);
-                    if (sp < 0) continue;
+                    if (sp < 0) sp = an.definition.definitionIndex; // seeded species: shared defIndex
                     if (an.definition.currentSex > 0)
                     {
                         if (!males.TryGetValue(sp, out List<AnimalDefinition> list)) males[sp] = list = new List<AnimalDefinition>();
@@ -1698,7 +1698,8 @@ namespace SimLab
             foreach (LivingAnimal f in females)
             {
                 int sp = tl.populationBasedAnimalClassifier.LookUp(f.definition.definitionIndex);
-                if (sp < 0 || !males.TryGetValue(sp, out List<AnimalDefinition> list) || list.Count == 0) continue;
+                if (sp < 0) sp = f.definition.definitionIndex;
+                if (!males.TryGetValue(sp, out List<AnimalDefinition> list) || list.Count == 0) continue;
                 f.fertilized = true;
                 f.fertilizedByAnimal = list[n % list.Count];
                 f.hasSharedGenes = true;
