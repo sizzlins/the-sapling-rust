@@ -364,7 +364,8 @@ namespace SimLab
             int nf = 0, nready = 0, kf = 0, km = 0; double fE = 0, fT = 0;
             int nCarn = 0, nHerb = 0, nOmni = 0, nMeatOnly = 0;
             int nRealPred = 0, nRealHerb = 0, nRealOmni = 0, nMouthMeat = 0, nFungOnly = 0;
-            int ocN = 0, ocF = 0, ocFert = 0, ocPreg = 0;
+            int ocN = 0, ocF = 0, ocFert = 0, ocPreg = 0, ocPoisoned = 0, ocParasites = 0;
+            double ocPoison = 0;
             for (int ai = 0; ai < tl.today.areas.Length; ai++)
             {
                 WorldArea a = tl.today.areas[ai];
@@ -408,7 +409,7 @@ namespace SimLab
                     else nRealHerb++;
                     if (an.eatsMeat && !realPred) nMouthMeat++;
                     if (fungE > 0f && plantE <= 0f && meatE <= 0f) nFungOnly++;
-                    if (IsObligateCarnivoreDef(an.definition)) { ocN++; if (an.definition.currentSex == 0) ocF++; if (an.fertilized) ocFert++; if (an.pregnant) ocPreg++; }
+                    if (IsObligateCarnivoreDef(an.definition)) { ocN++; if (an.definition.currentSex == 0) ocF++; if (an.fertilized) ocFert++; if (an.pregnant) ocPreg++; ocPoison += an.dailyPoisonDamage; if (an.dailyPoisonDamage > 0f) ocPoisoned++; if (an.parasiteDamage > 0f) ocParasites++; }
                     int spx = tl.populationBasedAnimalClassifier.LookUp(an.definition.definitionIndex);
                     if (spx >= 0)
                     {
@@ -436,7 +437,7 @@ namespace SimLab
             foreach (var kv in sexesLens) log($"  [SEXDIAG] {kv.Key} n={kv.Value}");
             log($"  [DIET] mouth-can-eat: herbivores={nHerb} carnivores={nCarn} omnivores={nOmni} meatOnly={nMeatOnly}");
             log($"  [DIET2] actual-energy: predators={nRealPred} herbivores={nRealHerb} omnivores={nRealOmni} mouthMeatNoMeatEnergy={nMouthMeat} fungusOnly={nFungOnly}");
-            log($"  [PRED] obligate-carnivores={ocN} females={ocF} males={ocN - ocF} fertilized={ocFert} pregnant={ocPreg}");
+            log($"  [PRED] obligate-carnivores={ocN} females={ocF} males={ocN - ocF} fertilized={ocFert} pregnant={ocPreg} poisoned={ocPoisoned} avgPoisonDmg={(ocN > 0 ? ocPoison / ocN : 0):F2} parasites={ocParasites}");
             var order = new List<int>(spN.Keys);
             order.Sort((x, y) => spN[y].CompareTo(spN[x]));
             int shownSp = 0;
