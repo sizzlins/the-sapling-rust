@@ -113,6 +113,8 @@ namespace SimLab
         private static int _birthsM = 0;
         private static int _totalMutations = 0;
         private static Dictionary<DeathCause, int> _allDeaths = new Dictionary<DeathCause, int>();
+        private static Dictionary<DeathCause, int> _carnDeaths = new Dictionary<DeathCause, int>();
+        private static int _carnSpeciesMin = int.MaxValue;
 
         // Deep-time guardrails: keep taxonomy/definition maps bounded for multi-hundred-
         // thousand-day runs. Trait mutations still happen; new species stop at the cap.
@@ -344,11 +346,16 @@ namespace SimLab
             }
         }
 
-        private static void TrackDeath_Postfix(DeathCause cause)
+        private static void TrackDeath_Postfix(int speciesId, DeathCause cause)
         {
             int cur;
             _allDeaths.TryGetValue(cause, out cur);
             _allDeaths[cause] = cur + 1;
+            if (speciesId >= _carnSpeciesMin)
+            {
+                _carnDeaths.TryGetValue(cause, out cur);
+                _carnDeaths[cause] = cur + 1;
+            }
         }
 
         // Applies only the verified distance-band native fast path (byte-identical).
@@ -1809,7 +1816,7 @@ namespace SimLab
         {
             string outDir = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "sim-results");
             Directory.CreateDirectory(outDir);
-            string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + seed;
             string logPath = Path.Combine(outDir, "save-sim-" + stamp + ".log");
             File.WriteAllText(Path.Combine(outDir, "latest-log.txt"),
                 logPath + Environment.NewLine + "days=" + days + " reportEvery=" + reportEvery + " seed=" + seed + " patches=" + patchMode + Environment.NewLine);
@@ -1854,6 +1861,76 @@ namespace SimLab
             Log($"Loaded in {loadSw.Elapsed.TotalSeconds:F1}s: dayIndex={gs.dayIndex}, worldStates={gs.worldStates.Count}, species={gs.allSpecies.Count}, areas={gs.areas.Length}, size={gs.areas[0].size.x}x{gs.areas[0].size.y}");
 
             TimeLine tl = WireTimeline(gs, importer, importer2);
+
+            if (Environment.GetEnvironmentVariable("SIM_FIX_MOUTHS") == "1")
+            {
+                int fixedDefs = FixBackwardsMouths(tl, gs);
+                Log($"[COEVO] Fixed backwards torso[0] Front->Back mouths on {fixedDefs} animal definitions.");
+            }
+            if (Environment.GetEnvironmentVariable("SIM_LOCK_SEXUAL") == "1" || Environment.GetEnvironmentVariable("SIM_LOCK_CARNIVORE") == "1")
+            {
+                ApplyCoEvoPatches(
+                    Environment.GetEnvironmentVariable("SIM_LOCK_SEXUAL") == "1",
+                    Environment.GetEnvironmentVariable("SIM_LOCK_CARNIVORE") == "1");
+                Log($"[COEVO] Mutation locks active: sexual={Environment.GetEnvironmentVariable("SIM_LOCK_SEXUAL") == "1"}, carnivore={Environment.GetEnvironmentVariable("SIM_LOCK_CARNIVORE") == "1"}");
+            }
+            string solaraSizeEnv = Environment.GetEnvironmentVariable("SIM_SOLARA_SIZE");
+            if (!string.IsNullOrEmpty(solaraSizeEnv) && int.TryParse(solaraSizeEnv, out int solSize) && solSize > 0)
+            {
+                int resized = ResizeLivingAnimals(tl, gs, solSize);
+                Log($"[COEVO] Resized {resized} existing herbivore definitions to bodySize={solSize}.");
+            }
+            string seedArch = Environment.GetEnvironmentVariable("SIM_SEED_ARCHIVED");
+            if (!string.IsNullOrEmpty(seedArch) && File.Exists(seedArch))
+            {
+                bool coevoPair = Environment.GetEnvironmentVariable("SIM_COEVO_PAIR") == "1";
+                int cCount = int.TryParse(Environment.GetEnvironmentVariable("SIM_CARNIVORE_COUNT"), out int cc) && cc > 0 ? cc : 80;
+                int hCount = int.TryParse(Environment.GetEnvironmentVariable("SIM_HERBIVORE_COUNT"), out int hc) && hc > 0 ? hc : 400;
+                int cSize = int.TryParse(Environment.GetEnvironmentVariable("SIM_CARNIVORE_SIZE"), out int cs) ? cs : 10;
+                int hSize = int.TryParse(Environment.GetEnvironmentVariable("SIM_HERBIVORE_SIZE"), out int hs) ? hs : 9;
+                int cMouth = int.TryParse(Environment.GetEnvironmentVariable("SIM_CARNIVORE_MOUTH"), out int cm) ? cm : -1;
+                int hMouth = int.TryParse(Environment.GetEnvironmentVariable("SIM_HERBIVORE_MOUTH"), out int hm) ? hm : -1;
+                if (coevoPair)
+                {
+                    ClearAllLivingAnimals(tl);
+                    Log("[COEVO] Cleared existing animals; seeding sexual Lentocirus-bodyplan Herbivore ('Solara') + Obligate Carnivore ('Lentocirus') pair.");
+                    SeedFromArchivedBodyplan(tl, importer, importer2, seedArch, "Solara", false, hCount, hSize, hMouth, Log);
+                    int headStart = int.TryParse(Environment.GetEnvironmentVariable("SIM_PREY_HEADSTART"), out int hs2) ? hs2 : 0;
+                    if (headStart > 0)
+                    {
+                        Log($"[COEVO] Running {headStart}-day herbivore establishment phase before introducing obligate carnivore...");
+                        for (int hd = 1; hd <= headStart; hd++)
+                        {
+                            tl.LiveADay();
+                            if (hd % 50 == 0)
+                            {
+                                int cnt = 0, fert = 0, preg = 0, rdy = 0, kids = 0, bNest = 0, bEgg = 0, bSpc = 0; double sumE = 0, sumThr = 0;
+                                foreach (AnimalPosition pos in tl.today.areas[0].animalPositionTracker.animalPositions)
+                                {
+                                    var la = tl.today.areas[0].GetAnimalInCell(pos.cellIndex, pos.locationType);
+                                    if (la == null || la.eaten) continue;
+                                    cnt++; sumE += la.energy; sumThr += la.CalculateReproductionThreshold();
+                                    if (la.fertilized) fert++; if (la.pregnant) preg++; if (la.isChild) kids++;
+                                    if (la.readyToGiveBirth)
+                                    {
+                                        rdy++;
+                                        WorldCell wc = tl.today.areas[0].cells[pos.cellIndex];
+                                        if (!tl.CellContainsCorrectNestForAnimal(wc, la)) bNest++;
+                                        if (!tl.EggCanSurviveInCell(wc, la)) bEgg++;
+                                        if (!tl.EnoughSpaceForReproduction(la, tl.today.areas[0], 0, pos.cellIndex, pos.locationType))
+                                            bSpc++;
+                                    }
+                                }
+                                int hp, hf, han, hpl, hma, hgr, hds, heg;
+                                CountWorld(tl, out hp, out hf, out han, out hpl, out hma, out hgr, out hds, out heg);
+                                Log($"  [HS +{hd}] A={cnt} (fert={fert}, preg={preg}, rdy={rdy}[badNest={bNest},badEgg={bEgg},badSpc={bSpc}], kids={kids}, avgE={(cnt>0?sumE/cnt:0):F1}/{(cnt>0?sumThr/cnt:0):F1}, eggs={heg}, births={_totalBirths}, mat={_totalMatings})");
+                            }
+                        }
+                        LogAnimalGuildBreakdown(tl, Log);
+                    }
+                }
+                SeedFromArchivedBodyplan(tl, importer, importer2, seedArch, null, true, cCount, cSize, cMouth, Log);
+            }
 
             if (Environment.GetEnvironmentVariable("SIM_NO_ANIMAL_MUT") == "1")
             {
@@ -1983,6 +2060,26 @@ namespace SimLab
             {
                 tl.LiveADay();
                 done++;
+                if (done <= 1000 && done % 50 == 0 && Environment.GetEnvironmentVariable("SIM_COEVO_VERBOSE") == "1")
+                {
+                    int cCnt = 0, cF = 0, cM = 0, cFert = 0, cKids = 0, cEggs = 0, cCapped = 0; double cSumE = 0;
+                    int hCnt = 0;
+                    foreach (AnimalPosition pos in tl.today.areas[0].animalPositionTracker.animalPositions)
+                    {
+                        var la = tl.today.areas[0].GetAnimalInCell(pos.cellIndex, pos.locationType);
+                        if (la == null || la.eaten) continue;
+                        if (!IsObligateCarnivoreDef(la.definition)) { hCnt++; continue; }
+                        cCnt++; if (la.definition.currentSex == 0) cF++; else cM++;
+                        cSumE += la.energy;
+                        if (la.nrOfChildren >= la.maximumNrOfChildren) cCapped++;
+                        if (la.fertilized) cFert++; if (la.isChild) cKids++;
+                    }
+                    foreach (WorldCell wc in tl.today.areas[0].cells)
+                        if (wc != null && wc.eggs != null)
+                            foreach (var eg2 in wc.eggs)
+                                if (eg2 != null && IsObligateCarnivoreDef(eg2.definition)) cEggs++;
+                    Log($"  [COEVO +{done}] H={hCnt} | C={cCnt} (F={cF}/M={cM}, fert={cFert}, kids={cKids}, eggs={cEggs}, capped={cCapped}, avgE={(cCnt>0?cSumE/cCnt:0):F1}) mat={_totalMatings} births={_totalBirths}");
+                }
                 if (done % 100 == 0 && (System.Threading.Volatile.Read(ref stopFlag) != 0 || File.Exists(stopPath)))
                 {
                     System.Threading.Interlocked.Exchange(ref stopFlag, 1);
@@ -2039,6 +2136,8 @@ namespace SimLab
                         }
                         catch { }
                     }
+                    if (Environment.GetEnvironmentVariable("SIM_COEVO_PAIR") == "1")
+                        LogAnimalGuildBreakdown(tl, Log);
                     csv.WriteLine($"{tl.dayIndex},{p},{f},{an},{pl},{ma},{gr},{ds},{eg},{ps},{fs},{ans},{als},{tl.allSpecies.Count},{_totalMatings},{_totalBirths},{_totalMutations},{dps:F1},{mem}");
                     csv.Flush();
                     if (last || done % (reportEvery * 20) == 0)
@@ -2088,8 +2187,849 @@ namespace SimLab
             if (File.Exists(stopPath)) try { File.Delete(stopPath); } catch { }
             Log($"CSV: {csvPath}");
             Log($"Species census: {speciesPath}");
+            LogAnimalGuildBreakdown(tl, Log);
             liveLog.Close();
             return 0;
+        }
+
+        private static bool _lockSexual;
+        private static bool _lockCarnivore;
+
+        private static void ApplyCoEvoPatches(bool lockSexual, bool lockCarnivore)
+        {
+            _lockSexual = lockSexual;
+            _lockCarnivore = lockCarnivore;
+            var h = new Harmony("com.saplingrust.coevo");
+            if (lockSexual)
+            {
+                var rm = AccessTools.Method(typeof(AnimalMutator), "RemoveSex", new[] { typeof(AnimalDefinition) });
+                if (rm != null) h.Patch(rm, prefix: new HarmonyMethod(typeof(Program), nameof(CoEvo_RemoveSex_Prefix)));
+                var cm = AccessTools.Method(typeof(AnimalMutator), "ChangeMatingTraits", new[] { typeof(AnimalDefinition) });
+                if (cm != null) h.Patch(cm,
+                    prefix: new HarmonyMethod(typeof(Program), nameof(CoEvo_ChangeMatingTraits_Prefix)),
+                    postfix: new HarmonyMethod(typeof(Program), nameof(CoEvo_ChangeMatingTraits_Postfix)));
+                var esr = AccessTools.Method(typeof(TimeLine), "EnoughSpaceForReproduction",
+                    new[] { typeof(LivingAnimal), typeof(WorldArea), typeof(int), typeof(int), typeof(CellLocationType) });
+                if (esr != null) h.Patch(esr, postfix: new HarmonyMethod(typeof(Program), nameof(CoEvo_EnoughSpace_Postfix)));
+                var us = AccessTools.Method(typeof(LivingAnimal), "UpdateStats",
+                    new[] { typeof(OrganismObjectFileImporter), typeof(float) });
+                if (us != null) h.Patch(us, postfix: new HarmonyMethod(typeof(Program), nameof(CoEvo_SexualCarnivoreCap_Postfix)));
+                var bgb = AccessTools.Method(typeof(TimeLine), "BabyGetsBorn",
+                    new[] { typeof(LivingAnimal), typeof(WorldArea), typeof(int) });
+                if (bgb != null) h.Patch(bgb, prefix: new HarmonyMethod(typeof(Program), nameof(CoEvo_SexualCarnivoreBaby_Prefix)));
+                var le = AccessTools.Method(typeof(TimeLine), "LayEggInCell",
+                    new[] { typeof(LivingAnimal), typeof(int), typeof(int), typeof(bool) });
+                if (le != null) h.Patch(le, prefix: new HarmonyMethod(typeof(Program), nameof(CoEvo_SexualCarnivoreBaby_Prefix)));
+            }
+            if (lockCarnivore)
+            {
+                var cd = AccessTools.Method(typeof(AnimalMutator), "ChangeDiet", new[] { typeof(AnimalDefinition) });
+                if (cd != null) h.Patch(cd,
+                    prefix: new HarmonyMethod(typeof(Program), nameof(CoEvo_Carnivore_Prefix)),
+                    postfix: new HarmonyMethod(typeof(Program), nameof(CoEvo_Carnivore_Postfix)));
+                var rbp = AccessTools.Method(typeof(AnimalMutator), "ReplaceBodyPart", new[] { typeof(AnimalDefinition) });
+                if (rbp != null) h.Patch(rbp,
+                    prefix: new HarmonyMethod(typeof(Program), nameof(CoEvo_Carnivore_Prefix)),
+                    postfix: new HarmonyMethod(typeof(Program), nameof(CoEvo_Carnivore_Postfix)));
+            }
+        }
+
+        private static bool CoEvo_RemoveSex_Prefix(AnimalDefinition animal)
+        {
+            // Keep at least 2 sexes (base + sexes[0]) on strictly sexual species.
+            return !(animal != null && animal.sexes != null && animal.sexes.Length <= 1);
+        }
+
+        private static void CoEvo_ChangeMatingTraits_Prefix(AnimalDefinition animal, out bool __state)
+        {
+            __state = animal != null && animal.sexes != null && animal.sexes.Length >= 1 && !animal._canGiveBirthAsexually;
+        }
+
+        private static void CoEvo_ChangeMatingTraits_Postfix(AnimalDefinition animal, bool __state)
+        {
+            if (!__state || animal == null) return;
+            animal._canGiveBirthAsexually = false;
+            animal._canGiveBirthSexually = true;
+            animal._canFertilizeInternally = false;
+            var y = animal.young;
+            y.canGiveBirthAsexually = false;
+            animal.young = y;
+            if (animal.sexes != null)
+            {
+                for (int i = 0; i < animal.sexes.Length; i++)
+                {
+                    var m = animal.sexes[i];
+                    m.canGiveBirthAsexually = false;
+                    m.canGiveBirthSexually = false;
+                    m.canFertilizeInternally = true;
+                    animal.sexes[i] = m;
+                }
+            }
+            if (animal.youngSexes != null)
+            {
+                for (int i = 0; i < animal.youngSexes.Length; i++)
+                {
+                    var m = animal.youngSexes[i];
+                    m.canGiveBirthAsexually = false;
+                    m.canGiveBirthSexually = false;
+                    m.canFertilizeInternally = true;
+                    animal.youngSexes[i] = m;
+                }
+            }
+        }
+
+        private static void CoEvo_EnoughSpace_Postfix(
+            TimeLine __instance, LivingAnimal lifeForm, WorldArea area, int areaIndex,
+            int indexOfLifeFormCell, CellLocationType locationTypeOfLifeFormCell, ref bool __result)
+        {
+            // Sexual animals require an adjacent mate (near >= 1), so vanilla's `near > 1` deadlocks
+            // slow protolobe walkers the instant 1 egg or 2nd mate is nearby. Allow +1 neighbor slot for sexual mates.
+            if (__result || lifeForm == null || lifeForm.definition == null) return;
+            if (lifeForm.definition._canGiveBirthAsexually || !lifeForm.definition._canGiveBirthSexually) return;
+            if (lifeForm.definition.nestType != NestType.None && __instance.nestBuilding && lifeForm.ableToBuildNest) return;
+            int maxNear = lifeForm.eatsMeatOnly ? 5 : 3;
+            int cell = indexOfLifeFormCell;
+            if (lifeForm.timeInEgg < 5f)
+            {
+                // Pick any valid adjacent empty cell within maxSteepness
+                int[] around = area.GetAllCellsDirectlyAround(indexOfLifeFormCell);
+                cell = -1;
+                for (int i = 0; i < around.Length; i++)
+                {
+                    int c = around[i];
+                    if (c < 0 || c >= area.cells.Length) continue;
+                    if (area.cells[c].CalculateNormalizedSteepness() > lifeForm.maximumSteepness) continue;
+                    bool free = lifeForm.timeInEgg == 0f ? area.cells[c].animal == null : !area.cells[c].ContainsEggs();
+                    if (free && __instance.FindNumberOfAnimalsAroundCell(area, c, locationTypeOfLifeFormCell) <= maxNear)
+                    {
+                        cell = c;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                if (area.cells[cell].ContainsEggs() || __instance.FindNumberOfAnimalsAroundCell(area, cell, locationTypeOfLifeFormCell) > maxNear)
+                    cell = -1;
+            }
+            if (cell != -1)
+            {
+                __instance.latestCellToReproduceIn = cell;
+                __result = true;
+            }
+        }
+
+        private static void CoEvo_SexualCarnivoreCap_Postfix(LivingAnimal __instance)
+        {
+            int cap = int.TryParse(Environment.GetEnvironmentVariable("SIM_CARN_MAX_KIDS"), out int c) ? c : 3;
+            if (cap > 3 && __instance != null && __instance.eatsMeat && __instance.definition != null
+                && !__instance.definition._canGiveBirthAsexually && __instance.definition._canGiveBirthSexually)
+            {
+                __instance.maximumNrOfChildren = cap;
+            }
+        }
+
+        private static void CoEvo_SexualCarnivoreBaby_Prefix(LivingAnimal baby)
+        {
+            CoEvo_SexualCarnivoreCap_Postfix(baby);
+        }
+
+        private static readonly DetailedFoodType[] NonCarnivoreFoods = new[]
+        {
+            DetailedFoodType.Plankton, DetailedFoodType.SoftPlantTissue, DetailedFoodType.Grass,
+            DetailedFoodType.Fruit, DetailedFoodType.Seed, DetailedFoodType.Nut, DetailedFoodType.Fungus,
+            DetailedFoodType.Bark, DetailedFoodType.Nectar, DetailedFoodType.Sap, DetailedFoodType.MarineSnow
+        };
+
+        private static float MouthFoodEnergy(MouthDefinition md, DetailedFoodType f)
+        {
+            return (md != null && md.energyPerFoodType != null && md.energyPerFoodType.TryGetValue(f, out float v)) ? v : 0f;
+        }
+
+        private static bool IsObligateCarnivoreDef(AnimalDefinition def)
+        {
+            if (def == null || def.torso == null) return false;
+            bool hasMeatMouth = false;
+            bool eatsNonMeat = false;
+            for (int t = 0; t < def.torso.Length; t++)
+            {
+                if (def.torso[t] == null || def.torso[t].children == null) continue;
+                foreach (var kv in def.torso[t].children)
+                {
+                    if (kv.Value is MouthDefinition md)
+                    {
+                        if (MouthFoodEnergy(md, DetailedFoodType.WholeAnimal) > 0f
+                            || MouthFoodEnergy(md, DetailedFoodType.FreshMeat) > 0f
+                            || MouthFoodEnergy(md, DetailedFoodType.OldMeat) > 0f)
+                            hasMeatMouth = true;
+                        foreach (var nf in NonCarnivoreFoods)
+                        {
+                            if (MouthFoodEnergy(md, nf) > 0f && (def._excludeFromDiet == null || !def._excludeFromDiet.Contains(nf)))
+                                eatsNonMeat = true;
+                        }
+                    }
+                }
+            }
+            return hasMeatMouth && !eatsNonMeat;
+        }
+
+        private static void EnforceObligateCarnivoreDiet(AnimalDefinition def)
+        {
+            if (def._excludeFromDiet == null) def._excludeFromDiet = new HashSet<DetailedFoodType>();
+            foreach (var f in NonCarnivoreFoods) def._excludeFromDiet.Add(f);
+            var y = def.young;
+            if (y.excludeFromDiet == null) y.excludeFromDiet = new HashSet<DetailedFoodType>();
+            foreach (var f in NonCarnivoreFoods) y.excludeFromDiet.Add(f);
+            def.young = y;
+            if (def.sexes != null)
+            {
+                for (int i = 0; i < def.sexes.Length; i++)
+                {
+                    var m = def.sexes[i];
+                    if (m.excludeFromDiet == null) m.excludeFromDiet = new HashSet<DetailedFoodType>();
+                    foreach (var f in NonCarnivoreFoods) m.excludeFromDiet.Add(f);
+                    def.sexes[i] = m;
+                }
+            }
+            if (def.youngSexes != null)
+            {
+                for (int i = 0; i < def.youngSexes.Length; i++)
+                {
+                    var m = def.youngSexes[i];
+                    if (m.excludeFromDiet == null) m.excludeFromDiet = new HashSet<DetailedFoodType>();
+                    foreach (var f in NonCarnivoreFoods) m.excludeFromDiet.Add(f);
+                    def.youngSexes[i] = m;
+                }
+            }
+        }
+
+        private static void CoEvo_Carnivore_Prefix(AnimalDefinition animal, out MouthDefinition __state)
+        {
+            __state = null;
+            if (animal == null || !IsObligateCarnivoreDef(animal)) return;
+            if (animal.torso != null && animal.torso.Length > 0 && animal.torso[0] != null)
+            {
+                foreach (var kv in animal.torso[0].children)
+                    if (kv.Value is MouthDefinition md) { __state = (MouthDefinition)md.Clone(); break; }
+            }
+        }
+
+        private static void CoEvo_Carnivore_Postfix(AnimalDefinition animal, MouthDefinition __state)
+        {
+            if (__state == null || animal == null) return;
+            EnforceObligateCarnivoreDiet(animal);
+            if (!IsObligateCarnivoreDef(animal) && animal.torso != null && animal.torso.Length > 0 && animal.torso[0] != null)
+            {
+                animal.torso[0].SetChild((MouthDefinition)__state.Clone(), TorsoPartSide.Back);
+            }
+        }
+
+        private static bool FixAnimalMouthOrientation(AnimalDefinition def)
+        {
+            if (def == null || def.upright || def.torso == null || def.torso.Length < 2 || def.torso[0] == null || def.torso[0].children == null)
+                return false;
+            var toMove = new List<KeyValuePair<TorsoPartDetailedLocation, BodyPartDefinition>>();
+            foreach (var kv in def.torso[0].children)
+            {
+                if (kv.Key.side == TorsoPartSide.Front && kv.Value is MouthDefinition)
+                    toMove.Add(kv);
+            }
+            if (toMove.Count == 0) return false;
+            foreach (var kv in toMove)
+            {
+                def.torso[0].children.Remove(kv.Key);
+                def.torso[0].children[new TorsoPartDetailedLocation(TorsoPartSide.Back, kv.Key.locationOffset)] = kv.Value;
+            }
+            def.torso[0].childrenSummary.Clear();
+            return true;
+        }
+
+        private static int FixBackwardsMouths(TimeLine tl, GameSaver gs)
+        {
+            int count = 0;
+            var seen = new HashSet<AnimalDefinition>();
+            if (gs.allSpecies != null)
+                foreach (var sp in gs.allSpecies)
+                    if (sp != null && sp.speciesType == OrganismType.Animal && sp.exampleOrganism is AnimalDefinition ad && seen.Add(ad))
+                        if (FixAnimalMouthOrientation(ad)) count++;
+            if (tl.today != null && tl.today.areas != null)
+                foreach (var area in tl.today.areas)
+                    foreach (AnimalPosition pos in area.animalPositionTracker.animalPositions)
+                    {
+                        LivingAnimal la = area.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                        if (la != null && la.definition != null && seen.Add(la.definition))
+                            if (FixAnimalMouthOrientation(la.definition)) count++;
+                    }
+            return count;
+        }
+
+        private static int ResizeLivingAnimals(TimeLine tl, GameSaver gs, int targetSize)
+        {
+            int count = 0;
+            var seen = new HashSet<AnimalDefinition>();
+            Action<AnimalDefinition> apply = (ad) =>
+            {
+                if (ad == null || !seen.Add(ad)) return;
+                ad._bodySize = targetSize;
+                var y = ad.young; y.bodySize = targetSize; ad.young = y;
+                if (ad.sexes != null) for (int i = 0; i < ad.sexes.Length; i++) { var m = ad.sexes[i]; m.bodySize = targetSize; ad.sexes[i] = m; }
+                if (ad.youngSexes != null) for (int i = 0; i < ad.youngSexes.Length; i++) { var m = ad.youngSexes[i]; m.bodySize = targetSize; ad.youngSexes[i] = m; }
+                count++;
+            };
+            if (gs.allSpecies != null)
+                foreach (var sp in gs.allSpecies)
+                    if (sp != null && sp.speciesType == OrganismType.Animal && sp.exampleOrganism is AnimalDefinition ad) apply(ad);
+            if (tl.today != null && tl.today.areas != null)
+                foreach (var area in tl.today.areas)
+                    foreach (AnimalPosition pos in area.animalPositionTracker.animalPositions)
+                    {
+                        LivingAnimal la = area.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                        if (la != null && la.definition != null) apply(la.definition);
+                    }
+            return count;
+        }
+
+        private static readonly DetailedFoodType[] CarnivoreOnlyFoods = new[]
+        {
+            DetailedFoodType.WholeAnimal, DetailedFoodType.FreshMeat, DetailedFoodType.OldMeat,
+            DetailedFoodType.Egg, DetailedFoodType.Blood
+        };
+
+        private static void ClearAllLivingAnimals(TimeLine tl)
+        {
+            foreach (WorldArea area in tl.today.areas)
+            {
+                var positions = new List<AnimalPosition>(area.animalPositionTracker.animalPositions);
+                foreach (var pos in positions)
+                {
+                    area.RemoveAnimalFromCell(pos.cellIndex, pos.locationType);
+                }
+                for (int i = 0; i < area.cells.Length; i++)
+                {
+                    if (area.cells[i] != null && area.cells[i].eggs != null)
+                        Array.Clear(area.cells[i].eggs, 0, area.cells[i].eggs.Length);
+                }
+            }
+            for (int i = 0; i < tl.today.numberOfLivingOrganismsPerSpecies.Count && i < tl.allSpecies.Count; i++)
+            {
+                if (tl.allSpecies[i].speciesType == OrganismType.Animal)
+                    tl.today.numberOfLivingOrganismsPerSpecies[i] = 0;
+            }
+        }
+
+        private static void EnforcePureHerbivoreDiet(AnimalDefinition def)
+        {
+            if (def._excludeFromDiet == null) def._excludeFromDiet = new HashSet<DetailedFoodType>();
+            foreach (var f in CarnivoreOnlyFoods) def._excludeFromDiet.Add(f);
+            var y = def.young;
+            if (y.excludeFromDiet == null) y.excludeFromDiet = new HashSet<DetailedFoodType>();
+            foreach (var f in CarnivoreOnlyFoods) y.excludeFromDiet.Add(f);
+            def.young = y;
+            if (def.sexes != null)
+                for (int i = 0; i < def.sexes.Length; i++)
+                {
+                    var m = def.sexes[i];
+                    if (m.excludeFromDiet == null) m.excludeFromDiet = new HashSet<DetailedFoodType>();
+                    foreach (var f in CarnivoreOnlyFoods) m.excludeFromDiet.Add(f);
+                    def.sexes[i] = m;
+                }
+            if (def.youngSexes != null)
+                for (int i = 0; i < def.youngSexes.Length; i++)
+                {
+                    var m = def.youngSexes[i];
+                    if (m.excludeFromDiet == null) m.excludeFromDiet = new HashSet<DetailedFoodType>();
+                    foreach (var f in CarnivoreOnlyFoods) m.excludeFromDiet.Add(f);
+                    def.youngSexes[i] = m;
+                }
+        }
+
+        private static void SeedFromArchivedBodyplan(
+            TimeLine tl, OrganismObjectFileImporter importer, OrganismObjectFileImporter2 importer2,
+            string species16Path, string overrideName, bool obligateCarnivore, int count, int targetSize, int overrideMouthId, Action<string> log)
+        {
+            var sgs = new GameSaver();
+            sgs.importer = importer;
+            sgs.importer2 = importer2;
+            sgs.currentSaveFileFormatVersion = 16;
+            sgs.loadingStream = new FileStream(species16Path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            sgs.loadUsesStream = true;
+            sgs.pointer = 0;
+            SpeciesDefinition sp = sgs.GetSpecies();
+            sgs.loadingStream.Close();
+
+            string speciesName = string.IsNullOrEmpty(overrideName) ? sp.name : overrideName;
+            AnimalDefinition def = (AnimalDefinition)sp.exampleOrganism;
+            FixAnimalMouthOrientation(def);
+            if (overrideMouthId >= 0 && def.torso != null && def.torso.Length > 0)
+            {
+                MouthDefinition nm = importer.CreateMouthWithShapeIndex(overrideMouthId);
+                nm.scale = 1.0f;
+                def.torso[0].SetChild(nm, TorsoPartSide.Back);
+            }
+            string carnLimbEnv = obligateCarnivore ? Environment.GetEnvironmentVariable("SIM_CARNIVORE_LIMB") : Environment.GetEnvironmentVariable("SIM_HERBIVORE_LIMB");
+            if (!string.IsNullOrEmpty(carnLimbEnv) && int.TryParse(carnLimbEnv, out int limbId) && limbId >= 0 && def.torso != null)
+            {
+                for (int t = 0; t < def.torso.Length; t++)
+                {
+                    if (def.torso[t] == null || def.torso[t].children == null) continue;
+                    var keys = new List<TorsoPartDetailedLocation>(def.torso[t].children.Keys);
+                    foreach (var k in keys)
+                    {
+                        if (k.side == TorsoPartSide.Side && def.torso[t].children[k] is LimbDefinition oldLimb)
+                        {
+                            LimbDefinition nl = importer.CreateLimbWithShapeIndex(limbId);
+                            nl.scale = oldLimb.scale;
+                            def.torso[t].children[k] = nl;
+                        }
+                    }
+                    def.torso[t].childrenSummary.Clear();
+                }
+            }
+            if (obligateCarnivore && Environment.GetEnvironmentVariable("SIM_CARN_NO_FIN") == "1" && def.torso != null)
+            {
+                for (int t = 0; t < def.torso.Length; t++)
+                {
+                    if (def.torso[t] == null || def.torso[t].children == null) continue;
+                    var keys = new List<TorsoPartDetailedLocation>(def.torso[t].children.Keys);
+                    foreach (var k in keys)
+                        if (k.side != TorsoPartSide.Side && def.torso[t].children[k] is LimbDefinition)
+                            def.torso[t].children.Remove(k);
+                    def.torso[t].childrenSummary.Clear();
+                }
+            }
+            string eyeEnv = obligateCarnivore ? Environment.GetEnvironmentVariable("SIM_CARNIVORE_EYE") : Environment.GetEnvironmentVariable("SIM_HERBIVORE_EYE");
+            if (!string.IsNullOrEmpty(eyeEnv) && int.TryParse(eyeEnv, out int eyeId) && eyeId >= 0 && def.torso != null)
+            {
+                for (int t = 0; t < def.torso.Length; t++)
+                {
+                    if (def.torso[t] == null || def.torso[t].children == null) continue;
+                    var keys = new List<TorsoPartDetailedLocation>(def.torso[t].children.Keys);
+                    foreach (var k in keys)
+                        if (def.torso[t].children[k] is EyeDefinition oldEye)
+                        {
+                            EyeDefinition ne = importer.CreateEyeWithShapeIndex(eyeId);
+                            ne.scale = oldEye.scale;
+                            def.torso[t].children[k] = ne;
+                        }
+                    def.torso[t].childrenSummary.Clear();
+                }
+            }
+            string earEnv = obligateCarnivore ? Environment.GetEnvironmentVariable("SIM_CARNIVORE_EAR") : Environment.GetEnvironmentVariable("SIM_HERBIVORE_EAR");
+            if (!string.IsNullOrEmpty(earEnv) && int.TryParse(earEnv, out int earId) && earId >= 0 && def.torso != null)
+            {
+                for (int t = 0; t < def.torso.Length; t++)
+                {
+                    if (def.torso[t] == null || def.torso[t].children == null) continue;
+                    var keys = new List<TorsoPartDetailedLocation>(def.torso[t].children.Keys);
+                    foreach (var k in keys)
+                        if (def.torso[t].children[k] is EarDefinition oldEar)
+                        {
+                            EarDefinition ne = importer.CreateEarWithShapeIndex(earId);
+                            ne.scale = oldEar.scale;
+                            def.torso[t].children[k] = ne;
+                        }
+                    def.torso[t].childrenSummary.Clear();
+                }
+            }
+            // Clear any saved larval/morph bodyPartDiffs from archived amphibious Lentocirus so juveniles & males
+            // inherit the exact terrestrial legs, eyes, and mouth from def.torso instead of larval/aquatic overrides.
+            if (def.young.bodyPartDiffs != null && def.young.bodyPartDiffs.Count > 0)
+            {
+                log($"[COEVO] Clearing {def.young.bodyPartDiffs.Count} young bodyPartDiffs on '{speciesName}'.");
+                var ycl = def.young; ycl.bodyPartDiffs = new Dictionary<BodyPartDiffLocation, BodyPartDiff>(); def.young = ycl;
+            }
+            if (def.sexes != null)
+                for (int i = 0; i < def.sexes.Length; i++)
+                    if (def.sexes[i].bodyPartDiffs != null && def.sexes[i].bodyPartDiffs.Count > 0)
+                    {
+                        log($"[COEVO] Clearing {def.sexes[i].bodyPartDiffs.Count} sex[{i}] bodyPartDiffs on '{speciesName}'.");
+                        var mcl = def.sexes[i]; mcl.bodyPartDiffs = new Dictionary<BodyPartDiffLocation, BodyPartDiff>(); def.sexes[i] = mcl;
+                    }
+            if (def.youngSexes != null)
+                for (int i = 0; i < def.youngSexes.Length; i++)
+                    if (def.youngSexes[i].bodyPartDiffs != null && def.youngSexes[i].bodyPartDiffs.Count > 0)
+                    {
+                        log($"[COEVO] Clearing {def.youngSexes[i].bodyPartDiffs.Count} youngSex[{i}] bodyPartDiffs on '{speciesName}'.");
+                        var mcl = def.youngSexes[i]; mcl.bodyPartDiffs = new Dictionary<BodyPartDiffLocation, BodyPartDiff>(); def.youngSexes[i] = mcl;
+                    }
+            string skinEnv = Environment.GetEnvironmentVariable("SIM_SKIN");
+            if (!string.IsNullOrEmpty(skinEnv) && Enum.TryParse(skinEnv, true, out SkinType parsedSkin))
+            {
+                def._skinType = parsedSkin;
+                var ysk = def.young; ysk.skinType = parsedSkin; def.young = ysk;
+                if (def.sexes != null) for (int i = 0; i < def.sexes.Length; i++) { var m = def.sexes[i]; m.skinType = parsedSkin; def.sexes[i] = m; }
+                if (def.youngSexes != null) for (int i = 0; i < def.youngSexes.Length; i++) { var m = def.youngSexes[i]; m.skinType = parsedSkin; def.youngSexes[i] = m; }
+            }
+            if (targetSize > 0)
+            {
+                def._bodySize = targetSize;
+                var ysz = def.young; ysz.bodySize = targetSize; def.young = ysz;
+                if (def.sexes != null) for (int i = 0; i < def.sexes.Length; i++) { var m = def.sexes[i]; m.bodySize = targetSize; def.sexes[i] = m; }
+                if (def.youngSexes != null) for (int i = 0; i < def.youngSexes.Length; i++) { var m = def.youngSexes[i]; m.bodySize = targetSize; def.youngSexes[i] = m; }
+            }
+            int embMode = int.TryParse(Environment.GetEnvironmentVariable("SIM_EMBRYO"), out int em) ? em : 0;
+            def._embryoTimeInsideMother = embMode;
+            def._eggType = EggType.Cylinder;
+            def._nestType = NestType.None;
+            def._nestEnclosed = false;
+            // Enforce strictly sexual 50/50 F/M reproduction
+            def.currentSex = 0;
+            def._canGiveBirthAsexually = false;
+            def._canGiveBirthSexually = true;
+            def._canFertilizeInternally = false;
+            def._canFertilizeExternally = false;
+            // Distinct visual palettes for herbivore Solara vs carnivore Lentocirus + dimorphic males
+            if (!obligateCarnivore)
+            {
+                def._colorHue = 0.13f; def._colorBrightness = 0.72f;
+                def._secondaryColorHue = 0.08f; def._secondaryColorBrightness = 0.55f;
+                def._skinPattern = SkinPattern.Plain;
+            }
+            else
+            {
+                def._colorHue = 0.02f; def._colorBrightness = 0.45f;
+                def._secondaryColorHue = 0.08f; def._secondaryColorBrightness = 0.25f;
+                def._skinPattern = SkinPattern.ThinStripes;
+            }
+            var y = def.young;
+            y.embryoTimeInsideMother = embMode;
+            y.eggType = EggType.Cylinder;
+            y.nestType = NestType.None;
+            y.nestEnclosed = false;
+            y.canGiveBirthAsexually = false;
+            y.canGiveBirthSexually = true;
+            y.canFertilizeInternally = false;
+            y.canFertilizeExternally = false;
+            y.colorHue = def._colorHue; y.colorBrightness = def._colorBrightness;
+            y.secondaryColorHue = def._secondaryColorHue; y.secondaryColorBrightness = def._secondaryColorBrightness;
+            y.skinPattern = def._skinPattern;
+            def.young = y;
+            if (def.sexes == null || def.sexes.Length == 0)
+            {
+                AnimalMorph mm = AnimalMorph.CreateMorphBasedOnAnimalDefinition(def);
+                def.sexes = new[] { mm };
+                def.youngSexes = new[] { AnimalMorph.Clone(mm) };
+            }
+            for (int i = 0; i < def.sexes.Length; i++)
+            {
+                var m = def.sexes[i];
+                m.embryoTimeInsideMother = embMode;
+                m.eggType = EggType.Cylinder;
+                m.nestType = NestType.None;
+                m.nestEnclosed = false;
+                m.canGiveBirthAsexually = false;
+                m.canGiveBirthSexually = false;
+                m.canFertilizeInternally = true;
+                m.canFertilizeExternally = false;
+                if (!obligateCarnivore)
+                {
+                    m.colorHue = 0.56f; m.colorBrightness = 0.68f;
+                    m.secondaryColorHue = 0.12f; m.secondaryColorBrightness = 0.85f;
+                    m.skinPattern = SkinPattern.SmallSpots;
+                }
+                else
+                {
+                    m.colorHue = 0.96f; m.colorBrightness = 0.32f;
+                    m.secondaryColorHue = 0.07f; m.secondaryColorBrightness = 0.72f;
+                    m.skinPattern = SkinPattern.ThickStripes;
+                }
+                def.sexes[i] = m;
+            }
+            for (int i = 0; i < def.youngSexes.Length; i++)
+            {
+                var m = def.youngSexes[i];
+                m.embryoTimeInsideMother = embMode;
+                m.eggType = EggType.Cylinder;
+                m.nestType = NestType.None;
+                m.nestEnclosed = false;
+                m.canGiveBirthAsexually = false;
+                m.canGiveBirthSexually = false;
+                m.canFertilizeInternally = true;
+                m.canFertilizeExternally = false;
+                m.colorHue = def.sexes[0].colorHue; m.colorBrightness = def.sexes[0].colorBrightness;
+                m.secondaryColorHue = def.sexes[0].secondaryColorHue; m.secondaryColorBrightness = def.sexes[0].secondaryColorBrightness;
+                m.skinPattern = def.sexes[0].skinPattern;
+                def.youngSexes[i] = m;
+            }
+
+            if (obligateCarnivore)
+            {
+                EnforceObligateCarnivoreDiet(def);
+                def._wholeAnimalDietHueRange = new Vector2(0f, 1f);
+                def._wholeAnimalDietBrightnessRange = new Vector2(0f, 1f);
+                def._wholeAnimalDietSecondaryHueRange = new Vector2(0f, 1f);
+                def._wholeAnimalDietSecondaryBrightnessRange = new Vector2(0f, 1f);
+                def._invertWholeAnimalDietColorRange = false;
+                if (def._wholeAnimalDietExcludeSkinPatterns != null) def._wholeAnimalDietExcludeSkinPatterns.Clear();
+                var yw = def.young;
+                yw.wholeAnimalDietHueRange = new Vector2(0f, 1f);
+                yw.wholeAnimalDietBrightnessRange = new Vector2(0f, 1f);
+                yw.wholeAnimalDietSecondaryHueRange = new Vector2(0f, 1f);
+                yw.wholeAnimalDietSecondaryBrightnessRange = new Vector2(0f, 1f);
+                yw.invertWholeAnimalDietColorRange = false;
+                if (yw.wholeAnimalDietExcludeSkinPatterns != null) yw.wholeAnimalDietExcludeSkinPatterns.Clear();
+                def.young = yw;
+                // Offspring sex ratio (out of 12 brackets; default 6 = 50/50 F/M, or e.g. 8 = 67% F / 33% M for vanilla maxKids=3 viability).
+                int fBr = int.TryParse(Environment.GetEnvironmentVariable("SIM_CARN_FEMALE_BRACKETS"), out int fb) ? Math.Max(1, Math.Min(11, fb)) : 6;
+                def._offspringSexDecisionType = OffspringSexDecisionType.Chance;
+                def._offspringSexChanceBracket0  = 0 < fBr ? 0 : 1; def._offspringSexChanceBracket1  = 1 < fBr ? 0 : 1; def._offspringSexChanceBracket2  = 2 < fBr ? 0 : 1;
+                def._offspringSexChanceBracket3  = 3 < fBr ? 0 : 1; def._offspringSexChanceBracket4  = 4 < fBr ? 0 : 1; def._offspringSexChanceBracket5  = 5 < fBr ? 0 : 1;
+                def._offspringSexChanceBracket6  = 6 < fBr ? 0 : 1; def._offspringSexChanceBracket7  = 7 < fBr ? 0 : 1; def._offspringSexChanceBracket8  = 8 < fBr ? 0 : 1;
+                def._offspringSexChanceBracket9  = 9 < fBr ? 0 : 1; def._offspringSexChanceBracket10 = 10 < fBr ? 0 : 1; def._offspringSexChanceBracket11 = 11 < fBr ? 0 : 1;
+                for (int i = 0; i < def.sexes.Length; i++)
+                {
+                    var m = def.sexes[i];
+                    m.wholeAnimalDietHueRange = new Vector2(0f, 1f);
+                    m.wholeAnimalDietBrightnessRange = new Vector2(0f, 1f);
+                    m.wholeAnimalDietSecondaryHueRange = new Vector2(0f, 1f);
+                    m.wholeAnimalDietSecondaryBrightnessRange = new Vector2(0f, 1f);
+                    m.invertWholeAnimalDietColorRange = false;
+                    if (m.wholeAnimalDietExcludeSkinPatterns != null) m.wholeAnimalDietExcludeSkinPatterns.Clear();
+                    m.offspringSexDecisionType = OffspringSexDecisionType.Chance;
+                    m.offspringSexChanceBracket0  = 0 < fBr ? 0 : 1; m.offspringSexChanceBracket1  = 1 < fBr ? 0 : 1; m.offspringSexChanceBracket2  = 2 < fBr ? 0 : 1;
+                    m.offspringSexChanceBracket3  = 3 < fBr ? 0 : 1; m.offspringSexChanceBracket4  = 4 < fBr ? 0 : 1; m.offspringSexChanceBracket5  = 5 < fBr ? 0 : 1;
+                    m.offspringSexChanceBracket6  = 6 < fBr ? 0 : 1; m.offspringSexChanceBracket7  = 7 < fBr ? 0 : 1; m.offspringSexChanceBracket8  = 8 < fBr ? 0 : 1;
+                    m.offspringSexChanceBracket9  = 9 < fBr ? 0 : 1; m.offspringSexChanceBracket10 = 10 < fBr ? 0 : 1; m.offspringSexChanceBracket11 = 11 < fBr ? 0 : 1;
+                    def.sexes[i] = m;
+                }
+                for (int i = 0; i < def.youngSexes.Length; i++)
+                {
+                    var m = def.youngSexes[i];
+                    m.wholeAnimalDietHueRange = new Vector2(0f, 1f);
+                    m.wholeAnimalDietBrightnessRange = new Vector2(0f, 1f);
+                    m.wholeAnimalDietSecondaryHueRange = new Vector2(0f, 1f);
+                    m.wholeAnimalDietSecondaryBrightnessRange = new Vector2(0f, 1f);
+                    m.invertWholeAnimalDietColorRange = false;
+                    if (m.wholeAnimalDietExcludeSkinPatterns != null) m.wholeAnimalDietExcludeSkinPatterns.Clear();
+                    def.youngSexes[i] = m;
+                }
+            }
+            else EnforcePureHerbivoreDiet(def);
+
+            // Instincts (NO GoAwayFrom on TooWarm/TooCold: GoAwayFrom sets actionIsInstinctivelyPrioritized=true,
+            // which skips BOTH mating and eating for the entire season!).
+            // For carnivores:
+            // - Females prioritize Mate -> Food -> Cry (Cry ALSO sets prioritized=true and ReadyForInternalFertilization(true)
+            //   stays true even after fertilization until pregnant, so Cry MUST come AFTER Food so females hunt & eat!).
+            // - Males prioritize Mate -> Hear ASound (7.2-cell mating call homing) -> Food.
+            InstinctDefinition[] femaleInstincts = obligateCarnivore
+                ? new[]
+                {
+                    MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.APotentialMate, InstinctAction.GoTowards),
+                    MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.Food, InstinctAction.GoTowards),
+                    MakeInstinct(InstinctConditionSense.Feel, InstinctConditionObject.ReadyToMate, InstinctAction.Cry),
+                }
+                : new[]
+                {
+                    MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.APotentialMate, InstinctAction.GoTowards),
+                    MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.Food, InstinctAction.GoTowards),
+                };
+            InstinctDefinition[] maleInstincts = obligateCarnivore
+                ? new[]
+                {
+                    MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.APotentialMate, InstinctAction.GoTowards),
+                    MakeInstinct(InstinctConditionSense.Hear, InstinctConditionObject.ASound, InstinctAction.GoTowards),
+                    MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.Food, InstinctAction.GoTowards),
+                }
+                : femaleInstincts;
+            def._instincts = femaleInstincts;
+            var yi = def.young; yi.instincts = femaleInstincts; def.young = yi;
+            for (int i = 0; i < def.sexes.Length; i++) { var m = def.sexes[i]; m.instincts = maleInstincts; def.sexes[i] = m; }
+            for (int i = 0; i < def.youngSexes.Length; i++) { var m = def.youngSexes[i]; m.instincts = maleInstincts; def.youngSexes[i] = m; }
+
+            def.currentSex = 0;
+            var yc0 = new AnimalStatsCalculator(importer, 1f); yc0.Calculate(def, true);
+            var ac0 = new AnimalStatsCalculator(importer, 1f); ac0.Calculate(def, false);
+            // If scaled up in bodySize so predator > prey, gently trim torso diameters proportionally to stay under leg weight limit.
+            for (int iter = 0; iter < 20 && ac0.weight > ac0.weightSupportedForWalking - 0.15f && def.torso != null; iter++)
+            {
+                for (int t = 0; t < def.torso.Length; t++)
+                    def.torso[t].diameter = Math.Max(1.6f, def.torso[t].diameter * 0.95f);
+                yc0.Calculate(def, true);
+                ac0.Calculate(def, false);
+            }
+            var p0 = OrganismProblemDetection.DetectProblemInAnimal(def, yc0, ac0);
+            def.currentSex = 1;
+            var yc1 = new AnimalStatsCalculator(importer, 1f); yc1.Calculate(def, true);
+            var ac1 = new AnimalStatsCalculator(importer, 1f); ac1.Calculate(def, false);
+            var p1 = OrganismProblemDetection.DetectProblemInAnimal(def, yc1, ac1);
+            def.currentSex = 0;
+            log($"[COEVO] Seed '{speciesName}' ({(obligateCarnivore ? "CARN" : "HERB")}): size={def._bodySize}, age={ac0.expectedAge}d, preg={ac0.pregnancyTime}d, spd={ac0.speed:F2}(y:{yc0.speed:F2}), stp={ac0.maximumSteepness:F2}, wt={ac0.weight:F1}/{ac0.weightSupportedForWalking:F1}, atk={ac0.attack}, temp=[{ac0.minimumTemperatureThisOrganismCanHandle:F1}..{ac0.maximumTemperatureThisOrganismCanHandle:F1}C], prob=(F:{p0}, M:{p1}), obligCarn={IsObligateCarnivoreDef(def)}");
+
+            // Find habitable land cells via AnimalCellRequirementChecker, preferring the largest connected flat basins
+            WorldArea area = tl.today.areas[0];
+            var checker = new AnimalCellRequirementChecker();
+            int w = (int)area.size.x, h = (int)area.size.y;
+            bool[] habitable = new bool[area.cells.Length];
+            for (int i = 0; i < area.cells.Length; i++)
+            {
+                WorldCell c = area.cells[i];
+                if (c == null || !c.usable || !c.walkable || c.oceanDepth >= 0f) continue;
+                checker.Check(c, def, ac0, true);
+                if (checker.okayForAnimal) habitable[i] = true;
+            }
+            // Group habitable cells into connected components so slow protolobe walkers aren't stranded on tiny hilltops
+            int[] compId = new int[area.cells.Length];
+            var compCells = new List<List<int>>();
+            var q = new Queue<int>();
+            for (int i = 0; i < area.cells.Length; i++)
+            {
+                if (!habitable[i] || compId[i] != 0) continue;
+                int cid = compCells.Count + 1;
+                var list = new List<int>();
+                compId[i] = cid;
+                q.Enqueue(i);
+                while (q.Count > 0)
+                {
+                    int cur = q.Dequeue();
+                    list.Add(cur);
+                    int cx = cur / h, cy = cur % h;
+                    for (int dx = -1; dx <= 1; dx++)
+                        for (int dy = -1; dy <= 1; dy++)
+                        {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx = cx + dx, ny = cy + dy;
+                            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                            int ni = nx * h + ny;
+                            if (habitable[ni] && compId[ni] == 0) { compId[ni] = cid; q.Enqueue(ni); }
+                        }
+                }
+                compCells.Add(list);
+            }
+            compCells.Sort((a, b) => b.Count.CompareTo(a.Count));
+            var candidateCells = new List<int>();
+            foreach (var comp in compCells)
+            {
+                if (comp.Count < 16) continue;
+                foreach (int i in comp)
+                {
+                    if (area.GetAnimalInCell(i, CellLocationType.Ground) != null) continue;
+                    WorldCell c = area.cells[i];
+                    bool good = false;
+                    if (!obligateCarnivore)
+                    {
+                        good = c.plant != null;
+                    }
+                    else
+                    {
+                        int cx = i / h, cy = i % h;
+                        for (int dx = -3; dx <= 3 && !good; dx++)
+                            for (int dy = -3; dy <= 3 && !good; dy++)
+                            {
+                                int nx = cx + dx, ny = cy + dy;
+                                if (nx >= 0 && ny >= 0 && nx < w && ny < h && area.GetAnimalInCell(nx * h + ny, CellLocationType.Ground) != null)
+                                    good = true;
+                            }
+                    }
+                    if (good) candidateCells.Add(i);
+                }
+            }
+            // Spawn F/M pairs inside connected basins with >=3-cell spacing between pairs so
+            // FindNumberOfAnimalsAroundCell <= 1 and EnoughSpaceForReproduction passes immediately!
+            def.definitionIndex = tl.nextDefinitionIndex++;
+            int spawned = 0;
+            var used = new HashSet<int>();
+            var pairRoots = new List<int>();
+            for (int k = 0; k < candidateCells.Count && spawned < count; k++)
+            {
+                int c0 = candidateCells[k];
+                if (used.Contains(c0) || area.GetAnimalInCell(c0, CellLocationType.Ground) != null) continue;
+                int cx = c0 / h, cy = c0 % h;
+                bool tooClose = false;
+                int minPairSep = obligateCarnivore ? 2 : 3;
+                for (int r = 0; r < pairRoots.Count; r++)
+                {
+                    int rx = pairRoots[r] / h, ry = pairRoots[r] % h;
+                    if (Math.Abs(rx - cx) <= minPairSep && Math.Abs(ry - cy) <= minPairSep) { tooClose = true; break; }
+                }
+                if (tooClose) continue;
+                int c1 = -1;
+                for (int dx = -1; dx <= 1 && c1 < 0; dx++)
+                    for (int dy = -1; dy <= 1 && c1 < 0; dy++)
+                    {
+                        if (dx == 0 && dy == 0) continue;
+                        int nx = cx + dx, ny = cy + dy;
+                        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                        int ni = nx * h + ny;
+                        if (!habitable[ni]) continue;
+                        if (!used.Contains(ni) && area.GetAnimalInCell(ni, CellLocationType.Ground) == null) c1 = ni;
+                    }
+                if (c1 < 0) continue;
+                pairRoots.Add(c0);
+                int[] pairCells = new[] { c0, c1 };
+                for (int s = 0; s < 2 && spawned < count; s++)
+                {
+                    used.Add(pairCells[s]);
+                    AnimalDefinition instDef = (AnimalDefinition)def.Clone();
+                    instDef.definitionIndex = def.definitionIndex;
+                    instDef.currentSex = s;
+                    tl.nextSpeciesName = speciesName;
+                    tl.InsertAnimal(instDef, 0, pairCells[s], CellLocationType.Ground, true, -1);
+                    LivingAnimal placed = area.GetAnimalInCell(pairCells[s], CellLocationType.Ground);
+                    if (placed != null)
+                    {
+                        placed.isChild = false;
+                        placed.age = Math.Max(12, ac0.expectedAge / 4 + 1);
+                        placed.UpdateTemperature(area.cells[pairCells[s]].temperature);
+                        if (spawned == 0)
+                        {
+                            if (obligateCarnivore) { _carnDeaths.Clear(); _carnSpeciesMin = tl.populationBasedAnimalClassifier.LookUp(placed.definition.definitionIndex); }
+                            var flist = new List<string>();
+                            if (placed.orderedDetailedFoodTypes != null)
+                                for (int fi = 0; fi < placed.orderedDetailedFoodTypes.Length; fi++)
+                                    flist.Add($"{placed.orderedDetailedFoodTypes[fi]}:{placed.energyPerDetailedFoodType[fi]:F1}");
+                            log($"[COEVO] '{speciesName}' diet=[{string.Join(",", flist)}] loss={placed.dailyEnergyLoss:F2}/d reproThr={placed.CalculateReproductionThreshold():F1} reproCost={placed.energyNeededToReproduce:F1} see={tl.GetSeeingDistance(placed, CellLocationType.Ground):F1} maxKids={placed.maximumNrOfChildren}");
+                        }
+                        spawned++;
+                    }
+                }
+            }
+            log($"[COEVO] Spawned {spawned}/{count} '{speciesName}' ({(obligateCarnivore ? "CARN" : "HERB")}) in dense connected basins (largest={(compCells.Count > 0 ? compCells[0].Count : 0)} cells, candidates={candidateCells.Count}).");
+        }
+
+        private static void LogAnimalGuildBreakdown(TimeLine tl, Action<string> log)
+        {
+            var herbSpp = new Dictionary<int, int[]>();
+            var carnSpp = new Dictionary<int, int[]>();
+            int backMouths = 0, frontMouths = 0;
+            foreach (WorldArea area in tl.today.areas)
+            {
+                foreach (AnimalPosition pos in area.animalPositionTracker.animalPositions)
+                {
+                    LivingAnimal la = area.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                    if (la == null || la.eaten || la.definition == null) continue;
+                    int spIdx = tl.usePopulationBasedClassification ? tl.populationBasedAnimalClassifier.LookUp(la.definition.definitionIndex) : -1;
+                    bool carn = IsObligateCarnivoreDef(la.definition);
+                    var dict = carn ? carnSpp : herbSpp;
+                    if (!dict.ContainsKey(spIdx)) dict[spIdx] = new int[2];
+                    dict[spIdx][la.definition.currentSex == 0 ? 0 : 1]++;
+                    if (la.definition.torso != null && la.definition.torso.Length > 0 && la.definition.torso[0] != null)
+                    {
+                        foreach (var kv in la.definition.torso[0].children)
+                            if (kv.Value is MouthDefinition)
+                            {
+                                if (kv.Key.side == TorsoPartSide.Back) backMouths++;
+                                else if (kv.Key.side == TorsoPartSide.Front) frontMouths++;
+                            }
+                    }
+                }
+            }
+            int hTot = 0, hF = 0, hM = 0, cTot = 0, cF = 0, cM = 0;
+            foreach (var kv in herbSpp) { hF += kv.Value[0]; hM += kv.Value[1]; hTot += kv.Value[0] + kv.Value[1]; }
+            foreach (var kv in carnSpp) { cF += kv.Value[0]; cM += kv.Value[1]; cTot += kv.Value[0] + kv.Value[1]; }
+            log($"[GUILDS] Herbivores: {hTot} (F={hF}/M={hM}) across {herbSpp.Count} spp | Obligate Carnivores: {cTot} (F={cF}/M={cM}) across {carnSpp.Count} spp | torso[0] mouths: Back(OK)={backMouths}, Front(BAD)={frontMouths}");
+            foreach (var kv in carnSpp)
+            {
+                string nm = (kv.Key >= 0 && kv.Key < tl.allSpecies.Count) ? tl.allSpecies[kv.Key].name : "?";
+                log($"  [CARN] spp {kv.Key} '{nm}': {kv.Value[0] + kv.Value[1]} (F={kv.Value[0]}, M={kv.Value[1]})");
+            }
+            int shownH = 0;
+            foreach (var kv in herbSpp)
+            {
+                if (shownH++ >= 12) break;
+                string nm = (kv.Key >= 0 && kv.Key < tl.allSpecies.Count) ? tl.allSpecies[kv.Key].name : "?";
+                log($"  [HERB] spp {kv.Key} '{nm}': {kv.Value[0] + kv.Value[1]} (F={kv.Value[0]}, M={kv.Value[1]})");
+            }
         }
 
         // =========================================================================
@@ -2168,7 +3108,8 @@ namespace SimLab
             mouth.scale = 1.0f;
             var eye = importer.CreateEyeWithShapeIndex(15);     // stalk (360-deg FOV)
             eye.scale = 1.0f;
-            seg0.SetChild(mouth, TorsoPartSide.Front);
+            // On horizontal animals, torso[0] is the head and its outward front face is TorsoPartSide.Back.
+            seg0.SetChild(mouth, TorsoPartSide.Back);
             seg0.SetChild(eye, TorsoPartSide.Side);
 
             if (useSlowOnly)

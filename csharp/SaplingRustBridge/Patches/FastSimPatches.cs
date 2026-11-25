@@ -4160,25 +4160,33 @@ namespace SaplingRustBridge.Patches
                     a.energy -= a.dailyEnergyLoss * 2f;
                 }
             }
-            else if (!a.eatsMeat || a.nrOfChildren < a.maximumNrOfChildren)
+            else
             {
-                int rem = a.expectedAge - a.age;
-                if (rem < 0) rem = 0;
-                else if (rem > 20) rem = 20;
-                float thresh = (float)rem * a.dailyEnergyLoss + a.energyNeededToReproduce + a.energyNeededForNestCreation;
-                if (!(a.energy <= thresh) && def.CanGiveBirth() && (def.canGiveBirthAsexually || a.fertilized))
+                // Vanilla hardcodes maximumNrOfChildren=3 for eatsMeat (tuned for asexuals = 3 daughters/female);
+                // strictly sexual carnivores split births across (sexes.Length + 1) sexes, so scale to keep parity.
+                int effectiveMaxKids = (a.eatsMeat && !def._canGiveBirthAsexually && def._canGiveBirthSexually && def.sexes != null && def.sexes.Length >= 1)
+                    ? a.maximumNrOfChildren * (def.sexes.Length + 1)
+                    : a.maximumNrOfChildren;
+                if (!a.eatsMeat || a.nrOfChildren < effectiveMaxKids)
                 {
-                    a.energy -= a.energyNeededToReproduce;
-                    if (!(a.energy <= thresh)) a.energy = thresh;
-                    a.pregnant = true;
-                    if (a.verboseEnergy || a.verboseMating) a.logString += "p";
-                    if (a.pregnancyTime == 0f)
+                    int rem = a.expectedAge - a.age;
+                    if (rem < 0) rem = 0;
+                    else if (rem > 20) rem = 20;
+                    float thresh = (float)rem * a.dailyEnergyLoss + a.energyNeededToReproduce + a.energyNeededForNestCreation;
+                    if (!(a.energy <= thresh) && def.CanGiveBirth() && (def.canGiveBirthAsexually || a.fertilized))
                     {
-                        a.readyToGiveBirth = true;
-                    }
-                    else
-                    {
-                        a.babyDueAt = (int)((float)a.age + a.pregnancyTime);
+                        a.energy -= a.energyNeededToReproduce;
+                        if (!(a.energy <= thresh)) a.energy = thresh;
+                        a.pregnant = true;
+                        if (a.verboseEnergy || a.verboseMating) a.logString += "p";
+                        if (a.pregnancyTime == 0f)
+                        {
+                            a.readyToGiveBirth = true;
+                        }
+                        else
+                        {
+                            a.babyDueAt = (int)((float)a.age + a.pregnancyTime);
+                        }
                     }
                 }
             }
@@ -4696,6 +4704,14 @@ namespace SaplingRustBridge.Patches
             // currentSex to 0, wiping out all non-zero sexes once mutations cause blending).
             int targetSex = preserveSex >= 0 ? preserveSex : animalA.currentSex;
             if (dst.sexes == null || targetSex > dst.sexes.Length) targetSex = 0;
+            if (targetSex > 0 && dst.sexes != null)
+            {
+                // Isolate the active sex morph so ProcessNewAnimalDefinition does not mutate primary.sexes in place.
+                AnimalMorph[] sexesCopy = new AnimalMorph[dst.sexes.Length];
+                Array.Copy(dst.sexes, sexesCopy, dst.sexes.Length);
+                sexesCopy[targetSex - 1] = CloneAnimalMorphFast(dst.sexes[targetSex - 1]);
+                dst.sexes = sexesCopy;
+            }
             dst.currentSex = targetSex;
 
             blender.madeChanges = true;
@@ -4828,7 +4844,11 @@ namespace SaplingRustBridge.Patches
             {
                 int len = src.instincts.Length;
                 InstinctDefinition[] arr = new InstinctDefinition[len];
-                Array.Copy(src.instincts, arr, len);
+                for (int i = 0; i < len; i++)
+                {
+                    InstinctDefinition inst = src.instincts[i];
+                    arr[i] = inst != null ? (InstinctDefinition)_memberwiseClone(inst) : null;
+                }
                 dst.instincts = arr;
             }
             if (src.hormoneInitialLevels != null)
@@ -9080,6 +9100,80 @@ namespace SaplingRustBridge.Patches
             if (_expCacheEventBased) { __result = _expCacheEvList[index].index; return false; }
             __result = (_expCacheIndices != null) ? _expCacheIndices[index] : -1;
             return false;
+        }
+
+        // =========================================================================
+        // 30. GameSaver.GetLivingAnimal — fix vanilla load bugs:
+        //     (a) Vanilla hardcodes gravity=1f instead of planet.gravity on custom
+        //         planets (scenarioIndex==999), crushing evolved low-gravity animals
+        //         to canWalk=false, speed=0 on every save reload.
+        //     (b) Vanilla runs UpdateStats while isChild=true before restoring age,
+        //         and never populates hasCachedAdultMovementStats.
+        // =========================================================================
+        [HarmonyPatch(typeof(GameSaver), nameof(GameSaver.GetLivingAnimal))]
+        [HarmonyPostfix]
+        public static void GameSaver_GetLivingAnimal_Postfix(GameSaver __instance, LivingAnimal __result)
+        {
+            if (!Enabled || __result == null || __result.definition == null || __instance == null || __instance.importer == null) return;
+            AnimalDefinition def = __result.definition;
+            float grav = (__instance.scenarioIndex == 999) ? __instance.planet.gravity : 1f;
+            bool needAdultFix = __result.age > __result.matureAtAge && __result.isChild;
+            bool needGravFix = __instance.scenarioIndex == 999 && grav != 1f;
+            if (needAdultFix || needGravFix)
+            {
+                float savedEnergy = __result.energy;
+                float[] savedHormones = __result.hormoneLevels;
+                if (needAdultFix) __result.isChild = false;
+                __result.UpdateStats(__instance.importer, grav);
+                __result.energy = savedEnergy;
+                if (savedHormones != null && savedHormones.Length > 0) __result.hormoneLevels = savedHormones;
+                __result.FillUpOxygen();
+            }
+
+            // Recompute cached young/adult movement stats when young differs from adult.
+            bool mayDiffer = (def.young.bodyPartDiffs != null && def.young.bodyPartDiffs.Count > 0)
+                || def.young.bodySize != def._bodySize
+                || (def.currentSex > 0 && def.youngSexes != null && def.currentSex <= def.youngSexes.Length &&
+                    ((def.youngSexes[def.currentSex - 1].bodyPartDiffs != null && def.youngSexes[def.currentSex - 1].bodyPartDiffs.Count > 0)
+                     || def.youngSexes[def.currentSex - 1].bodySize != def.bodySize));
+            if (!mayDiffer) return;
+
+            var yc = new AnimalStatsCalculator(__instance.importer, grav);
+            yc.Calculate(def, true);
+            var ac = new AnimalStatsCalculator(__instance.importer, grav);
+            ac.Calculate(def, false);
+            bool diff = yc.sessile != ac.sessile || yc.canWalk != ac.canWalk || yc.canClimb != ac.canClimb
+                || yc.canGlide != ac.canGlide || yc.canFly != ac.canFly || yc.canSwim != ac.canSwim
+                || yc.aquaticBehavior != ac.aquaticBehavior || yc.speed != ac.speed
+                || yc.swimmingSpeed != ac.swimmingSpeed || yc.waterSurfaceBoost != ac.waterSurfaceBoost
+                || yc.maximumSteepness != ac.maximumSteepness || yc.canSteerInTheAir != ac.canSteerInTheAir;
+            if (!diff) return;
+
+            __result.hasCachedAdultMovementStats = true;
+            __result.cachedYoungSessile = yc.sessile;
+            __result.cachedYoungCanWalk = yc.canWalk;
+            __result.cachedYoungCanClimb = yc.canClimb;
+            __result.cachedYoungCanGlide = yc.canGlide;
+            __result.cachedYoungCanFly = yc.canFly;
+            __result.cachedYoungCanSwim = yc.canSwim;
+            __result.cachedYoungAquaticBehavior = yc.aquaticBehavior;
+            __result.cachedYoungSpeed = yc.speed;
+            __result.cachedYoungSwimmingSpeed = yc.swimmingSpeed;
+            __result.cachedYoungWaterSurfaceBoost = yc.waterSurfaceBoost;
+            __result.cachedYoungMaximumSteepness = yc.maximumSteepness;
+            __result.cachedYoungCanSteerInTheAir = yc.canSteerInTheAir;
+            __result.cachedAdultSessile = ac.sessile;
+            __result.cachedAdultCanWalk = ac.canWalk;
+            __result.cachedAdultCanClimb = ac.canClimb;
+            __result.cachedAdultCanGlide = ac.canGlide;
+            __result.cachedAdultCanFly = ac.canFly;
+            __result.cachedAdultCanSwim = ac.canSwim;
+            __result.cachedAdultAquaticBehavior = ac.aquaticBehavior;
+            __result.cachedAdultSpeed = ac.speed;
+            __result.cachedAdultSwimmingSpeed = ac.swimmingSpeed;
+            __result.cachedAdultWaterSurfaceBoost = ac.waterSurfaceBoost;
+            __result.cachedAdultMaximumSteepness = ac.maximumSteepness;
+            __result.cachedAdultCanSteerInTheAir = ac.canSteerInTheAir;
         }
     }
 }
