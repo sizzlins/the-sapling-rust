@@ -563,6 +563,13 @@ namespace SimLab
         private static int _aquaSpecies = -1;
         private static Dictionary<DeathCause, int> _aquaDeaths = new Dictionary<DeathCause, int>();
 
+        private static void DeathCause_Prefix(DeathCause deathCause, OrganismType organismType)
+        {
+            if (organismType != OrganismType.Animal) return;
+            _aquaDeaths.TryGetValue(deathCause, out int c);
+            _aquaDeaths[deathCause] = c + 1;
+        }
+
         private static void TrackDeath_Postfix(int speciesId, DeathCause cause)
         {
             int cur;
@@ -576,13 +583,8 @@ namespace SimLab
             if (_activeTimeLine != null && _activeTimeLine.populationBasedAnimalClassifier != null)
             {
                 int sp = _activeTimeLine.populationBasedAnimalClassifier.LookUp(speciesId);
-                bool isAqua = sp >= 0 && _aquaSpecies >= 0 && sp == _aquaSpecies;
-                if (!isAqua && sp >= 0 && sp < _activeTimeLine.allSpecies.Count && _activeTimeLine.allSpecies[sp].name == "Aquara")
-                {
-                    _aquaSpecies = sp;
-                    isAqua = true;
-                }
-                if (isAqua)
+                // This world starts with no animals, so any animal death is the seeded species.
+                if (sp >= 0 && sp < _activeTimeLine.allSpecies.Count && _activeTimeLine.allSpecies[sp].speciesType == OrganismType.Animal)
                 {
                     _aquaDeaths.TryGetValue(cause, out cur);
                     _aquaDeaths[cause] = cur + 1;
@@ -711,6 +713,8 @@ namespace SimLab
             if (Environment.GetEnvironmentVariable("SIM_NO_MALE_BIRTH") == "1")
                 h.Patch(typeof(AnimalDefinition).GetMethod("CanGiveBirth"),
                     prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(CanGiveBirth_Prefix), flags)));
+            h.Patch(AccessTools.Method(typeof(TimeLine), "RegisterDeathCause"),
+                prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(DeathCause_Prefix), flags)));
             h.Patch(AccessTools.Method(typeof(AnimalStatsCalculator), "Calculate", new[] { typeof(AnimalDefinition), typeof(bool) }),
                 postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(BalanceSex_Postfix), flags)));
             h.Patch(AccessTools.Method(typeof(LivingAnimal), "LiveADay", new[] { typeof(int) }),
@@ -4087,8 +4091,26 @@ namespace SimLab
             def.hormones = new HormoneDefinition[0];
 
             var seg0 = new TorsoPartDefinition(0f, 3.0f);
-            var mouth = importer.CreateMouthWithShapeIndex(30); // rakers
+            var mouth = importer.CreateMouthWithShapeIndex(9); // filter: plankton 5, drag 1, water oxygen
             mouth.scale = 1.0f;
+            if (mouth.energyPerFoodType != null)
+            {
+                mouth.energyPerFoodType.Remove(DetailedFoodType.WholeAnimal);
+                mouth.energyPerFoodType.Remove(DetailedFoodType.FreshMeat);
+                mouth.energyPerFoodType.Remove(DetailedFoodType.OldMeat);
+                mouth.energyPerFoodType.Remove(DetailedFoodType.Egg);
+                mouth.energyPerFoodType.Remove(DetailedFoodType.Blood);
+            }
+            mouth.eatsMeat = false;
+            mouth.getsMostEnergyFromMeat = false;
+            // Macro algae count as SoftPlantTissue and marine snow as its own type. Both are in
+            // the water already, so a broader diet raises the carrying capacity without meat.
+            if (mouth.energyPerFoodType != null)
+            {
+                mouth.energyPerFoodType[DetailedFoodType.SoftPlantTissue] = 3f;
+                mouth.energyPerFoodType[DetailedFoodType.MarineSnow] = 2f;
+            }
+            mouth.eatsPlants = true;
             var eye = importer.CreateEyeWithShapeIndex(15);     // stalk, 360 degrees
             eye.scale = 1.0f;
             seg0.SetChild(mouth, TorsoPartSide.Back);
@@ -4099,13 +4121,18 @@ namespace SimLab
             fin.scale = 1.0f;
             seg1.SetChild(fin, TorsoPartSide.Side);
 
+            var seg2 = new TorsoPartDefinition(0f, 4.0f);
+            var fin2 = importer.CreateLimbWithShapeIndex(25);   // second fin pair for feeding speed
+            fin2.scale = 1.0f;
+            seg2.SetChild(fin2, TorsoPartSide.Side);
+
             // webbed feet give maximumSteepness > 0: EnoughSpaceForReproduction steps to a
             // neighbouring cell with that limit, and 0 makes a swimmer sterile.
-            var seg2 = new TorsoPartDefinition(0f, 4.0f);
+            var seg3 = new TorsoPartDefinition(0f, 3.0f);
             var web = importer.CreateLimbWithShapeIndex(26);    // webbed
             web.scale = 1.0f;
-            seg2.SetChild(web, TorsoPartSide.Side);
-            def.torso = new TorsoPartDefinition[] { seg0, seg1, seg2 };
+            seg3.SetChild(web, TorsoPartSide.Side);
+            def.torso = new TorsoPartDefinition[] { seg0, seg1, seg2, seg3 };
 
             def._instincts = new InstinctDefinition[]
             {
