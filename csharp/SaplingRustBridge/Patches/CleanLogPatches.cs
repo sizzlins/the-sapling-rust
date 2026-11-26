@@ -18,6 +18,17 @@ namespace SaplingRustBridge.Patches
     [HarmonyPatch]
     public static class CleanLogPatches
     {
+        // 7. Carrying an aquatic animal can make CarriedOrganismLocationToAreaIndex() return -1
+        // (the carried position maps outside every area). UpdateAnimalRequirementsPanel then
+        // indexes today.areas[-1], throws every frame, and aborts WorldController.Update before
+        // the placement input runs, so dropping the animal appears to do nothing.
+        [HarmonyPatch(typeof(WorldController), "UpdateAnimalRequirementsPanel")]
+        [HarmonyFinalizer]
+        public static Exception AquaticRequirementsPanel_Finalizer(Exception __exception)
+        {
+            return null;
+        }
+
         /// <summary>
         /// Strips any child LODGroups that conflict with a root LODGroup on the same GameObject hierarchy.
         /// </summary>
