@@ -2834,6 +2834,29 @@ namespace SimLab
                     string etaStr = runForever ? "INF" : (dps > 0 ? $"{(days - done) / dps / 3600.0:F1}h" : "?");
                     long mem = GC.GetTotalMemory(false) / 1048576;
                     Log($"Day {tl.dayIndex,9} | P={p,5} F={f,4} A={an,5} (F/M={females}/{males}) | grass={gr,5} plank={pl,5} alga={ma,4} seeds={ds,4} eggs={eg,4} | spp alive P={ps} F={fs} A={ans} | totalSpp={tl.allSpecies.Count} capHits={_speciesCapHits} | mat={_totalMatings} births={_totalBirths} mut={_totalMutations} | {dps:F1} d/s ETA {etaStr} mem={mem}MB");
+                    if (Environment.GetEnvironmentVariable("SIM_LAND_AUDIT") == "1")
+                    {
+                        var terr = new Dictionary<int, int>();
+                        int tTot = 0, aTot = 0;
+                        foreach (WorldArea la2 in tl.today.areas)
+                            foreach (AnimalPosition lpos in la2.animalPositionTracker.animalPositions)
+                            {
+                                LivingAnimal lan = la2.GetAnimalInCell(lpos.cellIndex, lpos.locationType);
+                                if (lan == null || lan.eaten || lan.definition == null) continue;
+                                bool ter = SimulationTools.AnimalIsTerrestrial(lan.canWalk, lan.timeOnLand == -1,
+                                    importer.GetLocationForEggType(lan.definition.eggType), lan.speed, lan.swimmingSpeed);
+                                if (ter)
+                                {
+                                    tTot++;
+                                    int sp2 = tl.populationBasedAnimalClassifier.LookUp(lan.definition.definitionIndex);
+                                    if (sp2 >= 0) terr[sp2] = terr.TryGetValue(sp2, out int c4) ? c4 + 1 : 1;
+                                }
+                                else aTot++;
+                            }
+                        Log($"    [LAND] terrestrial={tTot} aquatic={aTot}");
+                        foreach (var kv in terr)
+                            Log($"    [LAND] '{(kv.Key < tl.allSpecies.Count ? tl.allSpecies[kv.Key].name : "?")}' n={kv.Value}");
+                    }
                     if (Environment.GetEnvironmentVariable("SIM_AUDIT_SEX") == "1") LogSexDiag(tl, Log);
                     if (_allDeaths.Count > 0)
                     {
