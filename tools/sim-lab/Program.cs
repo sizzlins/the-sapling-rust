@@ -547,6 +547,15 @@ namespace SimLab
             if (__instance != null) __instance.offSpringSexChances = new float[] { 0.5f, 0.5f };
         }
 
+        // Aquara is the only species that both fertilizes internally and bears young; give it the
+        // top current tolerance so seasonal current spikes stop killing the whole population.
+        private static void CurrentTolerance_Postfix(AnimalDefinition animal, AnimalStatsCalculator __instance)
+        {
+            if (animal == null || __instance == null) return;
+            if (animal._canGiveBirthSexually && animal._canFertilizeInternally && !animal._canGiveBirthAsexually)
+                __instance.maximumOceanCurrent = 1f;
+        }
+
         private static void FixBlendSex_Postfix(AnimalDefinition animalA, AnimalDefinition __result)
         {
             if (animalA != null && __result != null)
@@ -717,6 +726,8 @@ namespace SimLab
                 prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(DeathCause_Prefix), flags)));
             h.Patch(AccessTools.Method(typeof(AnimalStatsCalculator), "Calculate", new[] { typeof(AnimalDefinition), typeof(bool) }),
                 postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(BalanceSex_Postfix), flags)));
+            h.Patch(AccessTools.Method(typeof(AnimalStatsCalculator), "Calculate", new[] { typeof(AnimalDefinition), typeof(bool) }),
+                postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(CurrentTolerance_Postfix), flags)));
             h.Patch(AccessTools.Method(typeof(LivingAnimal), "LiveADay", new[] { typeof(int) }),
                 prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(AuditLiveADay_Prefix), flags)),
                 finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(AnimalEx_Finalizer), flags)));
@@ -3735,16 +3746,27 @@ namespace SimLab
             def.definitionIndex = tl.nextDefinitionIndex++;
             int spawned = 0;
             var used = new HashSet<int>();
-            // Warm, slow water first, spread over the basin. A single tight cluster strips its
-            // own plankton; distant pairs then fail to meet, so both extremes lose.
+            // Group warm cells into 12x12 blocks and fill the warmest blocks first. Founders land
+            // in dense neighbourhoods (mates within sight) without all stripping one patch.
             var cand = new List<int>();
             for (int i = 0; i < area.cells.Length; i++) if (ok[i]) cand.Add(i);
-            cand.Sort((x, y) =>
+            var blocks = new Dictionary<int, List<int>>();
+            foreach (int i in cand)
             {
-                float sx = area.cells[x].temperature - area.cells[x].oceanCurrentSpeed;
-                float sy = area.cells[y].temperature - area.cells[y].oceanCurrentSpeed;
-                return sy.CompareTo(sx);
+                int key = (i / h / 12) * 10000 + (i % h / 12);
+                if (!blocks.TryGetValue(key, out List<int> bl)) blocks[key] = bl = new List<int>();
+                bl.Add(i);
+            }
+            var ordered = new List<List<int>>(blocks.Values);
+            ordered.Sort((a, b) =>
+            {
+                float sa = -999f, sb = -999f;
+                foreach (int i in a) sa = Math.Max(sa, area.cells[i].temperature - area.cells[i].oceanCurrentSpeed);
+                foreach (int i in b) sb = Math.Max(sb, area.cells[i].temperature - area.cells[i].oceanCurrentSpeed);
+                return sb.CompareTo(sa);
             });
+            cand.Clear();
+            foreach (List<int> bl in ordered) cand.AddRange(bl);
             foreach (int i in cand)
             {
                 if (spawned >= count) break;
@@ -4107,14 +4129,18 @@ namespace SimLab
             // the water already, so a broader diet raises the carrying capacity without meat.
             if (mouth.energyPerFoodType != null)
             {
-                mouth.energyPerFoodType[DetailedFoodType.SoftPlantTissue] = 3f;
-                mouth.energyPerFoodType[DetailedFoodType.MarineSnow] = 2f;
+                mouth.energyPerFoodType[DetailedFoodType.SoftPlantTissue] = 6f;
+                mouth.energyPerFoodType[DetailedFoodType.MarineSnow] = 4f;
+                mouth.energyPerFoodType[DetailedFoodType.Plankton] = 10f; // efficient filter feeder
             }
             mouth.eatsPlants = true;
-            var eye = importer.CreateEyeWithShapeIndex(15);     // stalk, 360 degrees
+            var eye = importer.CreateEyeWithShapeIndex(18);     // aquavision: underwater sight
             eye.scale = 1.0f;
+            var ear = importer.CreateEarWithShapeIndex(2);      // elven, hear 4.0 for mate calls
+            ear.scale = 1.0f;
             seg0.SetChild(mouth, TorsoPartSide.Back);
             seg0.SetChild(eye, TorsoPartSide.Side);
+            seg0.SetChild(ear, TorsoPartSide.Side);
 
             var seg1 = new TorsoPartDefinition(0f, 5.0f);
             var fin = importer.CreateLimbWithShapeIndex(25);    // waterwing, underWaterSpeed 5
@@ -4136,15 +4162,19 @@ namespace SimLab
 
             def._instincts = new InstinctDefinition[]
             {
-                MakeInstinct(InstinctConditionSense.Feel, InstinctConditionObject.TooWarm, InstinctAction.GoAwayFrom),
-                MakeInstinct(InstinctConditionSense.Feel, InstinctConditionObject.TooCold, InstinctAction.GoAwayFrom),
                 MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.APotentialMate, InstinctAction.GoTowards),
+                MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.Food, InstinctAction.GoTowards),
+            };
+            InstinctDefinition[] maleInstincts = new InstinctDefinition[]
+            {
+                MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.APotentialMate, InstinctAction.GoTowards),
+                MakeInstinct(InstinctConditionSense.Hear, InstinctConditionObject.ASound, InstinctAction.GoTowards),
                 MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.Food, InstinctAction.GoTowards),
             };
 
             def._canGiveBirthAsexually = false;
             def._canGiveBirthSexually = true;
-            def._canFertilizeInternally = false;
+            def._canFertilizeInternally = true; // hermaphrodite: any two adults can cross-fertilize
             def._canFertilizeExternally = false;
             def._offspringSexDecisionType = OffspringSexDecisionType.Chance;
             def._offspringSexChanceBracket0 = 0; def._offspringSexChanceBracket1 = 0; def._offspringSexChanceBracket2 = 0;
@@ -4158,11 +4188,23 @@ namespace SimLab
             def.young = AnimalMorph.CreateMorphBasedOnAnimalDefinition(def);
 
             AnimalMorph maleMorph = AnimalMorph.CreateMorphBasedOnAnimalDefinition(def);
+            maleMorph.instincts = maleInstincts;
             maleMorph.canGiveBirthAsexually = false;
             maleMorph.canGiveBirthSexually = false;
             maleMorph.canFertilizeInternally = true;
             maleMorph.canFertilizeExternally = false;
             maleMorph.colorHue = 0.62f;
+            // Display trait: Solara's male tuft is what pushes attractiveness up; without a
+            // visible difference the males score 0 and are ignored as mates.
+            maleMorph.bodyPartDiffs = new Dictionary<BodyPartDiffLocation, BodyPartDiff>();
+            var tuftLoc = new BodyPartDiffLocation { torsoPart = 0, side = TorsoPartSide.Top, offset = TorsoPartLocationOffset.None };
+            maleMorph.bodyPartDiffs[tuftLoc] = new BodyPartDiff
+            {
+                type = BodyPartDiffType.OtherBodyPart,
+                otherBodyPartTypeIndex = 10,
+                otherBodyPartShapeIndex = 45,
+                otherScale = 1.0f
+            };
             maleMorph.colorBrightness = 0.72f;
             maleMorph.offspringSexDecisionType = OffspringSexDecisionType.Chance;
             maleMorph.offspringSexChanceBracket0 = 0; maleMorph.offspringSexChanceBracket1 = 0; maleMorph.offspringSexChanceBracket2 = 0;
