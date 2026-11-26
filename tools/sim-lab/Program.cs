@@ -560,6 +560,9 @@ namespace SimLab
             }
         }
 
+        private static int _aquaSpecies = -1;
+        private static Dictionary<DeathCause, int> _aquaDeaths = new Dictionary<DeathCause, int>();
+
         private static void TrackDeath_Postfix(int speciesId, DeathCause cause)
         {
             int cur;
@@ -569,6 +572,21 @@ namespace SimLab
             {
                 _carnDeaths.TryGetValue(cause, out cur);
                 _carnDeaths[cause] = cur + 1;
+            }
+            if (_activeTimeLine != null && _activeTimeLine.populationBasedAnimalClassifier != null)
+            {
+                int sp = _activeTimeLine.populationBasedAnimalClassifier.LookUp(speciesId);
+                bool isAqua = sp >= 0 && _aquaSpecies >= 0 && sp == _aquaSpecies;
+                if (!isAqua && sp >= 0 && sp < _activeTimeLine.allSpecies.Count && _activeTimeLine.allSpecies[sp].name == "Aquara")
+                {
+                    _aquaSpecies = sp;
+                    isAqua = true;
+                }
+                if (isAqua)
+                {
+                    _aquaDeaths.TryGetValue(cause, out cur);
+                    _aquaDeaths[cause] = cur + 1;
+                }
             }
         }
 
@@ -2764,6 +2782,12 @@ namespace SimLab
                         foreach (var kv in _carnDeaths) cp.Add($"{kv.Key}={kv.Value}");
                         Log("    carn-deaths: " + string.Join(", ", cp));
                     }
+                    if (_aquaDeaths.Count > 0)
+                    {
+                        var ap = new List<string>();
+                        foreach (var kv in _aquaDeaths) ap.Add($"{kv.Key}={kv.Value}");
+                        Log("    aqua-deaths: " + string.Join(", ", ap));
+                    }
                     {
                         double freq = System.Diagnostics.Stopwatch.Frequency;
                         double tp = _profPlants * 1000.0 / freq;
@@ -3695,18 +3719,20 @@ namespace SimLab
             var checker = new AnimalCellRequirementChecker();
             bool[] ok = new bool[area.cells.Length];
             int okN = 0;
+            float tMin = 99f, tMax = -99f; double tSum = 0;
             for (int i = 0; i < area.cells.Length; i++)
             {
                 WorldCell c = area.cells[i];
                 if (c == null || !c.usable || c.oceanDepth < 0f) continue;
                 checker.Check(c, def, calc, true);
-                if (checker.okayForAnimal) { ok[i] = true; okN++; }
+                if (checker.okayForAnimal) { ok[i] = true; okN++; tMin = Math.Min(tMin, c.temperature); tMax = Math.Max(tMax, c.temperature); tSum += c.temperature; }
             }
             int w = (int)area.size.x, h = (int)area.size.y;
             def.definitionIndex = tl.nextDefinitionIndex++;
             int spawned = 0;
             var used = new HashSet<int>();
-            // Warm, slow water first: cold currents were killing the founders before they bred.
+            // Warm, slow water first, spread over the basin. A single tight cluster strips its
+            // own plankton; distant pairs then fail to meet, so both extremes lose.
             var cand = new List<int>();
             for (int i = 0; i < area.cells.Length; i++) if (ok[i]) cand.Add(i);
             cand.Sort((x, y) =>
@@ -3749,6 +3775,8 @@ namespace SimLab
                         placed.UpdateTemperature(area.cells[cells[s]].temperature);
                         if (spawned == 0)
                         {
+                            _aquaSpecies = tl.populationBasedAnimalClassifier.LookUp(placed.definition.definitionIndex);
+                            _aquaDeaths.Clear();
                             var fl = new List<string>();
                             if (placed.orderedDetailedFoodTypes != null)
                                 for (int fi = 0; fi < placed.orderedDetailedFoodTypes.Length; fi++)
@@ -3759,7 +3787,8 @@ namespace SimLab
                     }
                 }
             }
-            log($"[AQUA] Spawned {spawned}/{count} '{name}' size={def._bodySize} age={calc.expectedAge}d swim={calc.canSwim} inW={calc.timeInWater} onL={calc.timeOnLand} wt={calc.weight:F1}/{calc.weightSupportedForWalking:F1} waterCells={okN}");
+            log($"[AQUA] Spawned {spawned}/{count} '{name}' size={def._bodySize} age={calc.expectedAge}d swim={calc.canSwim} swSpeed={calc.swimmingSpeed:F2} inW={calc.timeInWater} onL={calc.timeOnLand} wt={calc.weight:F1}/{calc.weightSupportedForWalking:F1} waterCells={okN} temp=[{calc.minimumTemperatureThisOrganismCanHandle:F1}..{calc.maximumTemperatureThisOrganismCanHandle:F1}]");
+            log($"[AQUA] water temp=[{tMin:F2}..{tMax:F2}] avg={(okN > 0 ? tSum / okN : 0):F2}");
         }
 
         private static void LogAnimalGuildBreakdown(TimeLine tl, Action<string> log)
@@ -4066,12 +4095,12 @@ namespace SimLab
             seg0.SetChild(eye, TorsoPartSide.Side);
 
             var seg1 = new TorsoPartDefinition(0f, 5.0f);
-            var fin = importer.CreateLimbWithShapeIndex(25);    // waterwing
+            var fin = importer.CreateLimbWithShapeIndex(25);    // waterwing, underWaterSpeed 5
             fin.scale = 1.0f;
             seg1.SetChild(fin, TorsoPartSide.Side);
 
-            // webbed feet only exist to give maximumSteepness > 0: EnoughSpaceForReproduction
-            // steps to a neighbouring cell with that limit, and 0 makes a swimmer sterile.
+            // webbed feet give maximumSteepness > 0: EnoughSpaceForReproduction steps to a
+            // neighbouring cell with that limit, and 0 makes a swimmer sterile.
             var seg2 = new TorsoPartDefinition(0f, 4.0f);
             var web = importer.CreateLimbWithShapeIndex(26);    // webbed
             web.scale = 1.0f;
