@@ -2197,6 +2197,56 @@ namespace SimLab
             return 0;
         }
 
+        // Export one named live species from a save as a .species16 archive.
+        private static int ExportSpeciesFromSave(string savePath, string speciesName, string outPath, OrganismObjectFileImporter importer)
+        {
+            var importer2 = BuildRealImporter2();
+            var gs = new GameSaver { importer = importer, importer2 = importer2, currentSaveFileFormatVersion = 16 };
+            gs.Decode(File.ReadAllBytes(savePath));
+            TimeLine tl = WireTimeline(gs, importer, importer2);
+
+            AnimalDefinition chosen = null;
+            foreach (AnimalPosition pos in tl.today.areas[0].animalPositionTracker.animalPositions)
+            {
+                LivingAnimal la = tl.today.areas[0].GetAnimalInCell(pos.cellIndex, pos.locationType);
+                if (la == null || la.eaten || la.definition == null) continue;
+                int spIdx = tl.populationBasedAnimalClassifier.LookUp(la.definition.definitionIndex);
+                if (spIdx < 0 || spIdx >= tl.allSpecies.Count) continue;
+                if (!string.Equals(tl.allSpecies[spIdx].name, speciesName, StringComparison.OrdinalIgnoreCase)) continue;
+                chosen = la.definition;
+                break;
+            }
+            if (chosen == null)
+            {
+                Console.Error.WriteLine($"Species '{speciesName}' has no living member in {savePath}");
+                return 2;
+            }
+
+            var def = (AnimalDefinition)chosen.Clone();
+            def.currentSex = 0;
+            def.definitionIndex = -1;
+            var sp = new SpeciesDefinition(def, speciesName, 0)
+            {
+                speciesType = OrganismType.Animal,
+                manuallyAdded = true,
+                birthPlaces = new List<int>(),
+                numberOfYearsNotExtinct = 0,
+                peakNumberOfLivingOrganisms = 0,
+                extinctSinceYear = -1,
+            };
+            var tmp = new GameSaver { importer = importer, importer2 = importer2, savingBytes = new List<byte>() };
+            tmp.AddSpecies(sp);
+            byte[] bytes = tmp.savingBytes.ToArray();
+            Directory.CreateDirectory(Path.GetDirectoryName(outPath));
+            File.WriteAllBytes(outPath, bytes);
+
+            var loader = new GameSaver { importer = importer, importer2 = importer2, currentSaveFileFormatVersion = 16, loadingBytes = bytes };
+            var loaded = loader.GetSpecies();
+            var ld = (AnimalDefinition)loaded.exampleOrganism;
+            Console.WriteLine($"EXPORTED '{loaded.name}' -> {outPath} ({bytes.Length} bytes) sexes={ld.sexes.Length + 1} size={ld.bodySize} egg={ld.eggType}");
+            return 0;
+        }
+
         private static int ExportTopSexualFromSave(string savePath, string herbOut, string carnOut, OrganismObjectFileImporter importer)
         {
             var importer2 = BuildRealImporter2();
@@ -4456,6 +4506,11 @@ namespace SimLab
             if (args != null && args.Length > 3 && args[0] == "--export-top-sexual")
             {
                 return ExportTopSexualFromSave(args[1], args[2], args[3], importer);
+            }
+
+            if (args != null && args.Length > 3 && args[0] == "--export-species")
+            {
+                return ExportSpeciesFromSave(args[1], args[2], args[3], importer);
             }
 
             // Load a real save and continue its ecosystem for N days:
