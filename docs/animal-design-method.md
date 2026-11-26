@@ -75,8 +75,19 @@ $env:SIM_ANIMAL_SAFE="1"
 .\SimLab.exe --save "<save.sav16>" 800 50 20261125 band
 ```
 
+## Aquatic species
+
+Water changes four mechanics that the land templates do not exercise.
+
+- `EggType.Ovoid` maps to `EggLocation.DryLand`, so `EggCanSurviveInCell` fails in water and no birth ever passes the gate. Use `Capsule` (UnderWater).
+- `EnoughSpaceForReproduction` steps to a neighbour with `maximumSteepness`. A pure fin swimmer has 0, so every ready female fails `badSpace`. Add `webbed` feet (0.4) to clear it.
+- The archived-bodyplan seeder rejects every cell with `oceanDepth >= 0`; aquatic species need their own water placement path.
+- `Plankton` in a mouth's energy map sets `filterFeeder`, which is what makes plankton edible across nearby cells. Current deaths come from `maximumOceanCurrent`, which is 0.95 for a size-14 swimmer; give the species 1.0.
+
+The working design is `Aquara`: filter mouth (id 9, plankton plus macro algae as SoftPlantTissue and MarineSnow, meat removed so the 3-birth carnivore cap does not apply), two `waterwing` pairs and `webbed` feet, `aquavision` eyes (18), `elven` ears (2), body size 14. It is hermaphroditic: every sex-0 adult both fertilizes and bears, with asexual birth off. That removes the male/female pairing bottleneck without cloning. It survived 8,000 days unaided, oscillating between 13 and 87 animals with 1,895 births.
+
 ## Limits
 
-`SeedFromArchivedBodyplan` places animals on walkable land cells only; it rejects cells with `oceanDepth >= 0`. An aquatic species needs a placement path that finds water cells, adds the animal with `CellLocationType.UnderWater` or `AtWaterSurface`, and skips the plant check. That path does not exist yet.
+`SeedFromArchivedBodyplan` places animals on walkable land cells only. `SeedAquatic` is the separate water path, and it assumes the definition is already built for swimming; it does not adapt an arbitrary archived body plan.
 
 The screens are still stochastic. A species can pass five worlds and fail on a sixth, so treat a sweep as evidence, not proof.
