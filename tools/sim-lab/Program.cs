@@ -140,6 +140,32 @@ namespace SimLab
         private static void ProfFungi_Prefix(out long __state) { __state = System.Diagnostics.Stopwatch.GetTimestamp(); }
         private static void ProfFungi_Postfix(long __state) { _profFungi += System.Diagnostics.Stopwatch.GetTimestamp() - __state; _cntFungi++; }
 
+        private static int _spaceTol;
+        private static readonly Dictionary<LivingAnimal, int> _moveTrack = new Dictionary<LivingAnimal, int>();
+
+        // SIM_TRACK_MOVE=<minCells>: log any animal whose cell jumps more than minCells (Chebyshev) in one day.
+        private static void TrackMoves(TimeLine tl, Dictionary<LivingAnimal, int> prev, bool before, int day)
+        {
+            WorldArea area = tl.today.areas[0];
+            int w = (int)area.size.x, h = (int)area.size.y;
+            int min = int.TryParse(Environment.GetEnvironmentVariable("SIM_TRACK_MOVE"), out int m) && m > 1 ? m : 8;
+            if (before) prev.Clear();
+            foreach (AnimalPosition pos in area.animalPositionTracker.animalPositions)
+            {
+                LivingAnimal an = area.GetAnimalInCell(pos.cellIndex, pos.locationType);
+                if (an == null || an.eaten) continue;
+                if (before) { prev[an] = pos.cellIndex; continue; }
+                if (!prev.TryGetValue(an, out int old)) continue;
+                int dx = Math.Abs(pos.cellIndex % w - old % w), dy = Math.Abs(pos.cellIndex / w - old / w);
+                if (Math.Max(dx, dy) <= min) continue;
+                int nx = pos.cellIndex % w, ny = pos.cellIndex / w;
+                Console.WriteLine($"[JUMP] day={tl.dayIndex} meat={an.eatsMeat} def={an.definition.definitionIndex} age={an.age} child={an.isChild} ({old % w},{old / w})->({nx},{ny}) of {w}x{h} edge={(nx == 0 || ny == 0 || nx == w - 1 || ny == h - 1)} moving={an.moving} walk={an.canWalk} speed={an.speed:F1} loc={pos.locationType} lastLog={an.lastLog}");
+            }
+        }
+        private static void SpaceTol_Postfix(ref int __result) { if (__result <= _spaceTol) __result = 0; }
+        private static long _lsN, _lsOutTemp, _lsStarving, _lsNearDeath, _lsAdult, _lsAlone;
+        private static double _lsAge, _lsHealth, _lsMaxHealth, _lsHLoss, _lsLife, _lsEnergy, _lsELoss, _lsExp, _lsDet, _lsMat, _lsSize, _lsNb;
+        private static int _lsMinX = 9999, _lsMaxX = -1, _lsMinY = 9999, _lsMaxY = -1;
         private static long _cntInstinct;
         private static long _cntInstinctHit;
         private static double _sumInstinctRange;
@@ -684,6 +710,11 @@ namespace SimLab
             h.Patch(typeof(TimeLine).GetMethod("LetAllAnimalsInAreaLiveADay"),
                 prefix: new HarmonyMethod(typeof(Program).GetMethod(nameof(AuditAnimals_Prefix), flags)),
                 finalizer: new HarmonyMethod(typeof(Program).GetMethod(nameof(TimelineAnimalsEx_Finalizer), flags)));
+
+            // Experiment: only caller is EnoughSpaceForReproduction (needs result <= 1). Tolerate up to N neighbours.
+            if (int.TryParse(Environment.GetEnvironmentVariable("SIM_SPACE_TOL"), out _spaceTol) && _spaceTol > 1)
+                h.Patch(AccessTools.Method(typeof(TimeLine), "FindNumberOfAnimalsAroundCell"),
+                    postfix: new HarmonyMethod(typeof(Program).GetMethod(nameof(SpaceTol_Postfix), flags)));
 
             foreach (string probe in new[] { "BabyGetsBorn", "CellContainsCorrectNestForAnimal", "EggCanSurviveInCell", "EnoughSpaceForReproduction" })
             {
@@ -2307,7 +2338,7 @@ namespace SimLab
                     if (sc.orderedDetailedFoodTypes != null)
                         for (int i = 0; i < sc.orderedDetailedFoodTypes.Length; i++)
                             diet.Add($"{sc.orderedDetailedFoodTypes[i]}:{sc.energyPerDetailedFoodType[i]:F1}");
-                    Console.WriteLine($"[{label} sex={s}] grav={grav:F2} size={def.bodySize} age={sc.expectedAge}d mat={sc.matureAtAge}d preg={sc.pregnancyTime}d eggT={sc.embryoDevelopmentTime - sc.pregnancyTime}d spd={sc.speed:F2}(y:{yc.speed:F2}) cw={sc.canWalk} wt={sc.weight:F1}/{sc.weightSupportedForWalking:F1} see(D/T/N)={sc.furthestSeeingDistanceDuringDayTime*5:F1}/{sc.furthestSeeingDistanceAtTwilight*5:F1}/{sc.furthestSeeingDistanceAtNight*5:F1} fov={sc.fieldOfView} hear={sc.furthestHearingDistance:F1} temp=[{sc.minimumTemperatureThisOrganismCanHandle:F1}..{sc.maximumTemperatureThisOrganismCanHandle:F1}] noEgg=[{def.noEggsBelowTemperature:F2}..{def.noEggsAboveTemperature:F2}] noHatch=[{def.noHatchBelowTemperature:F2}..{def.noHatchAboveTemperature:F2}] reproCost={sc.energyNeededToReproduce:F1} asex={def.canGiveBirthAsexually} sexB={def.canGiveBirthSexually} fertInt={def.canFertilizeInternally} prob={OrganismProblemDetection.DetectProblemInAnimal(def, yc, sc)}");
+                    Console.WriteLine($"[{label} sex={s}] grav={grav:F2} size={def.bodySize} age={sc.expectedAge}d mat={sc.matureAtAge}d preg={sc.pregnancyTime}d eggT={sc.embryoDevelopmentTime - sc.pregnancyTime}d spd={sc.speed:F2}(y:{yc.speed:F2}) swim={sc.canSwim} aq={sc.aquaticBehavior} inW={sc.timeInWater} onL={sc.timeOnLand} cw={sc.canWalk} wt={sc.weight:F1}/{sc.weightSupportedForWalking:F1} see(D/T/N)={sc.furthestSeeingDistanceDuringDayTime*5:F1}/{sc.furthestSeeingDistanceAtTwilight*5:F1}/{sc.furthestSeeingDistanceAtNight*5:F1} fov={sc.fieldOfView} hear={sc.furthestHearingDistance:F1} temp=[{sc.minimumTemperatureThisOrganismCanHandle:F1}..{sc.maximumTemperatureThisOrganismCanHandle:F1}] noEgg=[{def.noEggsBelowTemperature:F2}..{def.noEggsAboveTemperature:F2}] noHatch=[{def.noHatchBelowTemperature:F2}..{def.noHatchAboveTemperature:F2}] reproCost={sc.energyNeededToReproduce:F1} asex={def.canGiveBirthAsexually} sexB={def.canGiveBirthSexually} fertInt={def.canFertilizeInternally} prob={OrganismProblemDetection.DetectProblemInAnimal(def, yc, sc)}");
                     Console.WriteLine($"  diet=[{string.Join(",", diet)}] sexDec={def.offspringSexDecisionType} ch=[{(sc.offSpringSexChances != null ? string.Join(",", sc.offSpringSexChances) : "")}]");
                     Console.WriteLine($"  inst({insts.Count})=[{string.Join("; ", insts)}]");
                     if (s == 0) Console.WriteLine($"  parts=[{string.Join(", ", parts)}]");
@@ -2459,6 +2490,13 @@ namespace SimLab
                 SeedFromArchivedBodyplan(tl, importer, importer2, seedArch, null, true, cCount, cSize, cMouth, Log);
             }
 
+            if (Environment.GetEnvironmentVariable("SIM_SEED_AQUATIC") == "1")
+            {
+                int aqCount = int.TryParse(Environment.GetEnvironmentVariable("SIM_AQUATIC_COUNT"), out int aqc) && aqc > 0 ? aqc : 40;
+                int aqSize = int.TryParse(Environment.GetEnvironmentVariable("SIM_AQUATIC_SIZE"), out int aqs) && aqs > 0 ? aqs : 12;
+                SeedAquatic(tl, importer, BuildAquaticDefinition(importer, aqSize), "Aquara", aqCount, Log);
+            }
+
             if (Environment.GetEnvironmentVariable("SIM_NO_ANIMAL_MUT") == "1")
             {
                 tl.chanceForAnimalMutation = 0f;
@@ -2519,8 +2557,22 @@ namespace SimLab
                         if (anml.pregnant) preg[sp]++;
                         if (anml.fertilized) fert[sp]++;
                         if (anml.isChild) children[sp]++;
+                        _lsN++; _lsAge += anml.age; _lsHealth += anml.health; _lsMaxHealth += anml.maximumHealth;
+                        _lsHLoss += anml.dailyHealthLoss; _lsLife += anml.age + anml.health / Math.Max(1e-6f, anml.dailyHealthLoss);
+                        _lsEnergy += anml.energy; _lsExp += anml.expectedAge; _lsDet += anml.healthDeterioratesAtAge; _lsMat += anml.matureAtAge; if (anml.age >= anml.healthDeterioratesAtAge - 3) _lsNearDeath++; if (!anml.isChild) _lsAdult++; _lsSize += anml.definition.bodySize; _lsELoss += anml.dailyEnergyLoss;
+                        if (!anml.insideTemperatureRange) _lsOutTemp++;
+                        if (anml.energy <= 1f) _lsStarving++; { int nb = tl.FindNumberOfAnimalsAroundCell(area, pos.cellIndex, pos.locationType); _lsNb += nb; if (nb == 0) _lsAlone++; int cx = pos.cellIndex % (int)area.size.x, cy = pos.cellIndex / (int)area.size.x; if (cx < _lsMinX) _lsMinX = cx; if (cx > _lsMaxX) _lsMaxX = cx; if (cy < _lsMinY) _lsMinY = cy; if (cy > _lsMaxY) _lsMaxY = cy; }
+                        _lsN++; _lsAge += anml.age; _lsHealth += anml.health; _lsMaxHealth += anml.maximumHealth;
+                        _lsHLoss += anml.dailyHealthLoss; _lsLife += anml.age + anml.health / Math.Max(1e-6f, anml.dailyHealthLoss);
+                        _lsEnergy += anml.energy; _lsELoss += anml.dailyEnergyLoss;
+                        if (!anml.insideTemperatureRange) _lsOutTemp++;
+                        if (anml.energy <= 1f) _lsStarving++;
                     }
                 }
+                if (_lsN > 0)
+                    Log($"  [LIFESPAN] n={_lsN} avgAge={_lsAge / _lsN:F1} avgHealth={_lsHealth / _lsN:F1}/{_lsMaxHealth / _lsN:F1} dailyHealthLoss={_lsHLoss / _lsN:F3} projectedLifespan={_lsLife / _lsN:F1}d energy={_lsEnergy / _lsN:F1} dailyEnergyLoss={_lsELoss / _lsN:F2} expectedAge={_lsExp / _lsN:F1} deteriorateAt={_lsDet / _lsN:F1} matureAt={_lsMat / _lsN:F1} bodySize={_lsSize / _lsN:F2} adults={_lsAdult} within3dOfDeath={_lsNearDeath} avgNeighbours={_lsNb / _lsN:F2} aloneNoNeighbour={_lsAlone} bbox=x{_lsMinX}-{_lsMaxX},y{_lsMinY}-{_lsMaxY} outsideTemp={_lsOutTemp} starving={_lsStarving}");
+                if (_lsN > 0)
+                    Log($"  [LIFESPAN] n={_lsN} avgAge={_lsAge / _lsN:F1} avgHealth={_lsHealth / _lsN:F1}/{_lsMaxHealth / _lsN:F1} dailyHealthLoss={_lsHLoss / _lsN:F3} projectedLifespan={_lsLife / _lsN:F1}d energy={_lsEnergy / _lsN:F1} dailyEnergyLoss={_lsELoss / _lsN:F2} outsideTemp={_lsOutTemp} starving={_lsStarving}");
                 foreach (var kv in animalCounts)
                 {
                     int total = kv.Value[0] + kv.Value[1];
@@ -2642,11 +2694,14 @@ namespace SimLab
             csv.Flush();
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
+            bool trackMove = Environment.GetEnvironmentVariable("SIM_TRACK_MOVE") != null;
             int startDay = tl.dayIndex;
             int done = 0;
             while (runForever || done < days)
             {
+                if (trackMove) TrackMoves(tl, _moveTrack, true, done);
                 tl.LiveADay();
+                if (trackMove) TrackMoves(tl, _moveTrack, false, done + 1);
                 done++;
                 if (assignMates && done % 10 == 0) AssignMates(tl);
                 if (balanceSex && done % 10 == 0) BalanceSexes(tl);
@@ -3630,6 +3685,83 @@ namespace SimLab
             log($"[COEVO] Spawned {spawned}/{count} '{speciesName}' ({(obligateCarnivore ? "CARN" : "HERB")}) in dense connected basins (largest={(compCells.Count > 0 ? compCells[0].Count : 0)} cells, candidates={candidateCells.Count}).");
         }
 
+        // Places a built definition in open water. The archived-bodyplan seeder rejects every
+        // cell with oceanDepth >= 0, so aquatic species need their own placement pass.
+        private static void SeedAquatic(TimeLine tl, OrganismObjectFileImporter importer, AnimalDefinition def, string name, int count, Action<string> log)
+        {
+            WorldArea area = tl.today.areas[0];
+            var calc = new AnimalStatsCalculator(importer, tl.gravity);
+            calc.Calculate(def, false);
+            var checker = new AnimalCellRequirementChecker();
+            bool[] ok = new bool[area.cells.Length];
+            int okN = 0;
+            for (int i = 0; i < area.cells.Length; i++)
+            {
+                WorldCell c = area.cells[i];
+                if (c == null || !c.usable || c.oceanDepth < 0f) continue;
+                checker.Check(c, def, calc, true);
+                if (checker.okayForAnimal) { ok[i] = true; okN++; }
+            }
+            int w = (int)area.size.x, h = (int)area.size.y;
+            def.definitionIndex = tl.nextDefinitionIndex++;
+            int spawned = 0;
+            var used = new HashSet<int>();
+            // Warm, slow water first: cold currents were killing the founders before they bred.
+            var cand = new List<int>();
+            for (int i = 0; i < area.cells.Length; i++) if (ok[i]) cand.Add(i);
+            cand.Sort((x, y) =>
+            {
+                float sx = area.cells[x].temperature - area.cells[x].oceanCurrentSpeed;
+                float sy = area.cells[y].temperature - area.cells[y].oceanCurrentSpeed;
+                return sy.CompareTo(sx);
+            });
+            foreach (int i in cand)
+            {
+                if (spawned >= count) break;
+                if (!ok[i] || used.Contains(i) || area.GetAnimalInCell(i, CellLocationType.UnderWater) != null) continue;
+                int cx = i / h, cy = i % h, nb = -1;
+                for (int dx = -1; dx <= 1 && nb < 0; dx++)
+                    for (int dy = -1; dy <= 1 && nb < 0; dy++)
+                    {
+                        if (dx == 0 && dy == 0) continue;
+                        int nx = cx + dx, ny = cy + dy;
+                        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                        int ni = nx * h + ny;
+                        if (!ok[ni] || used.Contains(ni)) continue;
+                        if (area.GetAnimalInCell(ni, CellLocationType.UnderWater) == null) nb = ni;
+                    }
+                if (nb < 0) continue;
+                used.Add(i); used.Add(nb);
+                int[] cells = new[] { i, nb };
+                for (int s = 0; s < 2 && spawned < count; s++)
+                {
+                    AnimalDefinition inst = (AnimalDefinition)def.Clone();
+                    inst.definitionIndex = def.definitionIndex;
+                    inst.currentSex = s;
+                    tl.nextSpeciesName = name;
+                    tl.InsertAnimal(inst, 0, cells[s], CellLocationType.UnderWater, true, -1);
+                    LivingAnimal placed = area.GetAnimalInCell(cells[s], CellLocationType.UnderWater);
+                    if (placed != null)
+                    {
+                        placed.isChild = false;
+                        int ageMax = Math.Max(13, (int)calc.expectedAge - 1);
+                        placed.age = 12 + (spawned * 7) % Math.Max(1, ageMax - 12);
+                        placed.UpdateTemperature(area.cells[cells[s]].temperature);
+                        if (spawned == 0)
+                        {
+                            var fl = new List<string>();
+                            if (placed.orderedDetailedFoodTypes != null)
+                                for (int fi = 0; fi < placed.orderedDetailedFoodTypes.Length; fi++)
+                                    fl.Add($"{placed.orderedDetailedFoodTypes[fi]}:{placed.energyPerDetailedFoodType[fi]:F1}");
+                            log($"[AQUA] diet=[{string.Join(",", fl)}] canWalk={placed.canWalk} canSwim={placed.canSwim} inW={placed.timeInWater} onL={placed.timeOnLand}");
+                        }
+                        spawned++;
+                    }
+                }
+            }
+            log($"[AQUA] Spawned {spawned}/{count} '{name}' size={def._bodySize} age={calc.expectedAge}d swim={calc.canSwim} inW={calc.timeInWater} onL={calc.timeOnLand} wt={calc.weight:F1}/{calc.weightSupportedForWalking:F1} waterCells={okN}");
+        }
+
         private static void LogAnimalGuildBreakdown(TimeLine tl, Action<string> log)
         {
             var herbSpp = new Dictionary<int, int[]>();
@@ -3881,6 +4013,109 @@ namespace SimLab
             def.sexes = new AnimalMorph[] { maleMorph };
             def.youngSexes = new AnimalMorph[] { youngMaleMorph };
 
+            return def;
+        }
+
+        // Aquatic plankton feeder built from parts, same method as Solara.
+        // rakers mouth (id 30) breathes water and digests plankton; waterwing (id 25) swims.
+        private static AnimalDefinition BuildAquaticDefinition(OrganismObjectFileImporter importer, int bodySize = 12)
+        {
+            var def = new AnimalDefinition();
+            def.definitionIndex = 0;
+            def._bodySize = bodySize;
+            def._skinType = SkinType.Feathered; // +10C cold / +5C heat, the shallow water here runs cold
+            def._skinPattern = SkinPattern.Plain;
+            def._colorHue = 0.55f;
+            def._colorBrightness = 0.63f;
+            def._secondaryColorHue = 0.48f;
+            def._secondaryColorBrightness = 0.82f;
+            def._upright = false;
+            def._nestType = NestType.None;
+            def._nestEnclosed = false;
+            def._embryoTimeInsideMother = 4; // viviparous, no eggs to lose in water
+            def._eggType = EggType.Capsule; // UnderWater egg location; Ovoid is DryLand and blocks water births
+            def._noEggsBelowTemperature = 0f;
+            def._noEggsAboveTemperature = 1f;
+            def._noHatchBelowTemperature = 0f;
+            def._noHatchAboveTemperature = 1f;
+            def._sleepPattern = (SleepPattern)0;
+            def._fruitDietHueRange = new Vector2(0f, 1f);
+            def._invertFruitDietColorRange = false;
+            def._softPlantTissueDietHueRange = new Vector2(0f, 1f);
+            def._softPlantTissueDietBrightnessRange = new Vector2(0f, 1f);
+            def._invertSoftPlantTissueDietColorRange = false;
+            def._wholeAnimalDietHueRange = new Vector2(0f, 1f);
+            def._wholeAnimalDietBrightnessRange = new Vector2(0f, 1f);
+            def._wholeAnimalDietSecondaryHueRange = new Vector2(0f, 1f);
+            def._wholeAnimalDietSecondaryBrightnessRange = new Vector2(0f, 1f);
+            def._invertWholeAnimalDietColorRange = false;
+            def._fungusDietHueRange = new Vector2(0f, 1f);
+            def._fungusDietBrightnessRange = new Vector2(0f, 1f);
+            def._invertFungusDietColorRange = false;
+            def._excludeFromDiet = new HashSet<DetailedFoodType>();
+            def._excludeFruitShapesFromDiet = new HashSet<FruitShape>();
+            def._wholeAnimalDietExcludeSkinPatterns = new HashSet<SkinPattern>();
+            def.hormones = new HormoneDefinition[0];
+
+            var seg0 = new TorsoPartDefinition(0f, 3.0f);
+            var mouth = importer.CreateMouthWithShapeIndex(30); // rakers
+            mouth.scale = 1.0f;
+            var eye = importer.CreateEyeWithShapeIndex(15);     // stalk, 360 degrees
+            eye.scale = 1.0f;
+            seg0.SetChild(mouth, TorsoPartSide.Back);
+            seg0.SetChild(eye, TorsoPartSide.Side);
+
+            var seg1 = new TorsoPartDefinition(0f, 5.0f);
+            var fin = importer.CreateLimbWithShapeIndex(25);    // waterwing
+            fin.scale = 1.0f;
+            seg1.SetChild(fin, TorsoPartSide.Side);
+
+            // webbed feet only exist to give maximumSteepness > 0: EnoughSpaceForReproduction
+            // steps to a neighbouring cell with that limit, and 0 makes a swimmer sterile.
+            var seg2 = new TorsoPartDefinition(0f, 4.0f);
+            var web = importer.CreateLimbWithShapeIndex(26);    // webbed
+            web.scale = 1.0f;
+            seg2.SetChild(web, TorsoPartSide.Side);
+            def.torso = new TorsoPartDefinition[] { seg0, seg1, seg2 };
+
+            def._instincts = new InstinctDefinition[]
+            {
+                MakeInstinct(InstinctConditionSense.Feel, InstinctConditionObject.TooWarm, InstinctAction.GoAwayFrom),
+                MakeInstinct(InstinctConditionSense.Feel, InstinctConditionObject.TooCold, InstinctAction.GoAwayFrom),
+                MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.APotentialMate, InstinctAction.GoTowards),
+                MakeInstinct(InstinctConditionSense.See, InstinctConditionObject.Food, InstinctAction.GoTowards),
+            };
+
+            def._canGiveBirthAsexually = false;
+            def._canGiveBirthSexually = true;
+            def._canFertilizeInternally = false;
+            def._canFertilizeExternally = false;
+            def._offspringSexDecisionType = OffspringSexDecisionType.Chance;
+            def._offspringSexChanceBracket0 = 0; def._offspringSexChanceBracket1 = 0; def._offspringSexChanceBracket2 = 0;
+            def._offspringSexChanceBracket3 = 0; def._offspringSexChanceBracket4 = 0; def._offspringSexChanceBracket5 = 0;
+            def._offspringSexChanceBracket6 = 1; def._offspringSexChanceBracket7 = 1; def._offspringSexChanceBracket8 = 1;
+            def._offspringSexChanceBracket9 = 1; def._offspringSexChanceBracket10 = 1; def._offspringSexChanceBracket11 = 1;
+
+            def.sexes = new AnimalMorph[0];
+            def.youngSexes = new AnimalMorph[0];
+            def.currentSex = 0;
+            def.young = AnimalMorph.CreateMorphBasedOnAnimalDefinition(def);
+
+            AnimalMorph maleMorph = AnimalMorph.CreateMorphBasedOnAnimalDefinition(def);
+            maleMorph.canGiveBirthAsexually = false;
+            maleMorph.canGiveBirthSexually = false;
+            maleMorph.canFertilizeInternally = true;
+            maleMorph.canFertilizeExternally = false;
+            maleMorph.colorHue = 0.62f;
+            maleMorph.colorBrightness = 0.72f;
+            maleMorph.offspringSexDecisionType = OffspringSexDecisionType.Chance;
+            maleMorph.offspringSexChanceBracket0 = 0; maleMorph.offspringSexChanceBracket1 = 0; maleMorph.offspringSexChanceBracket2 = 0;
+            maleMorph.offspringSexChanceBracket3 = 0; maleMorph.offspringSexChanceBracket4 = 0; maleMorph.offspringSexChanceBracket5 = 0;
+            maleMorph.offspringSexChanceBracket6 = 1; maleMorph.offspringSexChanceBracket7 = 1; maleMorph.offspringSexChanceBracket8 = 1;
+            maleMorph.offspringSexChanceBracket9 = 1; maleMorph.offspringSexChanceBracket10 = 1; maleMorph.offspringSexChanceBracket11 = 1;
+
+            def.sexes = new AnimalMorph[] { maleMorph };
+            def.youngSexes = new AnimalMorph[] { AnimalMorph.Clone(maleMorph) };
             return def;
         }
 
