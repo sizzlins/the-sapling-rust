@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
 
@@ -18,6 +19,32 @@ namespace SaplingRustBridge.Patches
     [HarmonyPatch]
     public static class CleanLogPatches
     {
+        // 8. animalModelScalesPerBodySize has only 4 entries (body sizes 10..13). A size-14
+        // archive animal makes BuildCarriedAnimal index [4] and throw before the carried model
+        // exists, so the drop silently fails. Extend the table to size 17.
+        [HarmonyPatch(typeof(WorldView), "Start")]
+        [HarmonyPostfix]
+        public static void WorldView_Start_ExpandAnimalScales(WorldView __instance)
+        {
+            float[] a = __instance.animalModelScalesPerBodySize;
+            if (a == null || a.Length >= 8) return;
+            float[] expanded = new float[8];
+            for (int i = 0; i < expanded.Length; i++)
+                expanded[i] = i < a.Length ? a[i] : expanded[i - 1] + 0.1f;
+            __instance.animalModelScalesPerBodySize = expanded;
+            try
+            {
+                FieldInfo vf = typeof(WorldView).GetField("animalView", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                object av = vf != null ? vf.GetValue(__instance) : null;
+                if (av != null)
+                {
+                    FieldInfo sf = av.GetType().GetField("modelScalesPerBodySize", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (sf != null) sf.SetValue(av, expanded);
+                }
+            }
+            catch { }
+        }
+
         // 7. Carrying an aquatic animal can make CarriedOrganismLocationToAreaIndex() return -1
         // (the carried position maps outside every area). UpdateAnimalRequirementsPanel then
         // indexes today.areas[-1], throws every frame, and aborts WorldController.Update before
